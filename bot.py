@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import threading
+import webserver
 from datetime import datetime, date, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
@@ -1468,5 +1469,8 @@ if __name__ == "__main__":
     t = threading.Thread(target=_run_http, daemon=True)
     t.start()
     log.info("Health-check HTTP server started on port %d", PORT)
+
+    # Start the web server
+    webserver.keep_alive()
 
     bot.run(token, log_handler=None)   # logging already configured above
