@@ -1,3 +1,4 @@
+
 """
 OC & Dorm Discord Bot  ·  v3
 ─────────────────────────────────────────────────────────────────────────────
@@ -202,17 +203,22 @@ async def check_scheduled():
 
 @bot.tree.command(name="oc_add", description="Register a new OC to the database.")
 @app_commands.describe(
-    name="OC's full name", profile_picture="Direct image URL",
+    name="OC's full name", 
     birthday=f"Birthday in {BIRTHDAY_DISPLAY}", gender="OC's gender",
     pronouns="Pronouns (e.g. she/her)", face_claim="Face claim",
     main_skill="Primary skill", ethnicity="Ethnicity",
-    nationality="Nationality", form_link="Link to OC form (optional)"
+    nationality="Nationality", 
+    profile_picture_url="Direct image URL (optional if file attached)",
+    profile_picture_file="Upload image file (optional if URL provided)",
+    form_link="Link to OC form (optional)"
 )
 async def oc_add(
     interaction: discord.Interaction,
-    name: str, profile_picture: str, birthday: str,
+    name: str, birthday: str,
     gender: str, pronouns: str, face_claim: str,
     main_skill: str, ethnicity: str, nationality: str,
+    profile_picture_url: Optional[str] = None,
+    profile_picture_file: Optional[discord.Attachment] = None,
     form_link: Optional[str] = None
 ):
     try:
@@ -222,9 +228,21 @@ async def oc_add(
             f"❌ Birthday must be in **{BIRTHDAY_DISPLAY}** format (e.g. `25/06/2000`).",
             ephemeral=True)
 
-    if not valid_image_url(profile_picture):
+    pic_url = None
+    if profile_picture_file:
+        if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
+            return await interaction.response.send_message(
+                "❌ Attached file must be an image.", ephemeral=True)
+        pic_url = profile_picture_file.url
+    elif profile_picture_url:
+        if not valid_image_url(profile_picture_url):
+            return await interaction.response.send_message(
+                "❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).",
+                ephemeral=True)
+        pic_url = profile_picture_url
+    else:
         return await interaction.response.send_message(
-            "❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).",
+            "❌ You must provide either a `profile_picture_url` or upload a `profile_picture_file`.",
             ephemeral=True)
 
     if form_link and not valid_url(form_link):
@@ -239,7 +257,7 @@ async def oc_add(
             ephemeral=True)
 
     data["ocs"][key] = {
-        "name": name, "profile_picture": profile_picture, "birthday": birthday,
+        "name": name, "profile_picture": pic_url, "birthday": birthday,
         "gender": gender, "pronouns": pronouns, "face_claim": face_claim,
         "main_skill": main_skill, "ethnicity": ethnicity, "nationality": nationality,
         "form_link": form_link, "owner_id": interaction.user.id,
@@ -265,7 +283,9 @@ async def oc_add(
                   description="Edit an existing OC (only filled fields are changed).")
 @app_commands.describe(
     oc_name="Name of the OC to edit",
-    name="New name", profile_picture="New image URL",
+    name="New name", 
+    profile_picture_url="New image URL (optional)",
+    profile_picture_file="Upload new image file (optional)",
     birthday="New birthday (DD/MM/YYYY)", gender="New gender",
     pronouns="New pronouns", face_claim="New face claim",
     main_skill="New main skill", ethnicity="New ethnicity",
@@ -273,7 +293,9 @@ async def oc_add(
 )
 async def oc_edit(
     interaction: discord.Interaction, oc_name: str,
-    name: Optional[str] = None, profile_picture: Optional[str] = None,
+    name: Optional[str] = None, 
+    profile_picture_url: Optional[str] = None,
+    profile_picture_file: Optional[discord.Attachment] = None,
     birthday: Optional[str] = None, gender: Optional[str] = None,
     pronouns: Optional[str] = None, face_claim: Optional[str] = None,
     main_skill: Optional[str] = None, ethnicity: Optional[str] = None,
@@ -292,9 +314,17 @@ async def oc_edit(
             return await interaction.response.send_message(
                 f"❌ Birthday must be **{BIRTHDAY_DISPLAY}**.", ephemeral=True)
 
-    if profile_picture and not valid_image_url(profile_picture):
-        return await interaction.response.send_message(
-            "❌ Profile picture must be a direct image URL.", ephemeral=True)
+    pic_url = None
+    if profile_picture_file:
+        if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
+            return await interaction.response.send_message(
+                "❌ Attached file must be an image.", ephemeral=True)
+        pic_url = profile_picture_file.url
+    elif profile_picture_url:
+        if not valid_image_url(profile_picture_url):
+            return await interaction.response.send_message(
+                "❌ Profile picture must be a direct image URL.", ephemeral=True)
+        pic_url = profile_picture_url
 
     if form_link and not valid_url(form_link):
         return await interaction.response.send_message(
@@ -302,11 +332,15 @@ async def oc_edit(
 
     oc      = data["ocs"][key]
     updates = {
-        "name": name, "profile_picture": profile_picture, "birthday": birthday,
+        "name": name, "birthday": birthday,
         "gender": gender, "pronouns": pronouns, "face_claim": face_claim,
         "main_skill": main_skill, "ethnicity": ethnicity,
         "nationality": nationality, "form_link": form_link,
     }
+    
+    if pic_url:
+        updates["profile_picture"] = pic_url
+        
     changes = []
     for field, val in updates.items():
         if val is not None:
@@ -342,6 +376,40 @@ async def oc_view(interaction: discord.Interaction, oc_name: str):
         return await interaction.response.send_message(
             f"❌ No OC named **{oc_name}** found.", ephemeral=True)
     await interaction.response.send_message(embed=build_oc_embed(data["ocs"][key], key))
+
+
+class OCPaginatorView(discord.ui.View):
+    def __init__(self, ocs: list, filters_text: str = ""):
+        super().__init__(timeout=300)
+        self.ocs = ocs
+        self.filters_text = filters_text
+        self.current_index = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.current_index == 0
+        self.next_btn.disabled = self.current_index == len(self.ocs) - 1
+
+    def get_embed(self):
+        key, oc = self.ocs[self.current_index]
+        embed = build_oc_embed(oc, key)
+        footer_text = f"OC ID: {key}  ·  Result {self.current_index + 1} of {len(self.ocs)}"
+        if self.filters_text:
+            footer_text += f"  ·  Filters: {self.filters_text}"
+        embed.set_footer(text=footer_text)
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="prev_oc")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="next_oc")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
 
 @bot.tree.command(name="oc_list", description="Browse all OCs with optional filter.")
@@ -380,37 +448,16 @@ async def oc_list(
         return await interaction.response.send_message(
             "❌ No OCs match the given filters.", ephemeral=True)
 
-    items  = list(ocs.items())
-    total  = len(items)
-    embeds = []
-    for i in range(0, total, 10):
-        chunk = items[i:i+10]
-        title = "OC Database"
-        filters_active = []
-        if search_name:
-            filters_active.append(f"name contains '{search_name}'")
-        if filter_by:
-            filters_active.append(f"{filter_by} = {filter_value}")
-        if filters_active:
-            title += "  —  " + ", ".join(filters_active)
+    filters_active = []
+    if search_name:
+        filters_active.append(f"name contains '{search_name}'")
+    if filter_by:
+        filters_active.append(f"{filter_by} = {filter_value}")
+    filters_text = ", ".join(filters_active)
 
-        embed = discord.Embed(title=title, color=discord.Color.teal())
-        for k, oc in chunk:
-            age     = get_age(oc["birthday"])
-            age_str = f", {age} y/o" if age else ""
-            embed.add_field(
-                name=oc["name"],
-                value=(f"**Gender:** {oc['gender']}  |  **Pronouns:** {oc['pronouns']}\n"
-                       f"**Skill:** {oc['main_skill']}  |  **Nationality:** {oc['nationality']}"
-                       f"{age_str}"),
-                inline=False,
-            )
-        embed.set_footer(text=f"Page {i//10+1}/{(total-1)//10+1}  ·  {total} OC(s)")
-        embeds.append(embed)
-
-    await interaction.response.send_message(embed=embeds[0])
-    for e in embeds[1:]:
-        await interaction.followup.send(embed=e)
+    items = list(ocs.items())
+    view = OCPaginatorView(items, filters_text)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -418,12 +465,18 @@ async def oc_list(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="dorm_create",
-                  description="[Admin] Create a new dorm (add floors separately).")
+                  description="[Admin] Create a new dorm and set up all its floors.")
 @app_commands.describe(
     dorm_name="Display name for the dorm",
     capacity="Capacity per floor: 2 or 3",
+    num_floors="Number of floors to create initially",
 )
-async def dorm_create(interaction: discord.Interaction, dorm_name: str, capacity: int):
+async def dorm_create(
+    interaction: discord.Interaction, 
+    dorm_name: str, 
+    capacity: int, 
+    num_floors: int
+):
     if not is_admin(interaction):
         return await interaction.response.send_message(
             "❌ Only admins can create dorms.", ephemeral=True)
@@ -431,6 +484,10 @@ async def dorm_create(interaction: discord.Interaction, dorm_name: str, capacity
     if capacity not in DORM_SIZES:
         return await interaction.response.send_message(
             f"❌ Capacity must be **2** or **3**, not `{capacity}`.", ephemeral=True)
+            
+    if num_floors < 1:
+        return await interaction.response.send_message(
+            "❌ You must create at least 1 floor.", ephemeral=True)
 
     data = load_data()
     key  = dorm_key_of(dorm_name)
@@ -438,24 +495,41 @@ async def dorm_create(interaction: discord.Interaction, dorm_name: str, capacity
         return await interaction.response.send_message(
             f"❌ A dorm named **{dorm_name}** already exists.", ephemeral=True)
 
-    data["dorms"][key] = {"name": dorm_name, "capacity_per_floor": capacity, "floors": {}}
-    save_data(data)
+    await interaction.response.defer(ephemeral=True)
 
+    data["dorms"][key] = {"name": dorm_name, "capacity_per_floor": capacity, "floors": {}}
+    
     category = discord.utils.get(interaction.guild.categories, name="Dorms")
     if category is None:
-        await interaction.guild.create_category("Dorms")
+        category = await interaction.guild.create_category("Dorms")
 
-    await interaction.response.send_message(
-        f"Dorm **{dorm_name}** created (capacity: **{capacity}**/floor).\n"
-        f"Use `/dorm_add_floor` to add floors.", ephemeral=True)
+    for i in range(1, num_floors + 1):
+        floor_key = floor_key_of(i)
+        data["dorms"][key]["floors"][floor_key] = {"capacity": capacity, "occupants": []}
+
+        ch_name = f"{key}-{floor_key}"
+        if not discord.utils.get(interaction.guild.text_channels, name=ch_name):
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
+            }
+            if interaction.guild.owner:
+                overwrites[interaction.guild.owner] = discord.PermissionOverwrite(view_channel=True)
+            await interaction.guild.create_text_channel(
+                ch_name, category=category, overwrites=overwrites)
+
+    save_data(data)
+
+    await interaction.followup.send(
+        f"Dorm **{dorm_name}** created with **{num_floors}** floor(s) (capacity: **{capacity}**/floor).")
 
     await audit(interaction.guild,
-                f"Dorm created: '{dorm_name}' (cap {capacity}/floor) "
+                f"Dorm created: '{dorm_name}' with {num_floors} floors (cap {capacity}/floor) "
                 f"by {interaction.user} ({interaction.user.id})")
 
 
 @bot.tree.command(name="dorm_add_floor",
-                  description="[Admin] Add a floor to an existing dorm.")
+                  description="[Admin] Add an extra floor to an existing dorm.")
 @app_commands.describe(dorm_name="Name of the dorm")
 async def dorm_add_floor(interaction: discord.Interaction, dorm_name: str):
     if not is_admin(interaction):
@@ -1416,15 +1490,14 @@ async def oc_groupchat(
 async def oc_help(interaction: discord.Interaction):
     embed = discord.Embed(title="OC Bot — Command Reference", color=discord.Color.gold())
     embed.add_field(name="OC Management", inline=False, value=(
-        "`/oc_add` — Register a new OC\n"
+        "`/oc_add` — Register a new OC (supports file upload)\n"
         "`/oc_edit` — Edit OC fields (only filled fields change)\n"
         "`/oc_view` — View an OC's full profile\n"
-        "`/oc_list` — Browse/filter OCs "
-        "(filter_by, filter_value, search_name)\n"
+        "`/oc_list` — Browse/filter OCs with interactive paginator\n"
     ))
     embed.add_field(name="Dorm Management", inline=False, value=(
-        "`/dorm_create` *(admin)* — Create a dorm\n"
-        "`/dorm_add_floor` *(admin)* — Add a floor + channel\n"
+        "`/dorm_create` *(admin)* — Create a dorm with all its floors initially\n"
+        "`/dorm_add_floor` *(admin)* — Add an extra floor to an existing dorm\n"
         "`/dorm_assign` — Assign OC to a floor\n"
         "`/dorm_unassign` — Remove OC from their floor\n"
         "`/dorm_view` — View dorm occupancy\n"
