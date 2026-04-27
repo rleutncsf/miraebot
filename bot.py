@@ -36,6 +36,7 @@ AUDIT_CHANNEL_NAME        = "logs"            # ALL user action audit trail
 DEBUT_CHANNEL_NAME        = "debuts"
 NEWS_CHANNEL_NAME         = "announcements"
 DEV_RESPONSE_CHANNEL_NAME = "dev-responses"   # Dev DM responses
+DB_BACKUP_CHANNEL_NAME    = "bot-db-backup"   # Automatic DB persistence channel
 BIRTHDAY_FORMAT           = "%d/%m/%Y"
 BIRTHDAY_DISPLAY          = "DD/MM/YYYY"
 DORM_SIZES                = [2, 3]
@@ -44,6 +45,10 @@ PORT                      = int(os.environ.get("PORT", 8080))
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
+
+# State Flags for DB Persistence
+DB_LOADED  = False
+DATA_DIRTY = False
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 def load_data() -> dict:
@@ -57,8 +62,10 @@ def load_data() -> dict:
     return d
 
 def save_data(data: dict) -> None:
+    global DATA_DIRTY
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    DATA_DIRTY = True
 
 def get_age(birthday_str: str):
     try:
@@ -69,7 +76,7 @@ def get_age(birthday_str: str):
     except Exception:
         return None
 
-def is_admin(interaction: discord.Interaction) -> bool:
+def is_dev(interaction: discord.Interaction) -> bool:
     return (interaction.guild.owner_id == interaction.user.id
             or interaction.user.guild_permissions.administrator)
 
@@ -140,15 +147,94 @@ class _Health(BaseHTTPRequestHandler):
 def _run_http():
     HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
 
+# ─── Guard check to prevent overwriting memory during bootup ───────────────────
+@bot.tree.interaction_check
+async def global_interaction_check(interaction: discord.Interaction) -> bool:
+    if not DB_LOADED:
+        await interaction.response.send_message(
+            "⏳ The bot is currently booting up and restoring memory. Please try again in a moment.", 
+            ephemeral=True
+        )
+        return False
+    return True
+
 # ─── on_ready ──────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    global DB_LOADED
+
+    if not DB_LOADED:
+        # Attempt to restore DB from the backup channel
+        for guild in bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
+            if not ch:
+                try:
+                    # Try placing it under a Special category if it exists
+                    cat = discord.utils.get(guild.categories, name="Special")
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True)
+                    }
+                    ch = await guild.create_text_channel(DB_BACKUP_CHANNEL_NAME, category=cat, overwrites=overwrites)
+                except Exception:
+                    continue
+
+            if ch:
+                try:
+                    async for message in ch.history(limit=10):
+                        if message.attachments:
+                            att = message.attachments[0]
+                            if att.filename == "data.json":
+                                file_bytes = await att.read()
+                                with open(DATA_FILE, "wb") as f:
+                                    f.write(file_bytes)
+                                log.info("Successfully restored database memory from Discord backup.")
+                                break
+                except Exception as e:
+                    log.error(f"Error fetching DB backup: {e}")
+                break
+
+        DB_LOADED = True
+
     await bot.tree.sync()
     if not check_birthdays.is_running():
         check_birthdays.start()
     if not check_scheduled.is_running():
         check_scheduled.start()
+    if not auto_backup_db.is_running():
+        auto_backup_db.start()
+        
     log.info("Logged in as %s — slash commands synced", bot.user)
+
+
+# ─── Automated Backup loop ─────────────────────────────────────────────────────
+@tasks.loop(minutes=1)
+async def auto_backup_db():
+    global DATA_DIRTY
+    if not DATA_DIRTY or not DB_LOADED:
+        return
+    
+    if not os.path.exists(DATA_FILE):
+        return
+
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
+        if ch:
+            try:
+                # Clean up old backups to prevent channel clutter
+                async for msg in ch.history(limit=5):
+                    if msg.author == bot.user:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+                
+                file = discord.File(DATA_FILE, filename="data.json")
+                await ch.send(f"Automated DB Backup - {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}", file=file)
+                DATA_DIRTY = False
+                break
+            except Exception as e:
+                log.error(f"Backup failed: {e}")
 
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
 @tasks.loop(hours=24)
@@ -201,7 +287,7 @@ async def check_scheduled():
 #  OC MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="oc_add", description="Register a new OC to the database.")
+@bot.tree.command(name="oc_add", description="Register a new OC to the database (unlimited OCs per user).")
 @app_commands.describe(
     name="OC's full name", 
     birthday=f"Birthday in {BIRTHDAY_DISPLAY}", gender="OC's gender",
@@ -379,9 +465,9 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
             
     oc = data["ocs"][key]
     
-    if not is_admin(interaction) and interaction.user.id != oc.get("owner_id"):
+    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
         return await interaction.response.send_message(
-            "❌ You do not have permission to delete this OC. Only the owner or an admin can delete it.", 
+            "❌ You do not have permission to delete this OC. Only the owner or a dev can delete it.", 
             ephemeral=True)
             
     del data["ocs"][key]
@@ -505,12 +591,12 @@ async def oc_list(
 #  FLOOR & DORM MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="floor_create", description="[Admin] Create a new floor category.")
+@bot.tree.command(name="floor_create", description="[Dev] Create a new floor category.")
 @app_commands.describe(floor_name="Display name for the floor (e.g. 1st Floor)")
 async def floor_create(interaction: discord.Interaction, floor_name: str):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can create floors.", ephemeral=True)
+            "❌ Only devs can create floors.", ephemeral=True)
 
     data = load_data()
     key  = dorm_key_of(floor_name)
@@ -533,7 +619,7 @@ async def floor_create(interaction: discord.Interaction, floor_name: str):
                 f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
 
 
-@bot.tree.command(name="dorm_create", description="[Admin] Create a dorm room inside a floor.")
+@bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
 @app_commands.describe(
     floor_name="Name of the floor this room belongs to",
     room_name="Name for the room (e.g. Room 101)",
@@ -545,9 +631,9 @@ async def dorm_create(
     room_name: str,
     capacity: int
 ):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can create dorms.", ephemeral=True)
+            "❌ Only devs can create dorms.", ephemeral=True)
 
     if capacity not in DORM_SIZES:
         return await interaction.response.send_message(
@@ -757,10 +843,10 @@ async def dorm_view(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEWS  (admin only)
+#  NEWS  (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="news_post", description="[Admin] Post a news article embed.")
+@bot.tree.command(name="news_post", description="[Dev] Post a news article embed.")
 @app_commands.describe(
     title="Article headline", content="Article body",
     image_url="Optional image URL")
@@ -770,9 +856,9 @@ async def news_post(
     content: str,
     image_url: Optional[str] = None,
 ):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can post news.", ephemeral=True)
+            "❌ Only devs can post news.", ephemeral=True)
 
     if image_url and not valid_image_url(image_url):
         return await interaction.response.send_message(
@@ -801,11 +887,11 @@ async def news_post(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCHEDULED ANNOUNCEMENTS  (admin only)
+#  SCHEDULED ANNOUNCEMENTS  (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="announce_schedule",
-                  description="[Admin] Schedule an announcement for a future time (UTC).")
+                  description="[Dev] Schedule an announcement for a future time (UTC).")
 @app_commands.describe(
     title="Announcement title",
     content="Announcement body text",
@@ -821,9 +907,9 @@ async def announce_schedule(
     channel: Optional[str] = None,
     image_url: Optional[str] = None,
 ):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can schedule announcements.", ephemeral=True)
+            "❌ Only devs can schedule announcements.", ephemeral=True)
 
     try:
         fire_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M").replace(
@@ -871,11 +957,11 @@ async def announce_schedule(
 
 
 @bot.tree.command(name="announce_list",
-                  description="[Admin] List all pending scheduled announcements.")
+                  description="[Dev] List all pending scheduled announcements.")
 async def announce_list(interaction: discord.Interaction):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can view scheduled announcements.", ephemeral=True)
+            "❌ Only devs can view scheduled announcements.", ephemeral=True)
 
     data    = load_data()
     pending = {k: v for k, v in data["scheduled"].items() if not v.get("fired")}
@@ -894,12 +980,12 @@ async def announce_list(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="announce_cancel",
-                  description="[Admin] Cancel a scheduled announcement by ID.")
+                  description="[Dev] Cancel a scheduled announcement by ID.")
 @app_commands.describe(sched_id="Announcement ID from /announce_list")
 async def announce_cancel(interaction: discord.Interaction, sched_id: str):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can cancel announcements.", ephemeral=True)
+            "❌ Only devs can cancel announcements.", ephemeral=True)
 
     data = load_data()
     if sched_id not in data["scheduled"]:
@@ -1200,10 +1286,10 @@ async def ig_comment(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DEV DM COMMAND (admin only)
+#  DEV DM COMMAND (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class DevDMModal(discord.ui.Modal, title="Reply to Admin"):
+class DevDMModal(discord.ui.Modal, title="Reply to Dev"):
     response_text = discord.ui.TextInput(
         label="Your Response", 
         style=discord.TextStyle.paragraph, 
@@ -1236,10 +1322,10 @@ class DevDMModal(discord.ui.Modal, title="Reply to Admin"):
         else:
             embed.set_author(name=interaction.user.display_name)
             
-        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Admin ID: {self.dev_id}")
+        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Dev ID: {self.dev_id}")
         
         await ch.send(embed=embed)
-        await interaction.response.send_message("✅ Your response has been sent to the administrators.", ephemeral=True)
+        await interaction.response.send_message("✅ Your response has been sent to the developers.", ephemeral=True)
 
 
 class DevDMView(discord.ui.View):
@@ -1253,7 +1339,7 @@ class DevDMView(discord.ui.View):
         await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
 
 
-@bot.tree.command(name="dev_dm", description="[Admin] Send a DM to a specific user.")
+@bot.tree.command(name="dev_dm", description="[Dev] Send a DM to a specific user.")
 @app_commands.describe(
     user="The user to message",
     message="Message content",
@@ -1265,12 +1351,12 @@ async def dev_dm(
     message: str, 
     require_response: bool = False
 ):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can use this command.", ephemeral=True)
+            "❌ Only devs can use this command.", ephemeral=True)
             
     embed = discord.Embed(
-        title="Message from Server Admin", 
+        title="Message from Server Dev", 
         description=message, 
         color=discord.Color.brand_red(),
         timestamp=now_utc()
@@ -1288,7 +1374,7 @@ async def dev_dm(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DEBUT DM  (admin only)
+#  DEBUT DM  (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DebutView(discord.ui.View):
@@ -1345,7 +1431,7 @@ class DebutView(discord.ui.View):
 
 
 @bot.tree.command(name="debut_notify",
-                  description="[Admin] DM a user a debut contract for their OC.")
+                  description="[Dev] DM a user a debut contract for their OC.")
 @app_commands.describe(
     oc_name="Name of the OC being offered a debut",
     group_name="Name of the group the OC is debuting in",
@@ -1360,9 +1446,9 @@ async def debut_notify(
     message: str,
     channel_message: Optional[str] = None,
 ):
-    if not is_admin(interaction):
+    if not is_dev(interaction):
         return await interaction.response.send_message(
-            "❌ Only admins can send debut notifications.", ephemeral=True)
+            "❌ Only devs can send debut notifications.", ephemeral=True)
 
     data   = load_data()
     oc_key = oc_key_of(oc_name)
@@ -1620,24 +1706,24 @@ async def oc_groupchat(
 async def oc_help(interaction: discord.Interaction):
     embed = discord.Embed(title="OC Bot — Command Reference", color=discord.Color.gold())
     embed.add_field(name="OC Management", inline=False, value=(
-        "`/oc_add` — Register a new OC (supports file upload)\n"
+        "`/oc_add` — Register a new OC (supports file upload; unlimited per user)\n"
         "`/oc_edit` — Edit OC fields (only filled fields change)\n"
         "`/oc_delete` — Delete your OC entirely\n"
         "`/oc_view` — View an OC's full profile\n"
         "`/oc_list` — Browse/filter OCs with interactive paginator\n"
     ))
     embed.add_field(name="Floor/Dorm Management", inline=False, value=(
-        "`/floor_create` *(admin)* — Create a floor category\n"
-        "`/dorm_create` *(admin)* — Create a dorm room inside a floor\n"
+        "`/floor_create` *(dev)* — Create a floor category\n"
+        "`/dorm_create` *(dev)* — Create a dorm room inside a floor\n"
         "`/dorm_assign` — Assign an OC to a room\n"
         "`/dorm_unassign` — Remove an OC from their room\n"
         "`/dorm_view` — View floors and rooms interactively\n"
     ))
     embed.add_field(name="News & Announcements", inline=False, value=(
-        "`/news_post` *(admin)* — Post a news article\n"
-        "`/announce_schedule` *(admin)* — Schedule a future announcement\n"
-        "`/announce_list` *(admin)* — View pending scheduled announcements\n"
-        "`/announce_cancel` *(admin)* — Cancel a scheduled announcement\n"
+        "`/news_post` *(dev)* — Post a news article\n"
+        "`/announce_schedule` *(dev)* — Schedule a future announcement\n"
+        "`/announce_list` *(dev)* — View pending scheduled announcements\n"
+        "`/announce_cancel` *(dev)* — Cancel a scheduled announcement\n"
     ))
     embed.add_field(name="Instagram", inline=False, value=(
         "`/ig_post` — Post 1–10 photos (files or URLs) as your OC (Like & Comment included)\n"
@@ -1646,8 +1732,8 @@ async def oc_help(interaction: discord.Interaction):
     embed.add_field(name="Messaging", inline=False, value=(
         "`/oc_dm` — Private DM channel between two OCs\n"
         "`/oc_groupchat` — Group chat for multiple OCs\n"
-        "`/debut_notify` *(admin)* — Send a debut contract DM\n"
-        "`/dev_dm` *(admin)* — Message a user directly with optional reply button\n"
+        "`/debut_notify` *(dev)* — Send a debut contract DM\n"
+        "`/dev_dm` *(dev)* — Message a user directly with optional reply button\n"
     ))
     embed.add_field(name="Notes", inline=False, value=(
         f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -1656,6 +1742,7 @@ async def oc_help(interaction: discord.Interaction):
         f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
         f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
         f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
+        f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
         f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
         f"Scheduled time format: YYYY-MM-DD HH:MM (UTC)\n"
         f"Up to {MAX_PHOTOS} photos per Instagram post\n"
