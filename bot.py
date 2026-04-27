@@ -1,4 +1,3 @@
-
 """
 OC & Dorm Discord Bot  ·  v3
 ─────────────────────────────────────────────────────────────────────────────
@@ -31,16 +30,17 @@ logging.basicConfig(
 log = logging.getLogger("oc-bot")
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-DATA_FILE          = os.environ.get("DATA_FILE", "data.json")
-LOG_CHANNEL_NAME   = "oc-log"          # OC registrations, dorm logs
-AUDIT_CHANNEL_NAME = "logs"            # ALL user action audit trail
-DEBUT_CHANNEL_NAME = "debuts"
-NEWS_CHANNEL_NAME  = "announcements"
-BIRTHDAY_FORMAT    = "%d/%m/%Y"
-BIRTHDAY_DISPLAY   = "DD/MM/YYYY"
-DORM_SIZES         = [2, 3]
-MAX_PHOTOS         = 10
-PORT               = int(os.environ.get("PORT", 8080))
+DATA_FILE                 = os.environ.get("DATA_FILE", "data.json")
+LOG_CHANNEL_NAME          = "oc-log"          # OC registrations, dorm logs
+AUDIT_CHANNEL_NAME        = "logs"            # ALL user action audit trail
+DEBUT_CHANNEL_NAME        = "debuts"
+NEWS_CHANNEL_NAME         = "announcements"
+DEV_RESPONSE_CHANNEL_NAME = "dev-responses"   # Dev DM responses
+BIRTHDAY_FORMAT           = "%d/%m/%Y"
+BIRTHDAY_DISPLAY          = "DD/MM/YYYY"
+DORM_SIZES                = [2, 3]
+MAX_PHOTOS                = 10
+PORT                      = int(os.environ.get("PORT", 8080))
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
@@ -48,11 +48,11 @@ FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"ocs": {}, "dorms": {}, "instagram": {}, "dms": {},
+        return {"ocs": {}, "floors": {}, "dorms": {}, "instagram": {}, "dms": {},
                 "groupchats": {}, "scheduled": {}}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    for k in ("ocs", "dorms", "instagram", "dms", "groupchats", "scheduled"):
+    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled"):
         d.setdefault(k, {})
     return d
 
@@ -86,8 +86,8 @@ def oc_key_of(name: str) -> str:
 def dorm_key_of(name: str) -> str:
     return name.lower().replace(" ", "-")
 
-def floor_key_of(n: int) -> str:
-    return f"floor-{n}"
+def room_key_of(name: str) -> str:
+    return name.lower().replace(" ", "-")
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -354,17 +354,58 @@ async def oc_edit(
     new_key = oc_key_of(oc["name"])
     if new_key != key:
         data["ocs"][new_key] = data["ocs"].pop(key)
-        for dorm in data["dorms"].values():
-            for floor in dorm["floors"].values():
-                if key in floor["occupants"]:
-                    floor["occupants"].remove(key)
-                    floor["occupants"].append(new_key)
+        for floor in data["floors"].values():
+            for room in floor["rooms"].values():
+                if key in room["occupants"]:
+                    room["occupants"].remove(key)
+                    room["occupants"].append(new_key)
 
     save_data(data)
     embed = build_oc_embed(oc, new_key)
     await interaction.response.send_message(
         f"**{oc['name']}** updated.\n\n**Changes:**\n" + "\n".join(changes),
         embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="oc_delete", description="Delete an OC entirely.")
+@app_commands.describe(oc_name="Name of the OC to delete")
+async def oc_delete(interaction: discord.Interaction, oc_name: str):
+    data = load_data()
+    key  = oc_key_of(oc_name)
+    
+    if key not in data["ocs"]:
+        return await interaction.response.send_message(
+            f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+            
+    oc = data["ocs"][key]
+    
+    if not is_admin(interaction) and interaction.user.id != oc.get("owner_id"):
+        return await interaction.response.send_message(
+            "❌ You do not have permission to delete this OC. Only the owner or an admin can delete it.", 
+            ephemeral=True)
+            
+    del data["ocs"][key]
+    
+    # Remove from floors/rooms
+    for floor in data["floors"].values():
+        for room in floor.get("rooms", {}).values():
+            if key in room.get("occupants", []):
+                room["occupants"].remove(key)
+                
+    # Remove from group chats
+    for gc in data["groupchats"].values():
+        if key in gc.get("participants", []):
+            gc["participants"].remove(key)
+            
+    # Remove from DMs
+    for dm in data["dms"].values():
+        if key in dm.get("participants", []):
+            dm["participants"].remove(key)
+            
+    save_data(data)
+    
+    await interaction.response.send_message(f"✅ **{oc['name']}** has been deleted.", ephemeral=True)
+    await audit(interaction.guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
 
 
 @bot.tree.command(name="oc_view", description="View an OC's full profile.")
@@ -461,21 +502,48 @@ async def oc_list(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DORM MANAGEMENT
+#  FLOOR & DORM MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="dorm_create",
-                  description="[Admin] Create a new dorm and set up all its floors.")
+@bot.tree.command(name="floor_create", description="[Admin] Create a new floor category.")
+@app_commands.describe(floor_name="Display name for the floor (e.g. 1st Floor)")
+async def floor_create(interaction: discord.Interaction, floor_name: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(
+            "❌ Only admins can create floors.", ephemeral=True)
+
+    data = load_data()
+    key  = dorm_key_of(floor_name)
+    if key in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ A floor named **{floor_name}** already exists.", ephemeral=True)
+
+    data["floors"][key] = {"name": floor_name, "rooms": {}}
+    save_data(data)
+
+    category = discord.utils.get(interaction.guild.categories, name=floor_name)
+    if category is None:
+        await interaction.guild.create_category(floor_name)
+
+    await interaction.response.send_message(
+        f"Floor **{floor_name}** created.\n"
+        f"Use `/dorm_create` to add rooms to this floor.", ephemeral=True)
+
+    await audit(interaction.guild,
+                f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
+
+
+@bot.tree.command(name="dorm_create", description="[Admin] Create a dorm room inside a floor.")
 @app_commands.describe(
-    dorm_name="Display name for the dorm",
-    capacity="Capacity per floor: 2 or 3",
-    num_floors="Number of floors to create initially",
+    floor_name="Name of the floor this room belongs to",
+    room_name="Name for the room (e.g. Room 101)",
+    capacity="Capacity for this room (2 or 3)",
 )
 async def dorm_create(
     interaction: discord.Interaction, 
-    dorm_name: str, 
-    capacity: int, 
-    num_floors: int
+    floor_name: str, 
+    room_name: str,
+    capacity: int
 ):
     if not is_admin(interaction):
         return await interaction.response.send_message(
@@ -484,179 +552,121 @@ async def dorm_create(
     if capacity not in DORM_SIZES:
         return await interaction.response.send_message(
             f"❌ Capacity must be **2** or **3**, not `{capacity}`.", ephemeral=True)
-            
-    if num_floors < 1:
-        return await interaction.response.send_message(
-            "❌ You must create at least 1 floor.", ephemeral=True)
 
     data = load_data()
-    key  = dorm_key_of(dorm_name)
-    if key in data["dorms"]:
+    f_key = dorm_key_of(floor_name)
+    r_key = room_key_of(room_name)
+
+    if f_key not in data["floors"]:
         return await interaction.response.send_message(
-            f"❌ A dorm named **{dorm_name}** already exists.", ephemeral=True)
+            f"❌ No floor named **{floor_name}** found. Use `/floor_create` first.", ephemeral=True)
+
+    floor = data["floors"][f_key]
+    if r_key in floor["rooms"]:
+        return await interaction.response.send_message(
+            f"❌ A room named **{room_name}** already exists on this floor.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
 
-    data["dorms"][key] = {"name": dorm_name, "capacity_per_floor": capacity, "floors": {}}
+    floor["rooms"][r_key] = {"name": room_name, "capacity": capacity, "occupants": []}
     
-    category = discord.utils.get(interaction.guild.categories, name="Dorms")
+    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
     if category is None:
-        category = await interaction.guild.create_category("Dorms")
+        category = await interaction.guild.create_category(floor["name"])
 
-    for i in range(1, num_floors + 1):
-        floor_key = floor_key_of(i)
-        data["dorms"][key]["floors"][floor_key] = {"capacity": capacity, "occupants": []}
-
-        ch_name = f"{key}-{floor_key}"
-        if not discord.utils.get(interaction.guild.text_channels, name=ch_name):
-            overwrites = {
-                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
-            }
-            if interaction.guild.owner:
-                overwrites[interaction.guild.owner] = discord.PermissionOverwrite(view_channel=True)
-            await interaction.guild.create_text_channel(
-                ch_name, category=category, overwrites=overwrites)
-
-    save_data(data)
-
-    await interaction.followup.send(
-        f"Dorm **{dorm_name}** created with **{num_floors}** floor(s) (capacity: **{capacity}**/floor).")
-
-    await audit(interaction.guild,
-                f"Dorm created: '{dorm_name}' with {num_floors} floors (cap {capacity}/floor) "
-                f"by {interaction.user} ({interaction.user.id})")
-
-
-@bot.tree.command(name="dorm_add_floor",
-                  description="[Admin] Add an extra floor to an existing dorm.")
-@app_commands.describe(dorm_name="Name of the dorm")
-async def dorm_add_floor(interaction: discord.Interaction, dorm_name: str):
-    if not is_admin(interaction):
-        return await interaction.response.send_message(
-            "❌ Only admins can add floors.", ephemeral=True)
-
-    data = load_data()
-    key  = dorm_key_of(dorm_name)
-    if key not in data["dorms"]:
-        return await interaction.response.send_message(
-            f"❌ No dorm named **{dorm_name}** found.", ephemeral=True)
-
-    dorm      = data["dorms"][key]
-    floor_num = len(dorm["floors"]) + 1
-    floor_key = floor_key_of(floor_num)
-
-    dorm["floors"][floor_key] = {
-        "capacity": dorm["capacity_per_floor"], "occupants": []}
-    save_data(data)
-
-    category = discord.utils.get(interaction.guild.categories, name="Dorms")
-    if category is None:
-        category = await interaction.guild.create_category("Dorms")
-
-    ch_name = f"{key}-{floor_key}"
-    if not discord.utils.get(interaction.guild.text_channels, name=ch_name):
+    ch_name = f"{r_key}"
+    if not discord.utils.get(interaction.guild.text_channels, name=ch_name, category=category):
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
         }
         if interaction.guild.owner:
-            overwrites[interaction.guild.owner] = discord.PermissionOverwrite(
-                view_channel=True)
+            overwrites[interaction.guild.owner] = discord.PermissionOverwrite(view_channel=True)
         await interaction.guild.create_text_channel(
             ch_name, category=category, overwrites=overwrites)
 
-    await interaction.response.send_message(
-        f"Floor {floor_num} added to **{dorm['name']}**. Channel `#{ch_name}` created.",
-        ephemeral=True)
+    save_data(data)
+
+    await interaction.followup.send(
+        f"Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
 
     await audit(interaction.guild,
-                f"Floor {floor_num} added to dorm '{dorm_name}' "
+                f"Room created: '{room_name}' on '{floor['name']}' (cap {capacity}) "
                 f"by {interaction.user} ({interaction.user.id})")
 
 
-@bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm floor.")
+@bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm room.")
 @app_commands.describe(
-    oc_name="OC name", dorm_name="Dorm name", floor="Floor number")
+    oc_name="OC name", floor_name="Floor name", room_name="Room name")
 async def dorm_assign(
-    interaction: discord.Interaction, oc_name: str, dorm_name: str, floor: int
+    interaction: discord.Interaction, oc_name: str, floor_name: str, room_name: str
 ):
-    data     = load_data()
-    oc_key   = oc_key_of(oc_name)
-    dorm_k   = dorm_key_of(dorm_name)
-    floor_k  = floor_key_of(floor)
+    data   = load_data()
+    oc_key = oc_key_of(oc_name)
+    f_key  = dorm_key_of(floor_name)
+    r_key  = room_key_of(room_name)
 
     if oc_key not in data["ocs"]:
         return await interaction.response.send_message(
             f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
-    if dorm_k not in data["dorms"]:
+    if f_key not in data["floors"]:
         return await interaction.response.send_message(
-            f"❌ No dorm named **{dorm_name}** found.", ephemeral=True)
+            f"❌ No floor named **{floor_name}** found.", ephemeral=True)
 
-    dorm = data["dorms"][dorm_k]
-    if floor_k not in dorm["floors"]:
-        max_fl = len(dorm["floors"])
+    floor = data["floors"][f_key]
+    if r_key not in floor["rooms"]:
         return await interaction.response.send_message(
-            f"❌ **{dorm_name}** has **{max_fl}** floor(s). "
-            f"Floor `{floor}` does not exist.", ephemeral=True)
+            f"❌ Room **{room_name}** does not exist on **{floor_name}**.", ephemeral=True)
 
-    for dk, dv in data["dorms"].items():
-        for fk, fv in dv["floors"].items():
-            if oc_key in fv["occupants"]:
+    for f_k, f_v in data["floors"].items():
+        for r_k, r_v in f_v["rooms"].items():
+            if oc_key in r_v["occupants"]:
                 return await interaction.response.send_message(
-                    f"❌ **{oc_name}** is already in "
-                    f"**{dv['name']} – {fk.replace('-', ' ').title()}**.",
+                    f"❌ **{oc_name}** is already assigned to "
+                    f"**{r_v['name']}** on **{f_v['name']}**.",
                     ephemeral=True)
 
-    floor_data = dorm["floors"][floor_k]
-    if len(floor_data["occupants"]) >= floor_data["capacity"]:
-        available = [
-            f"Floor {fk.split('-')[1]}  —  "
-            f"{fv['capacity'] - len(fv['occupants'])} spot(s) left"
-            for fk, fv in dorm["floors"].items()
-            if len(fv["occupants"]) < fv["capacity"]
-        ]
-        avail_str = "\n".join(f"• {a}" for a in available) or "No floors available."
+    room_data = floor["rooms"][r_key]
+    if len(room_data["occupants"]) >= room_data["capacity"]:
         return await interaction.response.send_message(
-            f"❌ **{dorm_name} – Floor {floor}** is full "
-            f"({floor_data['capacity']}/{floor_data['capacity']}).\n\n"
-            f"**Available floors in {dorm_name}:**\n{avail_str}",
+            f"❌ **{room_name}** is full ({room_data['capacity']}/{room_data['capacity']}).",
             ephemeral=True)
 
-    floor_data["occupants"].append(oc_key)
+    room_data["occupants"].append(oc_key)
     save_data(data)
 
-    ch_name = f"{dorm_k}-{floor_k}"
-    channel = discord.utils.get(interaction.guild.text_channels, name=ch_name)
+    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+    ch_name = f"{r_key}"
+    channel = discord.utils.get(interaction.guild.text_channels, name=ch_name, category=category)
     if channel:
         await channel.set_permissions(
             interaction.user, view_channel=True, send_messages=True)
 
     occupants_display = ", ".join(
-        data["ocs"][o]["name"] for o in floor_data["occupants"] if o in data["ocs"])
-    is_full = len(floor_data["occupants"]) >= floor_data["capacity"]
+        data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
+    is_full = len(room_data["occupants"]) >= room_data["capacity"]
 
     await interaction.response.send_message(
-        f"**{oc_name}** assigned to **{dorm_name} – Floor {floor}**.\n"
+        f"**{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n"
         f"Occupants: {occupants_display}\n"
         f"Status: {'Full' if is_full else 'Has space'}")
 
     log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
     if log_ch:
-        spots      = floor_data["capacity"] - len(floor_data["occupants"])
+        spots      = room_data["capacity"] - len(room_data["occupants"])
         room_note  = "Room is now full." if is_full else f"{spots} spot(s) remaining."
         await log_ch.send(
-            f"**{oc_name}** assigned to **{dorm_name} – Floor {floor}** "
+            f"**{oc_name}** assigned to **{room_name}** on **{floor_name}** "
             f"by {interaction.user.mention}. {room_note}")
 
     await audit(interaction.guild,
-                f"OC '{oc_name}' assigned to '{dorm_name}' floor {floor} "
+                f"OC '{oc_name}' assigned to '{room_name}' on '{floor_name}' "
                 f"by {interaction.user} ({interaction.user.id}). "
                 f"{'Room full.' if is_full else ''}")
 
 
-@bot.tree.command(name="dorm_unassign", description="Remove an OC from their dorm.")
+@bot.tree.command(name="dorm_unassign", description="Remove an OC from their room.")
 @app_commands.describe(oc_name="Name of the OC to unassign")
 async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
     data   = load_data()
@@ -665,68 +675,85 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
         return await interaction.response.send_message(
             f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
-    for dorm_k, dorm in data["dorms"].items():
-        for floor_k, floor_data in dorm["floors"].items():
-            if oc_key in floor_data["occupants"]:
-                floor_data["occupants"].remove(oc_key)
+    for f_key, floor in data["floors"].items():
+        for r_key, room_data in floor["rooms"].items():
+            if oc_key in room_data["occupants"]:
+                room_data["occupants"].remove(oc_key)
                 save_data(data)
-                ch = discord.utils.get(
-                    interaction.guild.text_channels,
-                    name=f"{dorm_k}-{floor_k}")
+                
+                category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+                ch = discord.utils.get(interaction.guild.text_channels, name=f"{r_key}", category=category)
                 if ch:
                     await ch.set_permissions(interaction.user, overwrite=None)
+                    
                 await interaction.response.send_message(
-                    f"**{oc_name}** removed from "
-                    f"**{dorm['name']} – {floor_k.replace('-', ' ').title()}**.")
+                    f"**{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.")
                 await audit(interaction.guild,
                             f"OC '{oc_name}' unassigned from dorm "
                             f"by {interaction.user} ({interaction.user.id})")
                 return
 
     await interaction.response.send_message(
-        f"❌ **{oc_name}** is not assigned to any dorm.", ephemeral=True)
+        f"❌ **{oc_name}** is not assigned to any dorm room.", ephemeral=True)
 
 
-@bot.tree.command(name="dorm_view", description="View dorm occupancy.")
-@app_commands.describe(dorm_name="Specific dorm to view (leave blank for all)")
-async def dorm_view(interaction: discord.Interaction, dorm_name: Optional[str] = None):
-    data = load_data()
-    if not data["dorms"]:
-        return await interaction.response.send_message(
-            "❌ No dorms have been created yet.", ephemeral=True)
+class DormPaginatorView(discord.ui.View):
+    def __init__(self, floors_items: list, ocs: dict):
+        super().__init__(timeout=300)
+        self.floors = floors_items
+        self.ocs = ocs
+        self.current_index = 0
+        self._update_buttons()
 
-    if dorm_name:
-        key = dorm_key_of(dorm_name)
-        if key not in data["dorms"]:
-            return await interaction.response.send_message(
-                f"❌ No dorm named **{dorm_name}** found.", ephemeral=True)
-        dorms_to_show = {key: data["dorms"][key]}
-    else:
-        dorms_to_show = data["dorms"]
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.current_index == 0
+        self.next_btn.disabled = len(self.floors) == 0 or self.current_index == len(self.floors) - 1
 
-    first = True
-    for dorm_k, dorm in dorms_to_show.items():
-        embed = discord.Embed(title=dorm["name"], color=discord.Color.green())
-        if not dorm["floors"]:
-            embed.description = "No floors added yet. Use /dorm_add_floor."
-        for floor_k, floor_data in dorm["floors"].items():
-            floor_num = floor_k.split("-")[1]
-            occupants = [
-                data["ocs"][o]["name"]
-                for o in floor_data["occupants"] if o in data["ocs"]]
+    def get_embed(self):
+        if not self.floors:
+            return discord.Embed(title="No Floors", description="No floors have been created yet.")
+            
+        f_key, floor = self.floors[self.current_index]
+        embed = discord.Embed(title=f"Floor: {floor['name']}", color=discord.Color.green())
+        
+        if not floor["rooms"]:
+            embed.description = "No rooms added yet. Use /dorm_create."
+            
+        for r_key, room_data in floor["rooms"].items():
+            occupants = [self.ocs[o]["name"] for o in room_data["occupants"] if o in self.ocs]
             occ_str   = ", ".join(occupants) if occupants else "Empty"
-            is_full   = len(floor_data["occupants"]) >= floor_data["capacity"]
-            status    = ("Full"
-                         if is_full
-                         else f"{floor_data['capacity'] - len(floor_data['occupants'])} spot(s) left")
+            is_full   = len(room_data["occupants"]) >= room_data["capacity"]
+            status    = "Full" if is_full else f"{room_data['capacity'] - len(room_data['occupants'])} spot(s) left"
+            
             embed.add_field(
-                name=f"Floor {floor_num}  [{len(floor_data['occupants'])}/{floor_data['capacity']}]  {status}",
+                name=f"{room_data['name']}  [{len(room_data['occupants'])}/{room_data['capacity']}]  {status}",
                 value=occ_str, inline=False)
-        if first:
-            await interaction.response.send_message(embed=embed)
-            first = False
-        else:
-            await interaction.followup.send(embed=embed)
+                
+        embed.set_footer(text=f"Floor {self.current_index + 1} of {len(self.floors)}")
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="prev_floor")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="next_floor")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_index += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+@bot.tree.command(name="dorm_view", description="View floors and dorm occupancy.")
+async def dorm_view(interaction: discord.Interaction):
+    data = load_data()
+    if not data["floors"]:
+        return await interaction.response.send_message(
+            "❌ No floors have been created yet.", ephemeral=True)
+
+    items = list(data["floors"].items())
+    view = DormPaginatorView(items, data["ocs"])
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1015,21 +1042,20 @@ class IGCommentModal(discord.ui.Modal, title="Leave a Comment"):
     oc_name="Your OC's name",
     username="Instagram handle (e.g. @username)",
     caption="Post caption",
-    photo1="Photo URL #1 (required)",
-    photo2="Photo URL #2",  photo3="Photo URL #3",
-    photo4="Photo URL #4",  photo5="Photo URL #5",
-    photo6="Photo URL #6",  photo7="Photo URL #7",
-    photo8="Photo URL #8",  photo9="Photo URL #9",
-    photo10="Photo URL #10",
 )
 async def ig_post(
     interaction: discord.Interaction,
-    oc_name: str, username: str, caption: str, photo1: str,
-    photo2: Optional[str] = None, photo3: Optional[str] = None,
-    photo4: Optional[str] = None, photo5: Optional[str] = None,
-    photo6: Optional[str] = None, photo7: Optional[str] = None,
-    photo8: Optional[str] = None, photo9: Optional[str] = None,
-    photo10: Optional[str] = None,
+    oc_name: str, username: str, caption: str,
+    photo1_url: Optional[str] = None, photo1_file: Optional[discord.Attachment] = None,
+    photo2_url: Optional[str] = None, photo2_file: Optional[discord.Attachment] = None,
+    photo3_url: Optional[str] = None, photo3_file: Optional[discord.Attachment] = None,
+    photo4_url: Optional[str] = None, photo4_file: Optional[discord.Attachment] = None,
+    photo5_url: Optional[str] = None, photo5_file: Optional[discord.Attachment] = None,
+    photo6_url: Optional[str] = None, photo6_file: Optional[discord.Attachment] = None,
+    photo7_url: Optional[str] = None, photo7_file: Optional[discord.Attachment] = None,
+    photo8_url: Optional[str] = None, photo8_file: Optional[discord.Attachment] = None,
+    photo9_url: Optional[str] = None, photo9_file: Optional[discord.Attachment] = None,
+    photo10_url: Optional[str] = None, photo10_file: Optional[discord.Attachment] = None,
 ):
     data   = load_data()
     oc_key = oc_key_of(oc_name)
@@ -1038,13 +1064,30 @@ async def ig_post(
         return await interaction.response.send_message(
             f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
-    photos  = [p for p in [photo1, photo2, photo3, photo4, photo5,
-                             photo6, photo7, photo8, photo9, photo10] if p]
-    invalid = [p for p in photos if not valid_image_url(p)]
-    if invalid:
+    pairs = [
+        (photo1_url, photo1_file), (photo2_url, photo2_file),
+        (photo3_url, photo3_file), (photo4_url, photo4_file),
+        (photo5_url, photo5_file), (photo6_url, photo6_file),
+        (photo7_url, photo7_file), (photo8_url, photo8_file),
+        (photo9_url, photo9_file), (photo10_url, photo10_file),
+    ]
+
+    photos = []
+    for url, file in pairs:
+        if file:
+            if not file.content_type or not file.content_type.startswith("image/"):
+                return await interaction.response.send_message(
+                    "❌ All attached files must be valid images.", ephemeral=True)
+            photos.append(file.url)
+        elif url:
+            if not valid_image_url(url):
+                return await interaction.response.send_message(
+                    f"❌ Invalid image URL provided: `{url}`", ephemeral=True)
+            photos.append(url)
+
+    if not photos:
         return await interaction.response.send_message(
-            "❌ Invalid image URL(s):\n" +
-            "\n".join(f"• `{u}`" for u in invalid), ephemeral=True)
+            "❌ You must provide at least one photo (URL or File).", ephemeral=True)
 
     oc     = data["ocs"][oc_key]
     handle = username if username.startswith("@") else f"@{username}"
@@ -1099,7 +1142,6 @@ async def ig_post(
                 f"by {interaction.user} ({interaction.user.id})  post_id={post_id}")
 
 
-# ── /ig_comment kept for backward-compat (slash command path still works) ─────
 @bot.tree.command(name="ig_comment",
                   description="Leave a comment on an Instagram post as your OC.")
 @app_commands.describe(
@@ -1155,6 +1197,94 @@ async def ig_comment(
 
     await thread.send(embed=embed)
     await interaction.response.send_message("Comment posted.", ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEV DM COMMAND (admin only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DevDMModal(discord.ui.Modal, title="Reply to Admin"):
+    response_text = discord.ui.TextInput(
+        label="Your Response", 
+        style=discord.TextStyle.paragraph, 
+        max_length=2000
+    )
+
+    def __init__(self, guild_id: int, dev_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.dev_id = dev_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            return await interaction.response.send_message("❌ Could not locate the origin server.", ephemeral=True)
+            
+        ch = discord.utils.get(guild.text_channels, name=DEV_RESPONSE_CHANNEL_NAME)
+        if not ch:
+            return await interaction.response.send_message(
+                f"❌ The server does not have a `#{DEV_RESPONSE_CHANNEL_NAME}` channel setup.", ephemeral=True)
+            
+        embed = discord.Embed(
+            title="Response to Dev Message", 
+            description=self.response_text.value, 
+            color=discord.Color.green(),
+            timestamp=now_utc()
+        )
+        if interaction.user.display_avatar:
+            embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        else:
+            embed.set_author(name=interaction.user.display_name)
+            
+        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Admin ID: {self.dev_id}")
+        
+        await ch.send(embed=embed)
+        await interaction.response.send_message("✅ Your response has been sent to the administrators.", ephemeral=True)
+
+
+class DevDMView(discord.ui.View):
+    def __init__(self, guild_id: int, dev_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.dev_id = dev_id
+
+    @discord.ui.button(label="Reply to Dev", style=discord.ButtonStyle.primary, custom_id="dev_dm_reply")
+    async def reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
+
+
+@bot.tree.command(name="dev_dm", description="[Admin] Send a DM to a specific user.")
+@app_commands.describe(
+    user="The user to message",
+    message="Message content",
+    require_response="Whether the user gets a button to reply (logs to dev-responses channel)"
+)
+async def dev_dm(
+    interaction: discord.Interaction, 
+    user: discord.Member, 
+    message: str, 
+    require_response: bool = False
+):
+    if not is_admin(interaction):
+        return await interaction.response.send_message(
+            "❌ Only admins can use this command.", ephemeral=True)
+            
+    embed = discord.Embed(
+        title="Message from Server Admin", 
+        description=message, 
+        color=discord.Color.brand_red(),
+        timestamp=now_utc()
+    )
+    embed.set_footer(text=f"From Server: {interaction.guild.name}")
+    
+    view = DevDMView(interaction.guild.id, interaction.user.id) if require_response else None
+    
+    try:
+        await user.send(embed=embed, view=view)
+        await interaction.response.send_message(f"✅ DM successfully sent to {user.mention}.", ephemeral=True)
+        await audit(interaction.guild, f"Dev DM sent to {user} by {interaction.user}. Requires response: {require_response}")
+    except discord.Forbidden:
+        await interaction.response.send_message(f"❌ Could not DM {user.mention}. They likely have DMs disabled.", ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1492,15 +1622,16 @@ async def oc_help(interaction: discord.Interaction):
     embed.add_field(name="OC Management", inline=False, value=(
         "`/oc_add` — Register a new OC (supports file upload)\n"
         "`/oc_edit` — Edit OC fields (only filled fields change)\n"
+        "`/oc_delete` — Delete your OC entirely\n"
         "`/oc_view` — View an OC's full profile\n"
         "`/oc_list` — Browse/filter OCs with interactive paginator\n"
     ))
-    embed.add_field(name="Dorm Management", inline=False, value=(
-        "`/dorm_create` *(admin)* — Create a dorm with all its floors initially\n"
-        "`/dorm_add_floor` *(admin)* — Add an extra floor to an existing dorm\n"
-        "`/dorm_assign` — Assign OC to a floor\n"
-        "`/dorm_unassign` — Remove OC from their floor\n"
-        "`/dorm_view` — View dorm occupancy\n"
+    embed.add_field(name="Floor/Dorm Management", inline=False, value=(
+        "`/floor_create` *(admin)* — Create a floor category\n"
+        "`/dorm_create` *(admin)* — Create a dorm room inside a floor\n"
+        "`/dorm_assign` — Assign an OC to a room\n"
+        "`/dorm_unassign` — Remove an OC from their room\n"
+        "`/dorm_view` — View floors and rooms interactively\n"
     ))
     embed.add_field(name="News & Announcements", inline=False, value=(
         "`/news_post` *(admin)* — Post a news article\n"
@@ -1509,13 +1640,14 @@ async def oc_help(interaction: discord.Interaction):
         "`/announce_cancel` *(admin)* — Cancel a scheduled announcement\n"
     ))
     embed.add_field(name="Instagram", inline=False, value=(
-        "`/ig_post` — Post 1–10 photos as your OC (Like + Comment buttons included)\n"
+        "`/ig_post` — Post 1–10 photos (files or URLs) as your OC (Like & Comment included)\n"
         "`/ig_comment` — Comment on a post via slash command\n"
     ))
     embed.add_field(name="Messaging", inline=False, value=(
         "`/oc_dm` — Private DM channel between two OCs\n"
         "`/oc_groupchat` — Group chat for multiple OCs\n"
         "`/debut_notify` *(admin)* — Send a debut contract DM\n"
+        "`/dev_dm` *(admin)* — Message a user directly with optional reply button\n"
     ))
     embed.add_field(name="Notes", inline=False, value=(
         f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -1523,6 +1655,7 @@ async def oc_help(interaction: discord.Interaction):
         f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
         f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
         f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
+        f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
         f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
         f"Scheduled time format: YYYY-MM-DD HH:MM (UTC)\n"
         f"Up to {MAX_PHOTOS} photos per Instagram post\n"
