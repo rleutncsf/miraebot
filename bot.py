@@ -37,8 +37,9 @@ DEBUT_CHANNEL_NAME        = "debuts"
 NEWS_CHANNEL_NAME         = "announcements"
 DEV_RESPONSE_CHANNEL_NAME = "dev-responses"   # Dev DM responses
 DB_BACKUP_CHANNEL_NAME    = "bot-db-backup"   # Automatic DB persistence channel
-BIRTHDAY_FORMAT           = "%d/%m/%Y"
-BIRTHDAY_DISPLAY          = "DD/MM/YYYY"
+INSTAGRAM_CHANNEL_NAME    = "instagram"
+BIRTHDAY_FORMAT           = "%Y/%m/%d"
+BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [2, 3]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
@@ -75,6 +76,18 @@ def get_age(birthday_str: str):
                 - ((today.month, today.day) < (bday.month, bday.day)))
     except Exception:
         return None
+
+def format_birthday_long(birthday_str: str) -> str:
+    """
+    Convert a stored birthday string (BIRTHDAY_FORMAT) to long date display,
+    e.g. '2000/06/25' → 'June 25, 2000'.
+    Falls back to the raw string if parsing fails.
+    """
+    try:
+        bday = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
+        return bday.strftime("%B %d, %Y").replace(" 0", " ")  # strips leading zero on day
+    except Exception:
+        return birthday_str
 
 def is_dev(interaction: discord.Interaction) -> bool:
     return (interaction.guild.owner_id == interaction.user.id
@@ -117,7 +130,7 @@ def build_oc_embed(oc: dict, key: str) -> discord.Embed:
     embed   = discord.Embed(title=oc["name"], color=discord.Color.blurple())
     if oc.get("profile_picture"):
         embed.set_thumbnail(url=oc["profile_picture"])
-    embed.add_field(name="Birthday",    value=f"{oc['birthday']}{age_str}", inline=True)
+    embed.add_field(name="Birthday",    value=f"{format_birthday_long(oc['birthday'])}{age_str}", inline=True)
     embed.add_field(name="Gender",      value=oc["gender"],                 inline=True)
     embed.add_field(name="Pronouns",    value=oc["pronouns"],               inline=True)
     embed.add_field(name="Face Claim",  value=oc["face_claim"],             inline=True)
@@ -311,7 +324,7 @@ async def oc_add(
         datetime.strptime(birthday, BIRTHDAY_FORMAT)
     except ValueError:
         return await interaction.response.send_message(
-            f"❌ Birthday must be in **{BIRTHDAY_DISPLAY}** format (e.g. `25/06/2000`).",
+            f"❌ Birthday must be in **{BIRTHDAY_DISPLAY}** format (e.g. `2000/06/25`).",
             ephemeral=True)
 
     pic_url = None
@@ -372,7 +385,7 @@ async def oc_add(
     name="New name", 
     profile_picture_url="New image URL (optional)",
     profile_picture_file="Upload new image file (optional)",
-    birthday="New birthday (DD/MM/YYYY)", gender="New gender",
+    birthday=f"New birthday ({BIRTHDAY_DISPLAY})", gender="New gender",
     pronouns="New pronouns", face_claim="New face claim",
     main_skill="New main skill", ethnicity="New ethnicity",
     nationality="New nationality", form_link="New form link"
@@ -494,17 +507,6 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
     await audit(interaction.guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
 
 
-@bot.tree.command(name="oc_view", description="View an OC's full profile.")
-@app_commands.describe(oc_name="Name of the OC")
-async def oc_view(interaction: discord.Interaction, oc_name: str):
-    data = load_data()
-    key  = oc_key_of(oc_name)
-    if key not in data["ocs"]:
-        return await interaction.response.send_message(
-            f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-    await interaction.response.send_message(embed=build_oc_embed(data["ocs"][key], key))
-
-
 class OCPaginatorView(discord.ui.View):
     def __init__(self, ocs: list, filters_text: str = ""):
         super().__init__(timeout=300)
@@ -612,7 +614,7 @@ async def floor_create(interaction: discord.Interaction, floor_name: str):
         await interaction.guild.create_category(floor_name)
 
     await interaction.response.send_message(
-        f"Floor **{floor_name}** created.\n"
+        f"🏢 Floor **{floor_name}** created.\n"
         f"Use `/dorm_create` to add rooms to this floor.", ephemeral=True)
 
     await audit(interaction.guild,
@@ -674,7 +676,7 @@ async def dorm_create(
     save_data(data)
 
     await interaction.followup.send(
-        f"Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
+        f"🚪 Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
 
     await audit(interaction.guild,
                 f"Room created: '{room_name}' on '{floor['name']}' (cap {capacity}) "
@@ -734,16 +736,16 @@ async def dorm_assign(
     is_full = len(room_data["occupants"]) >= room_data["capacity"]
 
     await interaction.response.send_message(
-        f"**{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n"
-        f"Occupants: {occupants_display}\n"
-        f"Status: {'Full' if is_full else 'Has space'}")
+        f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n"
+        f"👥 Occupants: {occupants_display}\n"
+        f"{'🔴 Full' if is_full else '🟢 Has space'}")
 
     log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
     if log_ch:
         spots      = room_data["capacity"] - len(room_data["occupants"])
-        room_note  = "Room is now full." if is_full else f"{spots} spot(s) remaining."
+        room_note  = "🔴 Room is now full." if is_full else f"🟢 {spots} spot(s) remaining."
         await log_ch.send(
-            f"**{oc_name}** assigned to **{room_name}** on **{floor_name}** "
+            f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}** "
             f"by {interaction.user.mention}. {room_note}")
 
     await audit(interaction.guild,
@@ -773,7 +775,7 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
                     await ch.set_permissions(interaction.user, overwrite=None)
                     
                 await interaction.response.send_message(
-                    f"**{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.")
+                    f"🚶 **{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.")
                 await audit(interaction.guild,
                             f"OC '{oc_name}' unassigned from dorm "
                             f"by {interaction.user} ({interaction.user.id})")
@@ -803,16 +805,16 @@ class DormPaginatorView(discord.ui.View):
         embed = discord.Embed(title=f"Floor: {floor['name']}", color=discord.Color.green())
         
         if not floor["rooms"]:
-            embed.description = "No rooms added yet. Use /dorm_create."
+            embed.description = "🪑 No rooms added yet. Use `/dorm_create` to add some."
             
         for r_key, room_data in floor["rooms"].items():
             occupants = [self.ocs[o]["name"] for o in room_data["occupants"] if o in self.ocs]
-            occ_str   = ", ".join(occupants) if occupants else "Empty"
             is_full   = len(room_data["occupants"]) >= room_data["capacity"]
-            status    = "Full" if is_full else f"{room_data['capacity'] - len(room_data['occupants'])} spot(s) left"
+            status    = "🔴 Full" if is_full else f"🟢 {room_data['capacity'] - len(room_data['occupants'])} spot(s) left"
+            occ_str   = ("🏠 " + ", ".join(occupants)) if occupants else "🪑 Empty"
             
             embed.add_field(
-                name=f"{room_data['name']}  [{len(room_data['occupants'])}/{room_data['capacity']}]  {status}",
+                name=f"🚪 {room_data['name']}  [{len(room_data['occupants'])}/{room_data['capacity']}]  {status}",
                 value=occ_str, inline=False)
                 
         embed.set_footer(text=f"Floor {self.current_index + 1} of {len(self.floors)}")
@@ -1195,8 +1197,15 @@ async def ig_post(
     data["instagram"][post_id] = post_obj
     save_data(data)
 
+    ig_ch = discord.utils.get(interaction.guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
+    if not ig_ch:
+        return await interaction.response.send_message(
+            f"❌ Channel `#{INSTAGRAM_CHANNEL_NAME}` not found. "
+            f"Please create it before posting.", ephemeral=True)
+
     await interaction.response.send_message(
-        f"Posting {handle}'s photo{'s' if len(photos) > 1 else ''}…", ephemeral=True)
+        f"📸 Posting {handle}'s photo{'s' if len(photos) > 1 else ''} to {ig_ch.mention}…",
+        ephemeral=True)
 
     view  = IGPostView(post_id, likes=0)
     embed = discord.Embed(
@@ -1211,78 +1220,21 @@ async def ig_post(
     embed.set_image(url=photos[0])
     embed.set_footer(text=f"{len(photos)} photo(s)  ·  post id: {post_id}")
 
-    msg = await interaction.channel.send(embed=embed, view=view)
+    msg = await ig_ch.send(embed=embed, view=view)
 
     for i, photo in enumerate(photos[1:], start=2):
         extra = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
         extra.set_image(url=photo)
         extra.set_footer(text=f"Photo {i}/{len(photos)}")
-        await interaction.channel.send(embed=extra)
+        await ig_ch.send(embed=extra)
 
-    data["instagram"][post_id]["channel_id"] = interaction.channel.id
+    data["instagram"][post_id]["channel_id"] = ig_ch.id
     data["instagram"][post_id]["message_id"] = msg.id
     save_data(data)
 
     await audit(interaction.guild,
                 f"IG post by OC '{oc_name}' ({handle}) "
                 f"by {interaction.user} ({interaction.user.id})  post_id={post_id}")
-
-
-@bot.tree.command(name="ig_comment",
-                  description="Leave a comment on an Instagram post as your OC.")
-@app_commands.describe(
-    post_id="The post ID shown on the post embed",
-    oc_name="Your OC's name",
-    comment="Your comment text",
-)
-async def ig_comment(
-    interaction: discord.Interaction, post_id: str, oc_name: str, comment: str
-):
-    data   = load_data()
-    oc_key = oc_key_of(oc_name)
-
-    if post_id not in data["instagram"]:
-        return await interaction.response.send_message(
-            f"❌ Post ID `{post_id}` not found.", ephemeral=True)
-
-    if oc_key not in data["ocs"]:
-        return await interaction.response.send_message(
-            f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    post      = data["instagram"][post_id]
-    oc        = data["ocs"][oc_key]
-    thread_id = post.get("thread_id")
-
-    if not thread_id:
-        ch = interaction.guild.get_channel(post.get("channel_id"))
-        if ch and post.get("message_id"):
-            msg    = await ch.fetch_message(post["message_id"])
-            thread = await msg.create_thread(
-                name=f"Comments — {post['username']}",
-                auto_archive_duration=10080)
-            post["thread_id"] = thread.id
-            save_data(data)
-        else:
-            return await interaction.response.send_message(
-                "❌ Could not locate the post.", ephemeral=True)
-    else:
-        thread = interaction.guild.get_thread(thread_id)
-        if not thread:
-            return await interaction.response.send_message(
-                "❌ Comment thread not found.", ephemeral=True)
-
-    embed = discord.Embed(
-        description=f"**{oc['name']}**  {comment}",
-        color=discord.Color.from_rgb(200, 200, 200),
-        timestamp=now_utc(),
-    )
-    if oc.get("profile_picture"):
-        embed.set_author(name=oc["name"], icon_url=oc["profile_picture"])
-    else:
-        embed.set_author(name=oc["name"])
-
-    await thread.send(embed=embed)
-    await interaction.response.send_message("Comment posted.", ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1709,7 +1661,6 @@ async def oc_help(interaction: discord.Interaction):
         "`/oc_add` — Register a new OC (supports file upload; unlimited per user)\n"
         "`/oc_edit` — Edit OC fields (only filled fields change)\n"
         "`/oc_delete` — Delete your OC entirely\n"
-        "`/oc_view` — View an OC's full profile\n"
         "`/oc_list` — Browse/filter OCs with interactive paginator\n"
     ))
     embed.add_field(name="Floor/Dorm Management", inline=False, value=(
@@ -1727,7 +1678,6 @@ async def oc_help(interaction: discord.Interaction):
     ))
     embed.add_field(name="Instagram", inline=False, value=(
         "`/ig_post` — Post 1–10 photos (files or URLs) as your OC (Like & Comment included)\n"
-        "`/ig_comment` — Comment on a post via slash command\n"
     ))
     embed.add_field(name="Messaging", inline=False, value=(
         "`/oc_dm` — Private DM channel between two OCs\n"
@@ -1741,6 +1691,7 @@ async def oc_help(interaction: discord.Interaction):
         f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
         f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
         f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
+        f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
         f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
         f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
         f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
