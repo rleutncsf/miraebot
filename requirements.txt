@@ -1,0 +1,2 @@
+# Use a modern version of discord.py to support app_commands, modals, and views
+discord.py>=2.3.0
