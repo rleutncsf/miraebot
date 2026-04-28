@@ -48,6 +48,15 @@ JST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
 
+BUTTON_COLOR_MAP = {
+    "green":   discord.ButtonStyle.success,
+    "red":     discord.ButtonStyle.danger,
+    "grey":    discord.ButtonStyle.secondary,
+    "gray":    discord.ButtonStyle.secondary,
+    "blurple": discord.ButtonStyle.primary,
+    "blue":    discord.ButtonStyle.primary,
+}
+
 # State Flags for DB Persistence
 DB_LOADED  = False
 DATA_DIRTY = False
@@ -110,6 +119,11 @@ def format_birthday_long(birthday_str: str) -> str:
 def is_dev(interaction: discord.Interaction) -> bool:
     return (interaction.guild.owner_id == interaction.user.id
             or interaction.user.guild_permissions.administrator)
+
+def resolve_button_style(value: Optional[str], default: discord.ButtonStyle) -> discord.ButtonStyle:
+    if value:
+        return BUTTON_COLOR_MAP.get(value.lower().strip(), default)
+    return default
 
 def valid_image_url(url: str) -> bool:
     return bool(re.match(
@@ -956,6 +970,104 @@ async def dorm_rename(
                 f"by {interaction.user} ({interaction.user.id})")
 
 
+@bot.tree.command(name="dorm_relocate", description="[Dev] Move a dorm room from one floor to another.")
+@app_commands.describe(
+    room_name="Display name of the room to move",
+    source_floor="Current floor the room belongs to",
+    target_floor="Destination floor to move it to",
+)
+async def dorm_relocate(
+    interaction: discord.Interaction, 
+    room_name: str, 
+    source_floor: str, 
+    target_floor: str
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can relocate dorm rooms.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    data = load_data()
+    src_fkey = dorm_key_of(source_floor)
+    tgt_fkey = dorm_key_of(target_floor)
+    r_key = room_key_of(room_name)
+
+    if src_fkey not in data["floors"]:
+        return await interaction.followup.send(
+            f"❌ No source floor named **{source_floor}** found.", ephemeral=True)
+
+    if tgt_fkey not in data["floors"]:
+        return await interaction.followup.send(
+            f"❌ No target floor named **{target_floor}** found.", ephemeral=True)
+
+    if src_fkey == tgt_fkey:
+        return await interaction.followup.send(
+            "❌ Source and target floor are the same.", ephemeral=True)
+
+    if r_key not in data["floors"][src_fkey]["rooms"]:
+        return await interaction.followup.send(
+            f"❌ No room named **{room_name}** found on **{source_floor}**.", ephemeral=True)
+
+    if r_key in data["floors"][tgt_fkey]["rooms"]:
+        return await interaction.followup.send(
+            f"❌ A room named **{room_name}** already exists on **{target_floor}**. Rename it first.", ephemeral=True)
+
+    # Data migration
+    room_data = data["floors"][src_fkey]["rooms"].pop(r_key)
+    data["floors"][tgt_fkey]["rooms"][r_key] = room_data
+
+    # Discord channel migration
+    src_category = discord.utils.get(interaction.guild.categories, name=data["floors"][src_fkey]["name"])
+    tgt_category = discord.utils.get(interaction.guild.categories, name=data["floors"][tgt_fkey]["name"])
+    
+    if not tgt_category:
+        try:
+            tgt_category = await interaction.guild.create_category(data["floors"][tgt_fkey]["name"])
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"dorm_relocate: Failed to create target category '{data['floors'][tgt_fkey]['name']}': {e}")
+            tgt_category = None
+
+    if src_category and tgt_category:
+        channel = discord.utils.get(interaction.guild.text_channels, name=r_key, category=src_category)
+        if channel:
+            try:
+                await channel.edit(category=tgt_category)
+            except discord.Forbidden:
+                log.warning(f"dorm_relocate: Forbidden from moving channel {r_key} to category {tgt_category.name}.")
+            except discord.HTTPException as e:
+                log.warning(f"dorm_relocate: Failed to move channel {r_key} to category {tgt_category.name}: {e}")
+        else:
+            log.warning(f"dorm_relocate: Discord channel '{r_key}' not found in source category '{src_category.name}'; skipping.")
+    else:
+        log.warning(f"dorm_relocate: Source or target category missing; skipping channel edit for '{r_key}'.")
+
+    save_data(data)
+
+    occupants_display = ", ".join(
+        data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
+    if not occupants_display:
+        occupants_display = "None"
+
+    embed = discord.Embed(
+        title="Dorm Relocated",
+        color=discord.Color.green(),
+        timestamp=now_utc()
+    )
+    embed.add_field(name="Room", value=room_data["name"], inline=True)
+    embed.add_field(name="Capacity", value=str(room_data["capacity"]), inline=True)
+    embed.add_field(name="Occupants", value=occupants_display, inline=False)
+    embed.add_field(name="Moved From", value=data["floors"][src_fkey]["name"], inline=True)
+    embed.add_field(name="Moved To", value=data["floors"][tgt_fkey]["name"], inline=True)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    await audit(interaction.guild,
+                f"Room relocated: '{room_data['name']}' from '{data['floors'][src_fkey]['name']}' "
+                f"to '{data['floors'][tgt_fkey]['name']}' ({len(room_data['occupants'])} occupants) "
+                f"by {interaction.user} ({interaction.user.id})")
+
+
 @bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm room.")
 @app_commands.describe(
     oc_name="OC name", floor_name="Floor name", room_name="Room name")
@@ -1253,7 +1365,7 @@ async def news_post(
 
 @bot.tree.command(name="send_embed", description="[Dev] Post a custom embed to any channel as a custom identity.")
 @app_commands.describe(
-    channel="Target text channel name",
+    channel="Target text channel (select from dropdown)",
     title="Embed title (1-256 chars)",
     content="Embed description (1-4096 chars)",
     custom_username="Optional custom sender name",
@@ -1264,7 +1376,7 @@ async def news_post(
 )
 async def send_embed(
     interaction: discord.Interaction,
-    channel: str,
+    channel: discord.TextChannel, # FIX: was str, now discord.TextChannel for dropdown UI
     title: str,
     content: str,
     custom_username: Optional[str] = None,
@@ -1276,10 +1388,6 @@ async def send_embed(
     if not is_dev(interaction):
         return await interaction.response.send_message("❌ Only devs can send custom embeds.", ephemeral=True)
 
-    target_ch = discord.utils.get(interaction.guild.text_channels, name=channel)
-    if not target_ch:
-        return await interaction.response.send_message(f"❌ Channel `#{channel}` not found.", ephemeral=True)
-
     if len(title) < 1 or len(title) > 256:
         return await interaction.response.send_message("❌ Title must be 1-256 characters.", ephemeral=True)
     if len(content) < 1 or len(content) > 4096:
@@ -1290,12 +1398,13 @@ async def send_embed(
     if image_url and not valid_image_url(image_url):
         return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
 
+    warning_msg = ""
     resolved_color = discord.Color.blurple()
     if color:
         try:
             resolved_color = discord.Color(int(color.lstrip('#'), 16))
-        except Exception:
-            resolved_color = discord.Color.blurple()
+        except ValueError:
+            warning_msg = "\n⚠️ Invalid color hex, using default."
 
     resolved_username = custom_username or interaction.user.display_name
     resolved_avatar = avatar_url or interaction.user.display_avatar.url
@@ -1312,13 +1421,166 @@ async def send_embed(
     if footer_text:
         embed.set_footer(text=footer_text)
 
-    await target_ch.send(embed=embed)
-    await interaction.response.send_message(f"✅ Embed sent to {target_ch.mention}.", ephemeral=True)
+    await channel.send(embed=embed)
+    await interaction.response.send_message(f"✅ Embed sent to {channel.mention}.{warning_msg}", ephemeral=True)
 
     await audit(
         interaction.guild,
-        f"[SEND_EMBED] '{title}' posted to #{target_ch.name} by {interaction.user} ({interaction.user.id}) as '{resolved_username}'"
+        f"[SEND_EMBED] '{title}' posted to #{channel.name} by {interaction.user} ({interaction.user.id}) as '{resolved_username}'"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ANNOUNCE (dev only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnnounceView(discord.ui.View):
+    def __init__(self, b1_label=None, b1_style=None, b1_url=None,
+                       b2_label=None, b2_style=None, b2_url=None):
+        super().__init__(timeout=None)
+        if b1_label:
+            if b1_url:
+                btn = discord.ui.Button(
+                    label=b1_label, url=b1_url,
+                    style=discord.ButtonStyle.link, custom_id=None)
+            else:
+                btn = discord.ui.Button(
+                    label=b1_label,
+                    style=b1_style or discord.ButtonStyle.primary,
+                    custom_id="announce_btn1")
+            self.add_item(btn)
+        if b2_label:
+            if b2_url:
+                btn = discord.ui.Button(
+                    label=b2_label, url=b2_url,
+                    style=discord.ButtonStyle.link, custom_id=None)
+            else:
+                btn = discord.ui.Button(
+                    label=b2_label,
+                    style=b2_style or discord.ButtonStyle.secondary,
+                    custom_id="announce_btn2")
+            self.add_item(btn)
+
+
+@bot.tree.command(name="announce", description="[Dev] Post a styled announcement embed to any channel immediately.")
+@app_commands.describe(
+    channel="Target channel (select from dropdown)",
+    title="Announcement title (supports {server} placeholder)",
+    content="Announcement body (supports {server}, {date} placeholders)",
+    embed_color="Hex color (e.g. #FF5733) — defaults to blurple",
+    image_url="Optional banner image URL",
+    thumbnail_url="Optional thumbnail image URL",
+    footnote="Optional footer text (supports {server}, {date} placeholders)",
+    oc_note="Optional OC-flavor field added below content (supports {oc} placeholder — requires oc_name)",
+    oc_name="OC name for {oc} placeholder resolution in oc_note",
+    button1_label="Label for optional first button",
+    button1_color="Color for button 1: green / red / grey / blurple",
+    button1_url="URL for button 1 (makes it a link button — overrides color)",
+    button2_label="Label for optional second button",
+    button2_color="Color for button 2",
+    button2_url="URL for button 2",
+    ping_role="Optional role to mention above the embed",
+)
+async def announce(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    content: str,
+    embed_color: Optional[str] = None,
+    image_url: Optional[str] = None,
+    thumbnail_url: Optional[str] = None,
+    footnote: Optional[str] = None,
+    oc_note: Optional[str] = None,
+    oc_name: Optional[str] = None,
+    button1_label: Optional[str] = None,
+    button1_color: Optional[str] = None,
+    button1_url: Optional[str] = None,
+    button2_label: Optional[str] = None,
+    button2_color: Optional[str] = None,
+    button2_url: Optional[str] = None,
+    ping_role: Optional[discord.Role] = None,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can post announcements.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    warning_msgs = []
+
+    if button1_label and len(button1_label) > 80:
+        return await interaction.followup.send("❌ button1_label exceeds 80 characters.", ephemeral=True)
+    if button2_label and len(button2_label) > 80:
+        return await interaction.followup.send("❌ button2_label exceeds 80 characters.", ephemeral=True)
+
+    if image_url and not valid_image_url(image_url):
+        return await interaction.followup.send("❌ Invalid image URL.", ephemeral=True)
+    if thumbnail_url and not valid_image_url(thumbnail_url):
+        return await interaction.followup.send("❌ Invalid thumbnail URL.", ephemeral=True)
+
+    data = load_data()
+    oc_display = ""
+    if oc_name:
+        oc_key = oc_key_of(oc_name)
+        if oc_key in data["ocs"]:
+            oc_display = data["ocs"][oc_key]["name"]
+        else:
+            oc_display = oc_name
+            warning_msgs.append(f"⚠️ OC '{oc_name}' not found; using raw string.")
+
+    def _resolve(text: Optional[str]) -> Optional[str]:
+        if text is not None:
+            return text.format(
+                server=interaction.guild.name,
+                date=now_utc().strftime("%B %d, %Y"),
+                oc=oc_display,
+            )
+        return None
+
+    resolved_color = discord.Color.blurple()
+    if embed_color:
+        try:
+            resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
+        except ValueError:
+            warning_msgs.append("⚠️ Invalid embed color hex; using default blurple.")
+
+    embed = discord.Embed(
+        title=_resolve(title),
+        description=_resolve(content),
+        color=resolved_color,
+        timestamp=now_utc(),
+    )
+    if thumbnail_url:
+        embed.set_thumbnail(url=thumbnail_url)
+    if image_url:
+        embed.set_image(url=image_url)
+    if oc_note:
+        embed.add_field(name="Note", value=_resolve(oc_note), inline=False)
+    if footnote:
+        embed.set_footer(text=_resolve(footnote))
+
+    view = None
+    if button1_label or button2_label:
+        b1_style = resolve_button_style(button1_color, discord.ButtonStyle.primary)
+        b2_style = resolve_button_style(button2_color, discord.ButtonStyle.secondary)
+        view = AnnounceView(
+            b1_label=button1_label, b1_style=b1_style, b1_url=button1_url,
+            b2_label=button2_label, b2_style=b2_style, b2_url=button2_url
+        )
+
+    content_str = ping_role.mention if ping_role else None
+    await channel.send(content=content_str, embed=embed, view=view)
+
+    warn_str = "\n".join(warning_msgs)
+    if warn_str:
+        warn_str = "\n" + warn_str
+
+    await interaction.followup.send(f"✅ Announcement posted to {channel.mention}.{warn_str}", ephemeral=True)
+
+    await audit(interaction.guild,
+                f"[ANNOUNCE] '{title}' to #{channel.name} "
+                f"(buttons={'Yes' if view else 'No'}, ping={'Yes' if ping_role else 'No'}) "
+                f"by {interaction.user} ({interaction.user.id})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1331,7 +1593,7 @@ async def send_embed(
     title="Announcement title",
     content="Announcement body text",
     fire_at="When to post: YYYY-MM-DD HH:MM (24h)",
-    channel="Channel to post in (default: announcements)",
+    channel="Channel to post in — select from dropdown (default: #announcements)",
     image_url="Optional image URL",
     timezone_str="Timezone of the input time (default: UTC)",
 )
@@ -1349,7 +1611,7 @@ async def announce_schedule(
     title: str,
     content: str,
     fire_at: str,
-    channel: Optional[str] = None,
+    channel: Optional[discord.TextChannel] = None, # FIX: was str, now discord.TextChannel for dropdown UI
     image_url: Optional[str] = None,
     timezone_str: Optional[str] = None,
 ):
@@ -1382,11 +1644,10 @@ async def announce_schedule(
         return await interaction.response.send_message(
             "❌ Image URL must be a direct image link.", ephemeral=True)
 
-    target_channel = channel or NEWS_CHANNEL_NAME
-    ch = discord.utils.get(interaction.guild.text_channels, name=target_channel)
-    if not ch:
+    resolved_ch = channel or discord.utils.get(interaction.guild.text_channels, name=NEWS_CHANNEL_NAME)
+    if not resolved_ch:
         return await interaction.response.send_message(
-            f"❌ Channel `#{target_channel}` not found.", ephemeral=True)
+            f"❌ Target channel not found.", ephemeral=True)
 
     data     = load_data()
     sched_id = f"sched_{int(fire_dt.timestamp())}_{interaction.user.id}"
@@ -1394,7 +1655,7 @@ async def announce_schedule(
         "title":     title,
         "content":   content,
         "fire_at":   fire_dt.isoformat(),
-        "channel":   target_channel,
+        "channel":   resolved_ch.name,
         "image_url": image_url,
         "created_by": interaction.user.id,
         "fired":     False,
@@ -1405,7 +1666,7 @@ async def announce_schedule(
         f"✅ Announcement **{title}** scheduled for:\n"
         f"• Local: {local_dt.strftime('%Y-%m-%d %H:%M')} {tz_str}\n"
         f"• UTC:   {fire_dt.strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"Will post to {ch.mention}.",
+        f"Will post to {resolved_ch.mention}.",
         ephemeral=True)
 
     await audit(interaction.guild,
@@ -1721,10 +1982,15 @@ class DevDMModal(discord.ui.Modal, title="Reply to Dev"):
 
 
 class DevDMView(discord.ui.View):
-    def __init__(self, guild_id: int, dev_id: int):
+    def __init__(self, guild_id: int, dev_id: int, reply_label: str = "Reply to Dev", reply_style: discord.ButtonStyle = discord.ButtonStyle.primary):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.dev_id = dev_id
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "dev_dm_reply":
+                    child.label = reply_label
+                    child.style = reply_style
 
     @discord.ui.button(label="Reply to Dev", style=discord.ButtonStyle.primary, custom_id="dev_dm_reply")
     async def reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1735,31 +2001,69 @@ class DevDMView(discord.ui.View):
 @app_commands.describe(
     user="The user to message",
     message="Message content",
-    require_response="Whether the user gets a button to reply (logs to dev-responses channel)"
+    require_response="Whether the user gets a button to reply (logs to dev-responses channel)",
+    embed_title="Optional custom title (supports {server})",
+    embed_color="Optional hex color (e.g. #FF5733)",
+    reply_label="Optional custom reply button label",
+    reply_color="Optional custom reply button color (green, red, grey, blurple)",
+    footnote="Optional custom footer text (supports {server}, {user})",
 )
 async def dev_dm(
     interaction: discord.Interaction, 
     user: discord.Member, 
     message: str, 
-    require_response: bool = False
+    require_response: bool = False,
+    embed_title: Optional[str] = None,
+    embed_color: Optional[str] = None,
+    reply_label: Optional[str] = None,
+    reply_color: Optional[str] = None,
+    footnote: Optional[str] = None
 ):
     if not is_dev(interaction):
         return await interaction.response.send_message(
             "❌ Only devs can use this command.", ephemeral=True)
+
+    if reply_label and len(reply_label) > 80:
+        return await interaction.response.send_message("❌ reply_label exceeds 80 characters.", ephemeral=True)
             
+    warning_msgs = []
+    resolved_color = discord.Color.brand_red()
+    if embed_color:
+        try:
+            resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
+        except ValueError:
+            warning_msgs.append("⚠️ Invalid color hex, using default.")
+
+    actual_title = embed_title.format(server=interaction.guild.name) if embed_title else "Message from Server Dev"
+
     embed = discord.Embed(
-        title="Message from Server Dev", 
+        title=actual_title, 
         description=message, 
-        color=discord.Color.brand_red(),
+        color=resolved_color,
         timestamp=now_utc()
     )
-    embed.set_footer(text=f"From Server: {interaction.guild.name}")
+
+    if footnote:
+        actual_foot = footnote.format(server=interaction.guild.name, user=interaction.user.display_name)
+        embed.set_footer(text=actual_foot)
+    else:
+        actual_foot = f"From Server: {interaction.guild.name}"
+        if require_response:
+            actual_foot += " · A response is requested."
+        embed.set_footer(text=actual_foot)
     
-    view = DevDMView(interaction.guild.id, interaction.user.id) if require_response else None
+    view = DevDMView(
+        guild_id=interaction.guild.id, 
+        dev_id=interaction.user.id,
+        reply_label=reply_label or "Reply to Dev",
+        reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary)
+    ) if require_response else None
     
     try:
         await user.send(embed=embed, view=view)
-        await interaction.response.send_message(f"✅ DM successfully sent to {user.mention}.", ephemeral=True)
+        warn_str = "\n".join(warning_msgs)
+        if warn_str: warn_str = "\n" + warn_str
+        await interaction.response.send_message(f"✅ DM successfully sent to {user.mention}.{warn_str}", ephemeral=True)
         await audit(interaction.guild, f"Dev DM sent to {user} by {interaction.user}. Requires response: {require_response}")
     except discord.Forbidden:
         await interaction.response.send_message(f"❌ Could not DM {user.mention}. They likely have DMs disabled.", ephemeral=True)
@@ -1772,7 +2076,9 @@ async def dev_dm(
 class DebutView(discord.ui.View):
     def __init__(self, guild_id: int, user_id: int,
                  oc_name: str, group_name: str, debut_channel_id: int,
-                 custom_channel_message: Optional[str] = None):
+                 custom_channel_message: Optional[str] = None,
+                 accept_label: Optional[str] = None, accept_style: Optional[discord.ButtonStyle] = None,
+                 decline_label: Optional[str] = None, decline_style: Optional[discord.ButtonStyle] = None):
         super().__init__(timeout=None)
         self.guild_id               = guild_id
         self.user_id                = user_id
@@ -1780,6 +2086,15 @@ class DebutView(discord.ui.View):
         self.group_name             = group_name
         self.debut_channel_id       = debut_channel_id
         self.custom_channel_message = custom_channel_message
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "debut_accept":
+                    child.label = accept_label or "Accept"
+                    child.style = accept_style or discord.ButtonStyle.success
+                elif child.custom_id == "debut_decline":
+                    child.label = decline_label or "Decline"
+                    child.style = decline_style or discord.ButtonStyle.danger
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success,
                        custom_id="debut_accept")
@@ -1828,8 +2143,15 @@ class DebutView(discord.ui.View):
     oc_name="Name of the OC being offered a debut",
     group_name="Name of the group the OC is debuting in",
     message="Custom debut message shown in the DM contract",
-    channel_message="Message posted in #debuts after acceptance "
-                    "(use {member}, {oc}, {group} as placeholders; optional)",
+    channel_message="Message posted in #debuts after acceptance (use {member}, {oc}, {group})",
+    embed_title="Optional custom title (supports {oc}, {group})",
+    embed_color="Optional hex color (e.g. #FFD700)",
+    accept_label="Optional custom accept button label",
+    accept_color="Optional accept button color (green, red, grey, blurple)",
+    decline_label="Optional custom decline button label",
+    decline_color="Optional decline button color",
+    footnote="Optional custom footer text (supports {oc}, {group}, {server})",
+    oc_placeholder="Optional Note field added to the embed (supports {oc}, {group})"
 )
 async def debut_notify(
     interaction: discord.Interaction,
@@ -1837,10 +2159,23 @@ async def debut_notify(
     group_name: str,
     message: str,
     channel_message: Optional[str] = None,
+    embed_title: Optional[str] = None,
+    embed_color: Optional[str] = None,
+    accept_label: Optional[str] = None,
+    accept_color: Optional[str] = None,
+    decline_label: Optional[str] = None,
+    decline_color: Optional[str] = None,
+    footnote: Optional[str] = None,
+    oc_placeholder: Optional[str] = None,
 ):
     if not is_dev(interaction):
         return await interaction.response.send_message(
             "❌ Only devs can send debut notifications.", ephemeral=True)
+
+    if accept_label and len(accept_label) > 80:
+        return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
+    if decline_label and len(decline_label) > 80:
+        return await interaction.response.send_message("❌ decline_label exceeds 80 characters.", ephemeral=True)
 
     data   = load_data()
     oc_key = oc_key_of(oc_name)
@@ -1860,6 +2195,14 @@ async def debut_notify(
         return await interaction.response.send_message(
             f"❌ The owner of **{oc_name}** is not in this server.", ephemeral=True)
 
+    warning_msgs = []
+    resolved_color = discord.Color.gold()
+    if embed_color:
+        try:
+            resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
+        except ValueError:
+            warning_msgs.append("⚠️ Invalid color hex, using default.")
+
     # Auto-create #debuts if missing
     debut_ch = discord.utils.get(interaction.guild.text_channels, name=DEBUT_CHANNEL_NAME)
     if not debut_ch:
@@ -1875,17 +2218,26 @@ async def debut_notify(
                 interaction.guild.me: discord.PermissionOverwrite(view_channel=True),
             })
 
+    actual_title = embed_title.format(oc=oc_name, group=group_name) if embed_title else f"Debut Contract  —  {oc_name}  |  {group_name}"
+
     embed = discord.Embed(
-        title=f"Debut Contract  —  {oc_name}  |  {group_name}",
+        title=actual_title,
         description=message,
-        color=discord.Color.gold(),
+        color=resolved_color,
         timestamp=now_utc(),
     )
     if oc.get("profile_picture"):
         embed.set_thumbnail(url=oc["profile_picture"])
     embed.add_field(name="OC",    value=oc_name,    inline=True)
     embed.add_field(name="Group", value=group_name, inline=True)
-    embed.set_footer(text=f"From: {interaction.guild.name}")
+
+    if oc_placeholder:
+        embed.add_field(name="Note", value=oc_placeholder.format(oc=oc_name, group=group_name), inline=False)
+
+    if footnote:
+        embed.set_footer(text=footnote.format(oc=oc_name, group=group_name, server=interaction.guild.name))
+    else:
+        embed.set_footer(text=f"From: {interaction.guild.name}")
 
     view = DebutView(
         guild_id=interaction.guild.id,
@@ -1894,6 +2246,10 @@ async def debut_notify(
         group_name=group_name,
         debut_channel_id=debut_ch.id,
         custom_channel_message=channel_message,
+        accept_label=accept_label,
+        accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
+        decline_label=decline_label,
+        decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger)
     )
 
     try:
@@ -1903,8 +2259,10 @@ async def debut_notify(
             embed=embed,
             view=view,
         )
+        warn_str = "\n".join(warning_msgs)
+        if warn_str: warn_str = "\n" + warn_str
         await interaction.response.send_message(
-            f"Debut contract sent to {member.mention} for **{oc_name}** ({group_name}).",
+            f"✅ Debut contract sent to {member.mention} for **{oc_name}** ({group_name}).{warn_str}",
             ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -2320,7 +2678,9 @@ async def help_cmd(interaction: discord.Interaction):
             "`/floor_rename` — Rename a floor (preserves assignments)\n"
             "`/dorm_create` — Create a dorm room inside a floor\n"
             "`/dorm_rename` — Rename a dorm room (preserves occupants)\n"
+            "`/dorm_relocate` — Move a dorm room from one floor to another\n"
             "`/dorm_kick` — Force-remove a user's OC(s) from their dorm assignment\n"
+            "`/announce` — Post an immediate custom announcement to any channel\n"
             "`/news_post` — Post a news article embed\n"
             "`/send_embed` — Post a custom embed to any channel as a custom identity\n"
             "`/announce_schedule` — Schedule a future announcement\n"
