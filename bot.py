@@ -1,17 +1,10 @@
-"""
-OC & Dorm Discord Bot  ·  v3
-─────────────────────────────────────────────────────────────────────────────
-All interaction through slash commands only.
-Render-ready: health-check HTTP server runs alongside the bot.
-─────────────────────────────────────────────────────────────────────────────
-"""
-
 import asyncio
 import json
 import logging
 import os
 import re
 import threading
+import signal
 import webserver
 from datetime import datetime, date, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -194,11 +187,22 @@ async def on_ready():
 
             if ch:
                 try:
-                    async for message in ch.history(limit=10):
+                    async for message in ch.history(limit=1):
                         if message.attachments:
                             att = message.attachments[0]
                             if att.filename == "data.json":
                                 file_bytes = await att.read()
+                                try:
+                                    parsed = json.loads(file_bytes)
+                                    # Basic schema validation
+                                    if not isinstance(parsed, dict):
+                                        raise ValueError("Root is not a dict")
+                                    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled"):
+                                        parsed.setdefault(k, {})
+                                except (json.JSONDecodeError, ValueError) as e:
+                                    log.error(f"Backup file is corrupt, skipping restore: {e}")
+                                    break  # Don't write corrupt data to disk
+                                
                                 with open(DATA_FILE, "wb") as f:
                                     f.write(file_bytes)
                                 log.info("Successfully restored database memory from Discord backup.")
@@ -234,17 +238,21 @@ async def auto_backup_db():
         ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
         if ch:
             try:
-                # Clean up old backups to prevent channel clutter
-                async for msg in ch.history(limit=5):
-                    if msg.author == bot.user:
+                # Upload first
+                file = discord.File(DATA_FILE, filename="data.json")
+                new_msg = await ch.send(
+                    f"Automated DB Backup - {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                    file=file
+                )
+                DATA_DIRTY = False
+
+                # Then clean up old backups (skip the one just posted)
+                async for msg in ch.history(limit=10):
+                    if msg.author == bot.user and msg.id != new_msg.id:
                         try:
                             await msg.delete()
                         except Exception:
                             pass
-                
-                file = discord.File(DATA_FILE, filename="data.json")
-                await ch.send(f"Automated DB Backup - {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}", file=file)
-                DATA_DIRTY = False
                 break
             except Exception as e:
                 log.error(f"Backup failed: {e}")
@@ -385,7 +393,7 @@ async def oc_add(
     name="New name", 
     profile_picture_url="New image URL (optional)",
     profile_picture_file="Upload new image file (optional)",
-    birthday=f"New birthday ({BIRTHDAY_DISPLAY})", gender="New gender",
+    birthday=f"New birthday in {BIRTHDAY_DISPLAY} format (e.g. 2000/06/25)", gender="New gender",
     pronouns="New pronouns", face_claim="New face claim",
     main_skill="New main skill", ethnicity="New ethnicity",
     nationality="New nationality", form_link="New form link"
@@ -405,6 +413,11 @@ async def oc_edit(
     if key not in data["ocs"]:
         return await interaction.response.send_message(
             f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+
+    oc = data["ocs"][key]
+    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
+        return await interaction.response.send_message(
+            "❌ You can only edit your own OCs.", ephemeral=True)
 
     if birthday:
         try:
@@ -429,7 +442,6 @@ async def oc_edit(
         return await interaction.response.send_message(
             "❌ Form link must be a valid URL.", ephemeral=True)
 
-    oc      = data["ocs"][key]
     updates = {
         "name": name, "birthday": birthday,
         "gender": gender, "pronouns": pronouns, "face_claim": face_claim,
@@ -443,7 +455,13 @@ async def oc_edit(
     changes = []
     for field, val in updates.items():
         if val is not None:
-            changes.append(f"`{field}`: {oc.get(field)} → {val}")
+            old_val = oc.get(field)
+            if field == "birthday":
+                display_old = format_birthday_long(old_val) if old_val else "None"
+                display_new = format_birthday_long(val)
+                changes.append(f"`birthday`: {display_old} → {display_new}")
+            else:
+                changes.append(f"`{field}`: {old_val} → {val}")
             oc[field] = val
 
     if not changes:
@@ -1025,11 +1043,11 @@ class IGPostView(discord.ui.View):
     def _update_like_label(self):
         for child in self.children:
             if getattr(child, "custom_id", "").startswith("ig_like_"):
-                child.label = f"Like  {self.likes}" if self.likes else "Like"
+                child.label = f"🤍 Like  {self.likes}" if self.likes else "🤍 Like"
 
     # ── Like button ───────────────────────────────────────────────────────────
-    @discord.ui.button(label="Like", style=discord.ButtonStyle.secondary,
-                       custom_id="ig_like_btn", emoji="♡")
+    @discord.ui.button(label="🤍 Like", style=discord.ButtonStyle.secondary,
+                       custom_id="ig_like_btn")
     async def like_btn(self, interaction: discord.Interaction,
                        button: discord.ui.Button):
         data = load_data()
@@ -1053,8 +1071,8 @@ class IGPostView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
     # ── Comment button — opens a modal ────────────────────────────────────────
-    @discord.ui.button(label="Comment", style=discord.ButtonStyle.primary,
-                       custom_id="ig_comment_btn", emoji="💬")
+    @discord.ui.button(label="💬 Comment", style=discord.ButtonStyle.primary,
+                       custom_id="ig_comment_btn")
     async def comment_btn(self, interaction: discord.Interaction,
                           button: discord.ui.Button):
         await interaction.response.send_modal(IGCommentModal(self.post_id))
@@ -1701,6 +1719,34 @@ async def oc_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ─── Shutdown & Emergency Backup ───────────────────────────────────────────────
+def _handle_shutdown(signum, frame):
+    """Triggered on SIGTERM or SIGINT. Forces a final async backup before exit."""
+    log.info("Shutdown signal received. Forcing final DB backup…")
+    asyncio.run_coroutine_threadsafe(_emergency_backup(), bot.loop)
+
+async def _emergency_backup():
+    global DATA_DIRTY
+    if not os.path.exists(DATA_FILE):
+        return
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
+        if ch:
+            try:
+                file = discord.File(DATA_FILE, filename="data.json")
+                await ch.send(
+                    f"[EMERGENCY BACKUP] Shutdown signal — {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                    file=file
+                )
+                DATA_DIRTY = False
+                log.info("Emergency backup completed.")
+            except Exception as e:
+                log.error(f"Emergency backup failed: {e}")
+            break
+    # Give the coroutine time to finish before process exits
+    await asyncio.sleep(3)
+
+
 # ─── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     token = os.environ.get("DISCORD_TOKEN")
@@ -1708,6 +1754,10 @@ if __name__ == "__main__":
         raise RuntimeError(
             "DISCORD_TOKEN environment variable is not set. "
             "Add it in Render → Environment.")
+
+    # Register handlers for clean shutdowns and emergency backups
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
 
     # Start health-check server in background thread
     t = threading.Thread(target=_run_http, daemon=True)
