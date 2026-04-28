@@ -1,3 +1,5 @@
+
+
 import asyncio
 import io
 import json
@@ -270,6 +272,45 @@ def build_oc_embed(oc: dict, key: str) -> discord.Embed:
     if oc.get("form_link"):
         embed.add_field(name="Form", value=f"[Click here]({oc['form_link']})", inline=True)
     embed.set_footer(text=f"OC ID: {key}")
+    return embed
+
+def _build_available_rooms_text(data: dict) -> str:
+    """
+    Returns a formatted string of all non-full dorm rooms across all floors.
+    Used in displaced-OC DM embeds so owners know where they can reassign.
+    Returns 'No rooms available.' if every room is full or no rooms exist.
+    """
+    lines = []
+    for f_key, floor in data["floors"].items():
+        for r_key, room in floor["rooms"].items():
+            occ   = len(room.get("occupants", []))
+            cap   = room.get("capacity", 0)
+            if occ < cap:
+                lines.append(
+                    f"**{floor['name']}** → {room['name']} [{occ}/{cap} spots taken]"
+                )
+    return "\n".join(lines) if lines else "No rooms available."
+
+def _build_displaced_dm_embed(
+    oc_name: str,
+    evicted_from_lines: list[str],
+    available_rooms_text: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🏚️ Your OC Has Been Displaced!",
+        color=discord.Color.orange(),
+        description=(
+            f"**{oc_name}** has been removed from their dorm assignment "
+            f"because the following room(s) were deleted by a server admin:\n"
+            + "\n".join(f"• {line}" for line in evicted_from_lines)
+        ),
+    )
+    embed.add_field(
+        name="Available Rooms",
+        value=available_rooms_text or "No rooms available at this time.",
+        inline=False,
+    )
+    embed.set_footer(text="Use /dorm_assign to pick a new room.")
     return embed
 
 # ─── Bot ───────────────────────────────────────────────────────────────────────
@@ -933,6 +974,132 @@ async def floor_rename(interaction: discord.Interaction, old_name: str, new_name
                 f"by {interaction.user} ({interaction.user.id})")
 
 
+@bot.tree.command(
+    name="floor_delete",
+    description="[Dev] Permanently delete a floor and all its dorm rooms."
+)
+@app_commands.describe(
+    floor_name="Display name of the floor to delete (e.g. '1st Floor')",
+    confirm="Type the floor name exactly to confirm deletion",
+)
+async def floor_delete(
+    interaction: discord.Interaction,
+    floor_name: str,
+    confirm: str,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can delete floors.", ephemeral=True)
+            
+    f_key = dorm_key_of(floor_name)
+    data = load_data()
+    
+    if f_key not in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ No floor named **{floor_name}** found.", ephemeral=True)
+            
+    if confirm != floor_name:
+        return await interaction.response.send_message(
+            f"❌ Confirmation text does not match. Type the floor name exactly as: **{floor_name}**",
+            ephemeral=True)
+            
+    await interaction.response.defer(ephemeral=True)
+    
+    floor_data = data["floors"].pop(f_key)
+    
+    displaced: dict[str, list[str]] = {}
+    for r_key, room_data in floor_data["rooms"].items():
+        for oc_key in room_data.get("occupants", []):
+            displaced.setdefault(oc_key, []).append(room_data["name"])
+            
+    category = discord.utils.get(interaction.guild.categories, name=floor_data["name"])
+    if category:
+        for ch in list(category.channels):
+            try:
+                await ch.delete(reason=f"Floor '{floor_data['name']}' deleted by dev")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning("floor_delete: could not delete channel %s: %s", ch.name, e)
+        try:
+            await category.delete(reason=f"Floor '{floor_data['name']}' deleted by dev")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("floor_delete: could not delete category %s: %s", category.name, e)
+            
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_delete"))
+    
+    available_rooms_text = _build_available_rooms_text(data)
+    failed_dms = []
+    owners_dict = {}
+    oc_count = 0
+    for oc_key, room_names in displaced.items():
+        if oc_key not in data["ocs"]:
+            log.warning("floor_delete: orphaned OC key %s", oc_key)
+            continue
+        owner_id = data["ocs"][oc_key].get("owner_id")
+        if not owner_id:
+            continue
+        oc_name = data["ocs"][oc_key]["name"]
+        oc_count += 1
+        
+        if owner_id not in owners_dict:
+            owners_dict[owner_id] = {"oc_names": [], "evicted_lines": [], "mentions": []}
+        owners_dict[owner_id]["oc_names"].append(oc_name)
+        for r_name in room_names:
+            owners_dict[owner_id]["evicted_lines"].append(f"{r_name} on {floor_data['name']}")
+            
+    displaced_bullets = []
+    for owner_id, o_data in owners_dict.items():
+        for o_n in o_data["oc_names"]:
+            displaced_bullets.append(f"• {o_n} (<@{owner_id}>)")
+
+        try:
+            owner = await interaction.guild.fetch_member(owner_id)
+        except (discord.NotFound, discord.HTTPException):
+            failed_dms.append(f"<@{owner_id}>")
+            continue
+            
+        oc_name_str = ", ".join(o_data["oc_names"])
+        dm_embed = _build_displaced_dm_embed(
+            oc_name=oc_name_str,
+            evicted_from_lines=o_data["evicted_lines"],
+            available_rooms_text=available_rooms_text
+        )
+        try:
+            await owner.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            failed_dms.append(owner.mention)
+            
+    dev_embed = discord.Embed(title="🗑️ Floor Deleted", color=discord.Color.red(), timestamp=now_utc())
+    dev_embed.add_field(name="Floor", value=floor_data["name"], inline=True)
+    r_names = ", ".join([r["name"] for r in floor_data["rooms"].values()]) or "None"
+    dev_embed.add_field(name="Rooms Deleted", value=f"{len(floor_data['rooms'])} ({r_names})", inline=True)
+    
+    if displaced_bullets:
+        dev_embed.add_field(name="OCs Displaced", value=f"{oc_count}\n" + "\n".join(displaced_bullets), inline=False)
+    else:
+        dev_embed.add_field(name="OCs Displaced", value="0", inline=False)
+        
+    dm_status = "✅ All owners notified." if not failed_dms and owners_dict else "None required."
+    if failed_dms:
+        dm_status = f"⚠️ Could not DM: {', '.join(failed_dms)}"
+    dev_embed.add_field(name="DM Status", value=dm_status, inline=False)
+    
+    await interaction.followup.send(embed=dev_embed, ephemeral=True)
+    
+    await audit(
+        interaction.guild,
+        f"Floor deleted: '{floor_data['name']}' — {len(floor_data['rooms'])} rooms, "
+        f"{len(displaced)} OCs displaced — by {interaction.user} ({interaction.user.id})"
+    )
+    
+    log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_ch:
+        await log_ch.send(
+            f"🗑️ Floor **{floor_name}** was deleted by {interaction.user.mention}.\n"
+            f"{len(displaced)} OC(s) were displaced and their owners have been notified."
+        )
+
+
 @bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
 @app_commands.describe(
     floor_name="Name of the floor this room belongs to",
@@ -1181,6 +1348,134 @@ async def dorm_relocate(
                 f"Room relocated: '{room_data['name']}' from '{data['floors'][src_fkey]['name']}' "
                 f"to '{data['floors'][tgt_fkey]['name']}' ({len(room_data['occupants'])} occupants) "
                 f"by {interaction.user} ({interaction.user.id})")
+
+
+@bot.tree.command(
+    name="dorm_delete",
+    description="[Dev] Permanently delete a single dorm room from a floor."
+)
+@app_commands.describe(
+    floor_name="Floor the room belongs to",
+    room_name="Display name of the room to delete",
+    confirm="Type the room name exactly to confirm deletion",
+)
+async def dorm_delete(
+    interaction: discord.Interaction,
+    floor_name: str,
+    room_name: str,
+    confirm: str,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can delete dorm rooms.", ephemeral=True)
+            
+    f_key = dorm_key_of(floor_name)
+    r_key = room_key_of(room_name)
+    data = load_data()
+    
+    if f_key not in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ No floor named **{floor_name}** found.", ephemeral=True)
+            
+    floor = data["floors"][f_key]
+    if r_key not in floor["rooms"]:
+        return await interaction.response.send_message(
+            f"❌ No room named **{room_name}** found on floor **{floor_name}**.", ephemeral=True)
+            
+    if confirm != room_name:
+        return await interaction.response.send_message(
+            f"❌ Confirmation text does not match. Type the room name exactly as: **{room_name}**",
+            ephemeral=True)
+            
+    await interaction.response.defer(ephemeral=True)
+    
+    room_data = floor["rooms"].pop(r_key)
+    displaced_oc_keys = list(room_data.get("occupants", []))
+    
+    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+    if category:
+        ch = discord.utils.get(interaction.guild.text_channels, name=r_key, category=category)
+        if ch:
+            try:
+                await ch.delete(reason=f"Dorm room '{room_data['name']}' deleted by dev")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning("dorm_delete: could not delete channel %s: %s", ch.name, e)
+                
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_delete"))
+    
+    displaced = {oc_key: [room_data["name"]] for oc_key in displaced_oc_keys}
+    
+    available_rooms_text = _build_available_rooms_text(data)
+    failed_dms = []
+    owners_dict = {}
+    oc_count = 0
+    for oc_key, room_names in displaced.items():
+        if oc_key not in data["ocs"]:
+            log.warning("dorm_delete: orphaned OC key %s", oc_key)
+            continue
+        owner_id = data["ocs"][oc_key].get("owner_id")
+        if not owner_id: continue
+        oc_name = data["ocs"][oc_key]["name"]
+        oc_count += 1
+        
+        if owner_id not in owners_dict:
+            owners_dict[owner_id] = {"oc_names": [], "evicted_lines": []}
+        owners_dict[owner_id]["oc_names"].append(oc_name)
+        for r_name in room_names:
+            owners_dict[owner_id]["evicted_lines"].append(f"{r_name} on {floor['name']}")
+            
+    displaced_bullets = []
+    for owner_id, o_data in owners_dict.items():
+        for o_n in o_data["oc_names"]:
+            displaced_bullets.append(f"• {o_n} (<@{owner_id}>)")
+
+        try:
+            owner = await interaction.guild.fetch_member(owner_id)
+        except (discord.NotFound, discord.HTTPException):
+            failed_dms.append(f"<@{owner_id}>")
+            continue
+            
+        oc_name_str = ", ".join(o_data["oc_names"])
+        dm_embed = _build_displaced_dm_embed(
+            oc_name=oc_name_str,
+            evicted_from_lines=o_data["evicted_lines"],
+            available_rooms_text=available_rooms_text
+        )
+        try:
+            await owner.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            failed_dms.append(owner.mention)
+            
+    dev_embed = discord.Embed(title="🗑️ Dorm Deleted", color=discord.Color.red(), timestamp=now_utc())
+    dev_embed.add_field(name="Floor", value=floor["name"], inline=True)
+    dev_embed.add_field(name="Room", value=room_data["name"], inline=True)
+    dev_embed.add_field(name="Capacity", value=f"{room_data.get('capacity', 0)} occupant(s)", inline=True)
+    
+    if displaced_bullets:
+        dev_embed.add_field(name="OCs Displaced", value="\n".join(displaced_bullets), inline=False)
+    else:
+        dev_embed.add_field(name="OCs Displaced", value="None (room was empty)", inline=False)
+        
+    dm_status = "✅ All owners notified." if not failed_dms and owners_dict else "None required."
+    if failed_dms:
+        dm_status = f"⚠️ Could not DM: {', '.join(failed_dms)}"
+    dev_embed.add_field(name="DM Status", value=dm_status, inline=False)
+    
+    await interaction.followup.send(embed=dev_embed, ephemeral=True)
+    
+    await audit(
+        interaction.guild,
+        f"Dorm deleted: '{room_data['name']}' on '{floor['name']}' — "
+        f"{len(displaced_oc_keys)} OCs displaced — by {interaction.user} ({interaction.user.id})"
+    )
+    
+    log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_ch:
+        await log_ch.send(
+            f"🗑️ Dorm **{room_data['name']}** on **{floor_name}** was deleted by {interaction.user.mention}.\n"
+            f"{len(displaced_oc_keys)} OC(s) were displaced and their owners have been notified."
+        )
 
 
 @bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm room.")
@@ -1713,7 +2008,7 @@ async def announce(
     title="Announcement title",
     content="Announcement body text",
     fire_at="When to post: YYYY-MM-DD HH:MM (24h)",
-    channel="Channel to post in (default: #announcements)",
+    channel="Channel to post in — select from dropdown (default: #announcements)",
     image_url="Optional image URL",
     timezone_str="Timezone of the input time (default: UTC)",
 )
@@ -2489,7 +2784,7 @@ class GCInviteView(discord.ui.View):
 
 @bot.tree.command(
     name="gc_invite",
-    description="[Dev] DM a debuted OC's owner a group-chat invite with channel access on acceptance."
+    description="[Dev] DM a debuted OC's owner a group-chat invite; they immediately join an assigned channel on acceptance."
 )
 @app_commands.describe(
     oc_name="Name of the already-debuted OC to invite",
@@ -2806,9 +3101,11 @@ async def help_cmd(interaction: discord.Interaction):
         embed.add_field(name="⚙️ Dev Tools", inline=False, value=(
             "`/floor_create` — Create a floor category\n"
             "`/floor_rename` — Rename a floor (preserves assignments)\n"
+            "`/floor_delete` — Permanently delete a floor (and all rooms) with OC owner notification\n"
             "`/dorm_create` — Create a dorm room inside a floor\n"
             "`/dorm_rename` — Rename a dorm room (preserves occupants)\n"
             "`/dorm_relocate` — Move a dorm room from one floor to another\n"
+            "`/dorm_delete` — Permanently delete a single dorm room with OC owner notification\n"
             "`/dorm_kick` — Force-remove a user's OC(s) from their dorm assignment\n"
             "`/announce` — Post an immediate custom announcement to any channel\n"
             "`/news_post` — Post a news article embed\n"
@@ -2913,10 +3210,21 @@ async def startup_cmd(interaction: discord.Interaction):
 
     # 1. Re-sync slash-command tree
     try:
-        await bot.tree.sync()
-        sync_status = "✅ Command tree re-synced."
+        synced = await bot.tree.sync()
+        sync_status = f"✅ Command tree re-synced ({len(synced)} command(s))."
+    except discord.app_commands.errors.CommandSyncFailure as e:
+        sync_status = (
+            f"❌ CommandSyncFailure (HTTP 400 / code 50035). "
+            f"A command description or option field exceeds Discord's schema limits. "
+            f"Check logs for the full error body.\nDetail: {e}"
+        )
+        log.critical("CommandSyncFailure during /startup: %s", e)
+    except discord.HTTPException as e:
+        sync_status = f"⚠️ HTTPException during sync (status={e.status}, code={e.code}): {e.text}"
+        log.error("HTTPException during /startup sync: %s", e)
     except Exception as e:
-        sync_status = f"⚠️ Sync failed: {e}"
+        sync_status = f"⚠️ Sync failed: {type(e).__name__}: {e}"
+        log.error("Unexpected error during /startup sync: %s", e)
 
     # 2. Restart background tasks if stopped
     task_lines = []
