@@ -172,6 +172,27 @@ async def global_interaction_check(interaction: discord.Interaction) -> bool:
         return False
     return True
 
+# ─── Ping ──────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="ping", description="Check the bot's responsiveness and WebSocket latency.")
+async def ping_cmd(interaction: discord.Interaction):
+    """
+    Responds with the bot's current WebSocket heartbeat latency in milliseconds.
+    Available to all users — no dev/admin restriction.
+    The latency is derived from bot.latency (a float in seconds, returned by discord.py
+    as the average of the last IDENTIFY / HEARTBEAT ACK round-trip times).
+    """
+    latency_ms = round(bot.latency * 1000)   # bot.latency is in seconds; convert to ms
+
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"WebSocket latency: **{latency_ms} ms**",
+        color=discord.Color.green() if latency_ms < 200 else discord.Color.orange(),
+        timestamp=now_utc(),
+    )
+    embed.set_footer(text="Latency is the bot's last WebSocket heartbeat round-trip time.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # ─── on_ready ──────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -1447,14 +1468,9 @@ class IGPostView(discord.ui.View):
                 "❌ Post not found.", ephemeral=True)
 
         post = data["instagram"][self.post_id]
-        likers: list = post.setdefault("likers", [])
 
-        if interaction.user.id in likers:
-            likers.remove(interaction.user.id)
-        else:
-            likers.append(interaction.user.id)
-
-        post["likes"] = len(likers)
+        # Pure increment — any user can click multiple times; no deduplication
+        post["likes"] = post.get("likes", 0) + 1
         self.likes    = post["likes"]
         self._update_like_label()
         save_data(data)
@@ -1570,7 +1586,6 @@ async def ig_post(
         "caption":   caption,
         "photos":    photos,
         "likes":     0,
-        "likers":    [],
         "posted_by": interaction.user.id,
         "posted_at": now_iso(),
         "channel_id": None,
@@ -1868,60 +1883,49 @@ class GCInviteView(discord.ui.View):
         oc_key: str,
         oc_name: str,
         group_name: str,
-        dev_ids: list[int],        # user IDs of all dev/admin members
+        target_channel_id: int,   # ID of the channel to grant access to on accept
+        dev_ids: list[int],       # user IDs of all dev/admin members
     ):
         super().__init__(timeout=None)
-        self.guild_id         = guild_id
-        self.invitee_user_id  = invitee_user_id
-        self.oc_key           = oc_key
-        self.oc_name          = oc_name
-        self.group_name       = group_name
-        self.dev_ids          = dev_ids
+        self.guild_id          = guild_id
+        self.invitee_user_id   = invitee_user_id
+        self.oc_key            = oc_key
+        self.oc_name           = oc_name
+        self.group_name        = group_name
+        self.target_channel_id = target_channel_id
+        self.dev_ids           = dev_ids
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success,
                        custom_id="gcinvite_accept")
     async def accept(self, interaction: discord.Interaction,
                      button: discord.ui.Button):
-        guild  = bot.get_guild(self.guild_id)
+        guild = bot.get_guild(self.guild_id)
         if not guild:
             return await interaction.response.edit_message(
                 content="❌ Server not found.", view=None)
 
-        # Build overwrites: deny everyone, grant invitee + all devs
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me:           discord.PermissionOverwrite(view_channel=True,
-                                    send_messages=True, read_message_history=True),
-        }
-        member = guild.get_member(self.invitee_user_id)
-        if member:
-            overwrites[member] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True)
-
-        for dev_id in self.dev_ids:
-            dev_member = guild.get_member(dev_id)
-            if dev_member:
-                overwrites[dev_member] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True,
-                    manage_messages=True, read_message_history=True)
-
-        # Create or reuse a "Group Chats" category
-        cat_name = "Group Chats"
-        category = discord.utils.get(guild.categories, name=cat_name)
-        if not category:
-            category = await guild.create_category(cat_name)
-
-        # Channel name derived from group name (Discord-safe slug)
-        ch_slug = self.group_name.lower().replace(" ", "-")
-        channel = discord.utils.get(guild.text_channels,
-                                    name=ch_slug, category=category)
+        channel = guild.get_channel(self.target_channel_id)
         if not channel:
-            channel = await guild.create_text_channel(
-                ch_slug, category=category, overwrites=overwrites)
+            return await interaction.response.edit_message(
+                content="❌ The assigned channel no longer exists. Contact a dev.", view=None)
 
-        # Persist to data store
-        data  = load_data()
-        gc_key = f"gc_{ch_slug}_{int(now_utc().timestamp())}"
+        member = guild.get_member(self.invitee_user_id)
+        if not member:
+            return await interaction.response.edit_message(
+                content="❌ Could not resolve your server membership. Are you still in the server?",
+                view=None)
+
+        # Grant immediate, targeted channel access — no channel creation
+        await channel.set_permissions(
+            member,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+
+        # Persist groupchat record
+        data   = load_data()
+        gc_key = f"gc_{channel.name}_{int(now_utc().timestamp())}"
         data["groupchats"][gc_key] = {
             "name":         self.group_name,
             "channel_id":   channel.id,
@@ -1930,25 +1934,20 @@ class GCInviteView(discord.ui.View):
         }
         save_data(data)
 
-        # Welcome embed in the new channel
-        embed = discord.Embed(
-            title=f"Welcome to {self.group_name}!",
-            description=(f"{member.mention if member else 'The invited user'}'s OC "
-                         f"**{self.oc_name}** has joined this group chat.\n"
-                         f"Devs are present in this channel."),
-            color=discord.Color.blue(),
-            timestamp=now_utc(),
-        )
-        await channel.send(embed=embed)
-
         await interaction.response.edit_message(
-            content=(f"✅ You accepted the group chat invite for **{self.oc_name}** "
-                     f"in **{self.group_name}**. Channel: see the server."),
-            view=None)
+            content=(
+                f"✅ You accepted the group chat invite for **{self.oc_name}** "
+                f"in **{self.group_name}**. You now have access to the channel in "
+                f"**{guild.name}**."
+            ),
+            view=None,
+        )
 
-        await audit(guild,
-                    f"GC invite accepted: OC '{self.oc_name}' added to "
-                    f"'{self.group_name}' by {interaction.user} ({interaction.user.id})")
+        await audit(
+            guild,
+            f"GC invite accepted: OC '{self.oc_name}' granted access to "
+            f"#{channel.name} ({channel.id}) by {interaction.user} ({interaction.user.id})",
+        )
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger,
                        custom_id="gcinvite_decline")
@@ -1962,22 +1961,31 @@ class GCInviteView(discord.ui.View):
 
 @bot.tree.command(
     name="gc_invite",
-    description="[Dev] DM a debuted OC's owner a group-chat invite that creates a private channel on acceptance."
+    description="[Dev] DM a debuted OC's owner a group-chat invite; they immediately join an assigned channel on acceptance."
 )
 @app_commands.describe(
     oc_name="Name of the already-debuted OC to invite",
-    group_name="Display name for the new group chat (becomes the channel name)",
+    group_name="Display name for the group chat",
     message="Custom invitation message shown in the DM",
+    target_channel="The existing channel the user will receive access to upon accepting",
 )
 async def gc_invite(
     interaction: discord.Interaction,
     oc_name: str,
     group_name: str,
     message: str,
+    target_channel: discord.TextChannel,
 ):
     if not is_dev(interaction):
         return await interaction.response.send_message(
             "❌ Only devs can send group chat invites.", ephemeral=True)
+
+    # Confirm the bot can manage permissions in the target channel
+    if not target_channel.permissions_for(interaction.guild.me).manage_permissions:
+        return await interaction.response.send_message(
+            f"❌ I do not have **Manage Permissions** in {target_channel.mention}. "
+            f"Grant that permission before using this channel as a GC target.",
+            ephemeral=True)
 
     data   = load_data()
     oc_key = oc_key_of(oc_name)
@@ -2023,6 +2031,7 @@ async def gc_invite(
         oc_key=oc_key,
         oc_name=oc_name,
         group_name=group_name,
+        target_channel_id=target_channel.id,
         dev_ids=dev_ids,
     )
 
@@ -2034,12 +2043,14 @@ async def gc_invite(
             view=view,
         )
         await interaction.response.send_message(
-            f"✅ Group chat invite sent to {member.mention} for OC **{oc_name}**.",
+            f"✅ Group chat invite sent to {member.mention} for OC **{oc_name}**. "
+            f"On acceptance they will receive access to {target_channel.mention}.",
             ephemeral=True)
         await audit(
             interaction.guild,
             f"GC invite sent to {member} ({member.id}) for OC '{oc_name}' "
-            f"group '{group_name}' by {interaction.user} ({interaction.user.id})"
+            f"group '{group_name}' target_channel=#{target_channel.name} ({target_channel.id}) "
+            f"by {interaction.user} ({interaction.user.id})"
         )
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -2259,6 +2270,9 @@ async def help_cmd(interaction: discord.Interaction):
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
         ))
+        embed.add_field(name="Utility", inline=False, value=(
+            "`/ping` — Check the bot's WebSocket latency\n"
+        ))
         embed.add_field(name="⚙️ Dev Tools", inline=False, value=(
             "`/floor_create` — Create a floor category\n"
             "`/floor_rename` — Rename a floor (preserves assignments)\n"
@@ -2272,8 +2286,6 @@ async def help_cmd(interaction: discord.Interaction):
             "`/debut_notify` — Send a debut contract DM\n"
             "`/gc_invite` — Invite a debuted OC's owner to a new private group chat\n"
             "`/dev_dm` — Message a user directly\n"
-            "`/shutdown` — Gracefully shut down the bot with a final DB backup\n"
-            "`/startup` — Manually revive the bot, re-sync commands, restart tasks\n"
         ))
         embed.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -2312,6 +2324,9 @@ async def help_cmd(interaction: discord.Interaction):
         embed.add_field(name="Messaging", inline=False, value=(
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
+        ))
+        embed.add_field(name="Utility", inline=False, value=(
+            "`/ping` — Check the bot's WebSocket latency\n"
         ))
         embed.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -2359,82 +2374,6 @@ async def _emergency_backup():
             except Exception as e:
                 log.error(f"Emergency backup failed: {e}")
             break
-
-
-@bot.tree.command(name="shutdown", description="[Dev] Gracefully shut down the bot with a final DB backup.")
-async def shutdown_cmd(interaction: discord.Interaction):
-    if not is_dev(interaction):
-        return await interaction.response.send_message(
-            "❌ Only devs can shut down the bot.", ephemeral=True)
-
-    await interaction.response.send_message(
-        "🔴 Shutdown initiated. Performing final DB backup before going offline…",
-        ephemeral=True)
-
-    await audit(
-        interaction.guild,
-        f"[SHUTDOWN] Bot shutdown initiated by {interaction.user} "
-        f"({interaction.user.id}) at {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
-
-    await _emergency_backup()
-    log.info("Graceful shutdown via /shutdown command by %s.", interaction.user)
-    await bot.close()
-
-
-@bot.tree.command(
-    name="startup",
-    description="[Dev] Manually revive the bot: re-sync commands and restart task loops."
-)
-async def startup_cmd(interaction: discord.Interaction):
-    if not is_dev(interaction):
-        return await interaction.response.send_message(
-            "❌ Only devs can use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    # 1. Re-sync slash-command tree
-    try:
-        await bot.tree.sync()
-        sync_status = "✅ Command tree re-synced."
-    except Exception as e:
-        sync_status = f"⚠️ Sync failed: {e}"
-
-    # 2. Restart background tasks if stopped
-    task_lines = []
-    for task_obj, label in [
-        (check_birthdays,  "check_birthdays"),
-        (check_scheduled,  "check_scheduled"),
-        (auto_backup_db,   "auto_backup_db"),
-    ]:
-        if not task_obj.is_running():
-            task_obj.start()
-            task_lines.append(f"🔄 `{label}` — restarted.")
-        else:
-            task_lines.append(f"✅ `{label}` — already running.")
-
-    # 3. Validate DB readability
-    try:
-        _ = load_data()
-        db_status = "✅ Database readable."
-    except Exception as e:
-        db_status = f"⚠️ Database error: {e}"
-
-    embed = discord.Embed(
-        title="Manual Startup Report",
-        color=discord.Color.green(),
-        timestamp=now_utc(),
-    )
-    embed.add_field(name="Slash Commands", value=sync_status, inline=False)
-    embed.add_field(name="Background Tasks", value="\n".join(task_lines), inline=False)
-    embed.add_field(name="Database", value=db_status, inline=False)
-    embed.set_footer(text=f"Initiated by {interaction.user} ({interaction.user.id})")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-    await audit(
-        interaction.guild,
-        f"[STARTUP] Manual startup executed by {interaction.user} ({interaction.user.id})"
-    )
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
