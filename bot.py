@@ -2784,7 +2784,7 @@ class GCInviteView(discord.ui.View):
 
 @bot.tree.command(
     name="gc_invite",
-    description="[Dev] DM a debuted OC's owner a group-chat invite; they immediately join an assigned channel on acceptance."
+    description="[Dev] DM a debuted OC's owner a group-chat invite."
 )
 @app_commands.describe(
     oc_name="Name of the already-debuted OC to invite",
