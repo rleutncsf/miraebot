@@ -134,6 +134,65 @@ def _validate_backup(parsed: dict) -> bool:
                 return False
     return True
 
+def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
+    """
+    Walk every registered command and option in the tree and return a list of
+    human-readable violation strings. Returns an empty list if everything is valid.
+
+    Checks enforced:
+      - Command description: 1–100 characters
+      - Option (parameter) description: 1–100 characters
+      - Option name: 1–32 characters
+      - Choice name: 1–100 characters
+      - Choice value (str): 1–100 characters
+      - Total top-level options per command: <= 25
+    """
+    violations: list[str] = []
+
+    for cmd in tree.get_commands():
+        # Command-level description
+        desc = getattr(cmd, "description", "") or ""
+        if not (1 <= len(desc) <= 100):
+            violations.append(
+                f"/{cmd.name}: command description length={len(desc)} "
+                f"(must be 1–100). Value: {desc!r}"
+            )
+
+        # Option-level checks
+        params = getattr(cmd, "_params", {})
+        if len(params) > 25:
+            violations.append(
+                f"/{cmd.name}: has {len(params)} options (max 25)."
+            )
+
+        for param_name, param in params.items():
+            p_desc = getattr(param, "description", "") or ""
+            if not (1 <= len(p_desc) <= 100):
+                violations.append(
+                    f"/{cmd.name} [{param_name}]: option description length={len(p_desc)} "
+                    f"(must be 1–100). Value: {p_desc!r}"
+                )
+            if not (1 <= len(param_name) <= 32):
+                violations.append(
+                    f"/{cmd.name} [{param_name}]: option name length={len(param_name)} "
+                    f"(must be 1–32)."
+                )
+            # Check choices if present
+            choices = getattr(param, "choices", []) or []
+            for choice in choices:
+                c_name = getattr(choice, "name", "") or ""
+                c_val  = getattr(choice, "value", "")
+                if not (1 <= len(c_name) <= 100):
+                    violations.append(
+                        f"/{cmd.name} [{param_name}] choice name length={len(c_name)}: {c_name!r}"
+                    )
+                if isinstance(c_val, str) and not (1 <= len(c_val) <= 100):
+                    violations.append(
+                        f"/{cmd.name} [{param_name}] choice value length={len(c_val)}: {c_val!r}"
+                    )
+
+    return violations
+
 def get_age(birthday_str: str):
     try:
         bday  = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
@@ -324,15 +383,37 @@ async def on_ready():
 
         DB_LOADED = True
 
-    await bot.tree.sync()
+    schema_violations = _validate_command_tree_schema(bot.tree)
+    if schema_violations:
+        log.critical(
+            "Pre-sync schema validation found %d violation(s). Sync will fail!\n%s",
+            len(schema_violations),
+            "\n".join(f"  • {v}" for v in schema_violations)
+        )
+    else:
+        log.info("Pre-sync schema validation passed — all %d commands are valid.", len(bot.tree.get_commands()))
+
+    try:
+        synced = await bot.tree.sync()
+        log.info("Logged in as %s — %d slash command(s) synced.", bot.user, len(synced))
+    except discord.app_commands.errors.CommandSyncFailure as e:
+        log.critical(
+            "CommandSyncFailure during on_ready sync. "
+            "One or more slash commands have invalid schema fields. "
+            "Full error: %s", e
+        )
+    except discord.HTTPException as e:
+        log.error(
+            "HTTPException during on_ready sync (status=%s, code=%s): %s",
+            e.status, e.code, e.text
+        )
+
     if not check_birthdays.is_running():
         check_birthdays.start()
     if not check_scheduled.is_running():
         check_scheduled.start()
     if not auto_backup_db.is_running():
         auto_backup_db.start()
-        
-    log.info("Logged in as %s — slash commands synced", bot.user)
 
 
 # ─── Automated Backup loop ─────────────────────────────────────────────────────
@@ -1212,7 +1293,7 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
 )
 @app_commands.describe(
     user="The server member whose OC(s) should be removed from their dorm",
-    oc_name="Specific OC to remove (optional — omit to remove ALL of this user's OCs)",
+    oc_name="OC to remove (optional — omit to remove all of this user's OCs from dorms)",
 )
 async def dorm_kick(
     interaction: discord.Interaction,
@@ -1508,7 +1589,7 @@ class AnnounceView(discord.ui.View):
     image_url="Optional banner image URL",
     thumbnail_url="Optional thumbnail image URL",
     footnote="Optional footer text (supports {server}, {date} placeholders)",
-    oc_note="Optional OC-flavor field added below content (supports {oc} placeholder — requires oc_name)",
+    oc_note="OC-flavor note added below content (supports {oc} placeholder; requires oc_name)",
     oc_name="OC name for {oc} placeholder resolution in oc_note",
     button1_label="Label for optional first button",
     button1_color="Color for button 1: green / red / grey / blurple",
@@ -1624,13 +1705,15 @@ async def announce(
 #  SCHEDULED ANNOUNCEMENTS  (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# NOTE: All Choice names and values must be <= 100 chars.
+# Verified on: [date]. Re-verify after any edits.
 @bot.tree.command(name="announce_schedule",
                   description="[Dev] Schedule an announcement for a future time.")
 @app_commands.describe(
     title="Announcement title",
     content="Announcement body text",
     fire_at="When to post: YYYY-MM-DD HH:MM (24h)",
-    channel="Channel to post in — select from dropdown (default: #announcements)",
+    channel="Channel to post in (default: #announcements)",
     image_url="Optional image URL",
     timezone_str="Timezone of the input time (default: UTC)",
 )
@@ -1859,7 +1942,7 @@ class IGPostView(discord.ui.View):
     oc_name="Your OC's name",
     username="Instagram username — do NOT include @, the bot adds it automatically (e.g. myhandle)",
     caption="Post caption",
-    photo1_url="First photo as a direct image URL — required (either this or photo1_file)",
+    photo1_url="First photo URL — required if no photo1_file is attached",
     photo1_file="First photo as a file upload — required (either this or photo1_url)",
 )
 async def ig_post(
@@ -1927,7 +2010,6 @@ async def ig_post(
     }
     data["instagram"][post_id] = post_obj
     save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post"))
 
     ig_ch = discord.utils.get(interaction.guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
     if not ig_ch:
@@ -1945,9 +2027,10 @@ async def ig_post(
         color=discord.Color.from_rgb(225, 48, 108),
         timestamp=now_utc(),
     )
+    author_icon = oc.get("profile_picture") or None
     embed.set_author(
         name=f"{oc['name']}  ({handle})",
-        icon_url=oc.get("profile_picture") or discord.Embed.Empty,
+        icon_url=author_icon,
     )
     embed.set_image(url=photos[0])
 
@@ -2406,7 +2489,7 @@ class GCInviteView(discord.ui.View):
 
 @bot.tree.command(
     name="gc_invite",
-    description="[Dev] DM a debuted OC's owner a group-chat invite; they immediately join an assigned channel on acceptance."
+    description="[Dev] DM a debuted OC's owner a group-chat invite with channel access on acceptance."
 )
 @app_commands.describe(
     oc_name="Name of the already-debuted OC to invite",
