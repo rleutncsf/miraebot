@@ -7,9 +7,15 @@ import threading
 import signal
 import sys
 import webserver
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
+import datetime as _dt
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # Python < 3.9
 
 import discord
 from discord import app_commands
@@ -25,7 +31,7 @@ log = logging.getLogger("oc-bot")
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 DATA_FILE                 = os.environ.get("DATA_FILE", "data.json")
-LOG_CHANNEL_NAME          = "oc-log"          # OC registrations, dorm logs
+LOG_CHANNEL_NAME          = "oc-logs"         # OC registrations, dorm logs, birthdays
 AUDIT_CHANNEL_NAME        = "logs"            # ALL user action audit trail
 DEBUT_CHANNEL_NAME        = "debuts"
 NEWS_CHANNEL_NAME         = "announcements"
@@ -37,6 +43,7 @@ BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [2, 3, 4]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
+KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
@@ -259,23 +266,54 @@ async def auto_backup_db():
                 log.error(f"Backup failed: {e}")
 
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
-@tasks.loop(hours=24)
+@tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 KST
 async def check_birthdays():
-    today = date.today()
-    data  = load_data()
+    # Use KST (GMT+9) for the "today" comparison — all OC birthdays are KST-anchored
+    today_kst = datetime.now(KST).date()
+    data       = load_data()
+
     for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)  # resolves to oc-logs
         if not ch:
             continue
+
         for oc in data["ocs"].values():
             try:
                 bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-                if bday.month == today.month and bday.day == today.day:
-                    age    = get_age(oc["birthday"])
-                    suffix = f" They turn {age} today!" if age else ""
-                    await ch.send(f"Happy Birthday to {oc['name']}!{suffix}")
-            except Exception:
-                pass
+                if bday.month != today_kst.month or bday.day != today_kst.day:
+                    continue
+
+                age        = get_age(oc["birthday"])   # still compares vs server UTC date; acceptable
+                age_suffix = f" They turn **{age}** today!" if age else ""
+
+                # Resolve the OC owner's mention if possible
+                owner_id  = oc.get("owner_id")
+                owner_mention = f"<@{owner_id}>" if owner_id else None
+
+                embed = discord.Embed(
+                    title=f"🎂 Happy Birthday, {oc['name']}!",
+                    description=(
+                        f"Today is **{oc['name']}**'s birthday! 🎉{age_suffix}\n"
+                        + (f"Owned by {owner_mention}" if owner_mention else "")
+                    ),
+                    color=discord.Color.from_rgb(255, 182, 193),   # pastel pink
+                    timestamp=datetime.now(KST),
+                )
+                if oc.get("profile_picture"):
+                    embed.set_thumbnail(url=oc["profile_picture"])
+                embed.add_field(
+                    name="Birthday",
+                    value=format_birthday_long(oc["birthday"]),
+                    inline=True,
+                )
+                if age:
+                    embed.add_field(name="Turning", value=str(age), inline=True)
+                embed.set_footer(text="Birthday recognized in KST (GMT+9)")
+
+                await ch.send(embed=embed)
+
+            except Exception as e:
+                log.warning("Birthday check failed for OC '%s': %s", oc.get("name", "?"), e)
 
 # ─── Scheduled announcements loop ─────────────────────────────────────────────
 @tasks.loop(seconds=30)
@@ -380,9 +418,22 @@ async def oc_add(
 
     log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
     if log_ch:
-        await log_ch.send(
-            f"New OC registered: **{name}** — added by {interaction.user.mention}",
-            embed=embed)
+        log_embed = discord.Embed(
+            title="✨ New OC Logged",
+            description=(
+                f"**{name}** has been registered by {interaction.user.mention}.\n"
+                f"Welcome them to the database!"
+            ),
+            color=discord.Color.green(),
+            timestamp=now_utc(),
+        )
+        if pic_url:
+            log_embed.set_thumbnail(url=pic_url)
+        log_embed.add_field(name="OC Name",   value=name,                          inline=True)
+        log_embed.add_field(name="Registered By", value=interaction.user.mention,  inline=True)
+        log_embed.add_field(name="OC ID",     value=f"`{oc_key_of(name)}`",        inline=True)
+        log_embed.set_footer(text=f"Logged at")
+        await log_ch.send(embed=log_embed)
 
     await audit(interaction.guild,
                 f"OC added: '{name}' by {interaction.user} ({interaction.user.id})")
@@ -1150,19 +1201,99 @@ async def news_post(
                 f"News posted: '{title}' by {interaction.user} ({interaction.user.id})")
 
 
+@bot.tree.command(name="send_embed", description="[Dev] Post a custom embed to any channel as a custom identity.")
+@app_commands.describe(
+    channel="Target text channel name",
+    title="Embed title (1-256 chars)",
+    content="Embed description (1-4096 chars)",
+    custom_username="Optional custom sender name",
+    avatar_url="Optional custom sender avatar URL",
+    color="Optional hex color (e.g. #FF5733)",
+    image_url="Optional image URL",
+    footer_text="Optional footer text"
+)
+async def send_embed(
+    interaction: discord.Interaction,
+    channel: str,
+    title: str,
+    content: str,
+    custom_username: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    color: Optional[str] = None,
+    image_url: Optional[str] = None,
+    footer_text: Optional[str] = None
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can send custom embeds.", ephemeral=True)
+
+    target_ch = discord.utils.get(interaction.guild.text_channels, name=channel)
+    if not target_ch:
+        return await interaction.response.send_message(f"❌ Channel `#{channel}` not found.", ephemeral=True)
+
+    if len(title) < 1 or len(title) > 256:
+        return await interaction.response.send_message("❌ Title must be 1-256 characters.", ephemeral=True)
+    if len(content) < 1 or len(content) > 4096:
+        return await interaction.response.send_message("❌ Content must be 1-4096 characters.", ephemeral=True)
+
+    if avatar_url and not valid_image_url(avatar_url):
+        return await interaction.response.send_message("❌ Invalid avatar URL.", ephemeral=True)
+    if image_url and not valid_image_url(image_url):
+        return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
+
+    resolved_color = discord.Color.blurple()
+    if color:
+        try:
+            resolved_color = discord.Color(int(color.lstrip('#'), 16))
+        except Exception:
+            resolved_color = discord.Color.blurple()
+
+    resolved_username = custom_username or interaction.user.display_name
+    resolved_avatar = avatar_url or interaction.user.display_avatar.url
+
+    embed = discord.Embed(
+        title=title,
+        description=content,
+        color=resolved_color,
+        timestamp=now_utc(),
+    )
+    embed.set_author(name=resolved_username, icon_url=resolved_avatar)
+    if image_url:
+        embed.set_image(url=image_url)
+    if footer_text:
+        embed.set_footer(text=footer_text)
+
+    await target_ch.send(embed=embed)
+    await interaction.response.send_message(f"✅ Embed sent to {target_ch.mention}.", ephemeral=True)
+
+    await audit(
+        interaction.guild,
+        f"[SEND_EMBED] '{title}' posted to #{target_ch.name} by {interaction.user} ({interaction.user.id}) as '{resolved_username}'"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCHEDULED ANNOUNCEMENTS  (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="announce_schedule",
-                  description="[Dev] Schedule an announcement for a future time (UTC).")
+                  description="[Dev] Schedule an announcement for a future time.")
 @app_commands.describe(
     title="Announcement title",
     content="Announcement body text",
-    fire_at="When to post: YYYY-MM-DD HH:MM (UTC, 24h)",
+    fire_at="When to post: YYYY-MM-DD HH:MM (24h)",
     channel="Channel to post in (default: announcements)",
     image_url="Optional image URL",
+    timezone_str="Timezone of the input time (default: UTC)",
 )
+@app_commands.choices(timezone_str=[
+    app_commands.Choice(name="UTC",           value="UTC"),
+    app_commands.Choice(name="JST — Asia/Tokyo (GMT+9)",  value="Asia/Tokyo"),
+    app_commands.Choice(name="KST — Asia/Seoul (GMT+9)",  value="Asia/Seoul"),
+    app_commands.Choice(name="PST+8 — Asia/Manila (GMT+8)", value="Asia/Manila"),
+    app_commands.Choice(name="EST — America/New_York (GMT-5)", value="America/New_York"),
+    app_commands.Choice(name="PST — America/Los_Angeles (GMT-8)", value="America/Los_Angeles"),
+    app_commands.Choice(name="BST/GMT — Europe/London",   value="Europe/London"),
+])
 async def announce_schedule(
     interaction: discord.Interaction,
     title: str,
@@ -1170,17 +1301,27 @@ async def announce_schedule(
     fire_at: str,
     channel: Optional[str] = None,
     image_url: Optional[str] = None,
+    timezone_str: Optional[str] = None,
 ):
     if not is_dev(interaction):
         return await interaction.response.send_message(
             "❌ Only devs can schedule announcements.", ephemeral=True)
 
+    tz_str = timezone_str or "UTC"
     try:
-        fire_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M").replace(
-            tzinfo=timezone.utc)
+        tz = ZoneInfo(tz_str)
+    except (ZoneInfoNotFoundError, KeyError):
+        return await interaction.response.send_message(
+            f"❌ Unknown timezone `{tz_str}`. Use a valid IANA timezone name, "
+            f"e.g. `UTC`, `Asia/Tokyo`, `Asia/Seoul`.", ephemeral=True)
+
+    try:
+        naive_dt  = datetime.strptime(fire_at, "%Y-%m-%d %H:%M")
+        local_dt  = naive_dt.replace(tzinfo=tz)
+        fire_dt   = local_dt.astimezone(timezone.utc)
     except ValueError:
         return await interaction.response.send_message(
-            "❌ Date/time must be in **YYYY-MM-DD HH:MM** format (UTC, 24-hour). "
+            "❌ Date/time must be in **YYYY-MM-DD HH:MM** format (24-hour). "
             "Example: `2025-12-25 09:00`", ephemeral=True)
 
     if fire_dt <= now_utc():
@@ -1211,8 +1352,10 @@ async def announce_schedule(
     save_data(data)
 
     await interaction.response.send_message(
-        f"Announcement **{title}** scheduled for "
-        f"`{fire_dt.strftime('%Y-%m-%d %H:%M UTC')}` in `#{target_channel}`.",
+        f"✅ Announcement **{title}** scheduled for:\n"
+        f"• Local: {local_dt.strftime('%Y-%m-%d %H:%M')} {tz_str}\n"
+        f"• UTC:   {fire_dt.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Will post to {ch.mention}.",
         ephemeral=True)
 
     await audit(interaction.guild,
@@ -1235,7 +1378,11 @@ async def announce_list(interaction: discord.Interaction):
 
     embed = discord.Embed(title="Scheduled Announcements", color=discord.Color.blurple())
     for k, v in sorted(pending.items(), key=lambda x: x[1]["fire_at"]):
-        fire_str = datetime.fromisoformat(v["fire_at"]).strftime("%Y-%m-%d %H:%M UTC")
+        fire_utc = datetime.fromisoformat(v["fire_at"])
+        fire_kst = fire_utc.astimezone(KST)
+        fire_str = (f"{fire_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
+                    f"({fire_kst.strftime('%H:%M KST')})")
+        
         embed.add_field(
             name=v["title"],
             value=f"Posts at: {fire_str}\nChannel: #{v['channel']}\nID: `{k}`",
@@ -2119,6 +2266,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/dorm_rename` — Rename a dorm room (preserves occupants)\n"
             "`/dorm_kick` — Force-remove a user's OC(s) from their dorm assignment\n"
             "`/news_post` — Post a news article embed\n"
+            "`/send_embed` — Post a custom embed to any channel as a custom identity\n"
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
             "`/debut_notify` — Send a debut contract DM\n"
@@ -2137,7 +2285,7 @@ async def help_cmd(interaction: discord.Interaction):
             f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
             f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
             f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
-            f"Scheduled time format: YYYY-MM-DD HH:MM (UTC)\n"
+            f"Scheduled time format: YYYY-MM-DD HH:MM (specify timezone; default UTC)\n"
             f"Up to {MAX_PHOTOS} photos per Instagram post\n"
         ))
         embed.set_footer(text="You are seeing this view because you have Administrator permissions.")
