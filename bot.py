@@ -43,7 +43,7 @@ BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [2, 3, 4]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
-KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
+JST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
@@ -68,6 +68,23 @@ def save_data(data: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     DATA_DIRTY = True
+
+def _validate_backup(parsed: dict) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    if "ocs" in parsed:
+        for v in parsed["ocs"].values():
+            if not isinstance(v, dict):
+                return False
+    if "floors" in parsed:
+        for v in parsed["floors"].values():
+            if not isinstance(v, dict) or "rooms" not in v or not isinstance(v["rooms"], dict):
+                return False
+    if "dorms" in parsed:
+        for v in parsed["dorms"].values():
+            if not isinstance(v, dict):
+                return False
+    return True
 
 def get_age(birthday_str: str):
     try:
@@ -210,22 +227,34 @@ async def on_ready():
                         guild.default_role: discord.PermissionOverwrite(view_channel=False),
                         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True)
                     }
-                    ch = await guild.create_text_channel(DB_BACKUP_CHANNEL_NAME, category=cat, overwrites=overwrites)
+                    ch = await guild.create_text_channel(
+                        DB_BACKUP_CHANNEL_NAME, 
+                        category=cat, 
+                        overwrites=overwrites,
+                        topic="⚙️ Automated DB backup storage. Do not send messages here.",
+                        slowmode_delay=21600
+                    )
                 except Exception:
                     continue
 
             if ch:
                 try:
-                    async for message in ch.history(limit=1):
-                        if message.attachments:
+                    await ch.edit(topic="⚙️ Automated DB backup storage. Do not send messages here.", slowmode_delay=21600)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+                try:
+                    async for message in ch.history(limit=20):
+                        if message.author == bot.user and message.attachments:
                             att = message.attachments[0]
                             if att.filename == "data.json":
                                 file_bytes = await att.read()
                                 try:
                                     parsed = json.loads(file_bytes)
-                                    # Basic schema validation
-                                    if not isinstance(parsed, dict):
-                                        raise ValueError("Root is not a dict")
+                                    if not _validate_backup(parsed):
+                                        log.error("Backup file failed schema validation, skipping restore.")
+                                        break
+                                    # Basic schema validation defaults
                                     for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled"):
                                         parsed.setdefault(k, {})
                                 except (json.JSONDecodeError, ValueError) as e:
@@ -234,7 +263,7 @@ async def on_ready():
                                 
                                 with open(DATA_FILE, "wb") as f:
                                     f.write(file_bytes)
-                                log.info("Successfully restored database memory from Discord backup.")
+                                log.info("Restored from backup — message_id=%s guild=%s", message.id, guild.id)
                                 break
                 except Exception as e:
                     log.error(f"Error fetching DB backup: {e}")
@@ -274,23 +303,23 @@ async def auto_backup_db():
                     file=file
                 )
                 DATA_DIRTY = False
+                log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
 
                 # Then clean up old backups (skip the one just posted)
-                async for msg in ch.history(limit=10):
-                    if msg.author == bot.user and msg.id != new_msg.id:
-                        try:
-                            await msg.delete()
-                        except Exception:
-                            pass
+                try:
+                    await ch.purge(limit=50, check=lambda m: m.author == bot.user and m.id != new_msg.id)
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Could not purge old backups: {e}")
                 break
             except Exception as e:
                 log.error(f"Backup failed: {e}")
 
+
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
-@tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 KST
+@tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 JST
 async def check_birthdays():
-    # Use KST (GMT+9) for the "today" comparison — all OC birthdays are KST-anchored
-    today_kst = datetime.now(KST).date()
+    # Use JST (GMT+9) for the "today" comparison — all OC birthdays are JST-anchored
+    today_jst = datetime.now(JST).date()
     data       = load_data()
 
     for guild in bot.guilds:
@@ -301,7 +330,7 @@ async def check_birthdays():
         for oc in data["ocs"].values():
             try:
                 bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-                if bday.month != today_kst.month or bday.day != today_kst.day:
+                if bday.month != today_jst.month or bday.day != today_jst.day:
                     continue
 
                 age        = get_age(oc["birthday"])   # still compares vs server UTC date; acceptable
@@ -318,7 +347,7 @@ async def check_birthdays():
                         + (f"Owned by {owner_mention}" if owner_mention else "")
                     ),
                     color=discord.Color.from_rgb(255, 182, 193),   # pastel pink
-                    timestamp=datetime.now(KST),
+                    timestamp=datetime.now(JST),
                 )
                 if oc.get("profile_picture"):
                     embed.set_thumbnail(url=oc["profile_picture"])
@@ -329,7 +358,7 @@ async def check_birthdays():
                 )
                 if age:
                     embed.add_field(name="Turning", value=str(age), inline=True)
-                embed.set_footer(text="Birthday recognized in KST (GMT+9)")
+                embed.set_footer(text="Birthday recognized in JST (GMT+9)")
 
                 await ch.send(embed=embed)
 
@@ -1400,9 +1429,9 @@ async def announce_list(interaction: discord.Interaction):
     embed = discord.Embed(title="Scheduled Announcements", color=discord.Color.blurple())
     for k, v in sorted(pending.items(), key=lambda x: x[1]["fire_at"]):
         fire_utc = datetime.fromisoformat(v["fire_at"])
-        fire_kst = fire_utc.astimezone(KST)
+        fire_jst = fire_utc.astimezone(JST)
         fire_str = (f"{fire_utc.strftime('%Y-%m-%d %H:%M UTC')}  "
-                    f"({fire_kst.strftime('%H:%M KST')})")
+                    f"({fire_jst.strftime('%H:%M JST')})")
         
         embed.add_field(
             name=v["title"],
@@ -1525,7 +1554,7 @@ class IGPostView(discord.ui.View):
                   description="Post an Instagram-style photo post as your OC.")
 @app_commands.describe(
     oc_name="Your OC's name",
-    username="Instagram handle (e.g. @username)",
+    username="Instagram username — do NOT include @, the bot adds it automatically (e.g. myhandle)",
     caption="Post caption",
     photo1_url="First photo as a direct image URL — required (either this or photo1_file)",
     photo1_file="First photo as a file upload — required (either this or photo1_url)",
@@ -1590,6 +1619,7 @@ async def ig_post(
         "posted_at": now_iso(),
         "channel_id": None,
         "message_id": None,
+        "last_message_id": None,
         "thread_id":  None,
     }
     data["instagram"][post_id] = post_obj
@@ -1616,18 +1646,30 @@ async def ig_post(
         icon_url=oc.get("profile_picture") or discord.Embed.Empty,
     )
     embed.set_image(url=photos[0])
-    embed.set_footer(text=f"{len(photos)} photo(s)  ·  post id: {post_id}")
 
-    msg = await ig_ch.send(embed=embed, view=view)
+    if len(photos) == 1:
+        embed.set_footer(text=f"{len(photos)} photo(s)  ·  post id: {post_id}")
+        last_msg = await ig_ch.send(embed=embed, view=view)
+        data["instagram"][post_id]["message_id"] = last_msg.id
+        data["instagram"][post_id]["last_message_id"] = last_msg.id
+    else:
+        embed.set_footer(text=f"{len(photos)} photo(s)  ·  post id: {post_id}")
+        first_msg = await ig_ch.send(embed=embed)
+        data["instagram"][post_id]["message_id"] = first_msg.id
 
-    for i, photo in enumerate(photos[1:], start=2):
-        extra = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
-        extra.set_image(url=photo)
-        extra.set_footer(text=f"Photo {i}/{len(photos)}")
-        await ig_ch.send(embed=extra)
+        for i, photo in enumerate(photos[1:-1], start=2):
+            mid_embed = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
+            mid_embed.set_image(url=photo)
+            mid_embed.set_footer(text=f"Photo {i}/{len(photos)}")
+            await ig_ch.send(embed=mid_embed)
+
+        last_embed = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
+        last_embed.set_image(url=photos[-1])
+        last_embed.set_footer(text=f"Photo {len(photos)}/{len(photos)}  ·  post id: {post_id}")
+        last_msg = await ig_ch.send(embed=last_embed, view=view)
+        data["instagram"][post_id]["last_message_id"] = last_msg.id
 
     data["instagram"][post_id]["channel_id"] = ig_ch.id
-    data["instagram"][post_id]["message_id"] = msg.id
     save_data(data)
 
     await audit(interaction.guild,
@@ -2286,6 +2328,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/debut_notify` — Send a debut contract DM\n"
             "`/gc_invite` — Invite a debuted OC's owner to a new private group chat\n"
             "`/dev_dm` — Message a user directly\n"
+            "`/startup` — Manually revive the bot, re-sync commands, restart tasks\n"
         ))
         embed.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -2365,15 +2408,71 @@ async def _emergency_backup():
         if ch:
             try:
                 file = discord.File(DATA_FILE, filename="data.json")
-                await ch.send(
+                new_msg = await ch.send(
                     f"[EMERGENCY BACKUP] Shutdown signal — {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
                     file=file
                 )
                 DATA_DIRTY = False
+                log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
                 log.info("Emergency backup completed.")
             except Exception as e:
                 log.error(f"Emergency backup failed: {e}")
             break
+
+
+@bot.tree.command(
+    name="startup",
+    description="[Dev] Manually revive the bot: re-sync commands and restart task loops."
+)
+async def startup_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can use this command.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # 1. Re-sync slash-command tree
+    try:
+        await bot.tree.sync()
+        sync_status = "✅ Command tree re-synced."
+    except Exception as e:
+        sync_status = f"⚠️ Sync failed: {e}"
+
+    # 2. Restart background tasks if stopped
+    task_lines = []
+    for task_obj, label in [
+        (check_birthdays,  "check_birthdays"),
+        (check_scheduled,  "check_scheduled"),
+        (auto_backup_db,   "auto_backup_db"),
+    ]:
+        if not task_obj.is_running():
+            task_obj.start()
+            task_lines.append(f"🔄 `{label}` — restarted.")
+        else:
+            task_lines.append(f"✅ `{label}` — already running.")
+
+    # 3. Validate DB readability
+    try:
+        _ = load_data()
+        db_status = "✅ Database readable."
+    except Exception as e:
+        db_status = f"⚠️ Database error: {e}"
+
+    embed = discord.Embed(
+        title="Manual Startup Report",
+        color=discord.Color.green(),
+        timestamp=now_utc(),
+    )
+    embed.add_field(name="Slash Commands", value=sync_status, inline=False)
+    embed.add_field(name="Background Tasks", value="\n".join(task_lines), inline=False)
+    embed.add_field(name="Database", value=db_status, inline=False)
+    embed.set_footer(text=f"Initiated by {interaction.user} ({interaction.user.id})")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await audit(
+        interaction.guild,
+        f"[STARTUP] Manual startup executed by {interaction.user} ({interaction.user.id})"
+    )
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
