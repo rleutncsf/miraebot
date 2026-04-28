@@ -1,3 +1,11 @@
+"""
+OC & Dorm Discord Bot  ·  v3
+─────────────────────────────────────────────────────────────────────────────
+All interaction through slash commands only.
+Render-ready: health-check HTTP server runs alongside the bot.
+─────────────────────────────────────────────────────────────────────────────
+"""
+
 import asyncio
 import json
 import logging
@@ -5,6 +13,7 @@ import os
 import re
 import threading
 import signal
+import sys
 import webserver
 from datetime import datetime, date, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -639,6 +648,71 @@ async def floor_create(interaction: discord.Interaction, floor_name: str):
                 f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
 
 
+@bot.tree.command(name="floor_rename", description="[Dev] Rename a floor without affecting room assignments.")
+@app_commands.describe(
+    old_name="Current floor name",
+    new_name="New floor name",
+)
+async def floor_rename(interaction: discord.Interaction, old_name: str, new_name: str):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can rename floors.", ephemeral=True)
+
+    # --- Validation ---
+    old_key = dorm_key_of(old_name)
+    new_key = dorm_key_of(new_name)
+    data    = load_data()
+
+    if old_key not in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ No floor named **{old_name}** found.", ephemeral=True)
+
+    if new_key == old_key:
+        return await interaction.response.send_message(
+            "❌ The new name resolves to the same key as the current name. "
+            "Choose a more distinct name.", ephemeral=True)
+
+    if new_key in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ A floor with the key `{new_key}` already exists "
+            f"(from name **{data['floors'][new_key]['name']}**). "
+            "Pick a different name.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # --- Data migration ---
+    floor_data          = data["floors"].pop(old_key)       # remove old key
+    floor_data["name"]  = new_name                          # update display name
+    data["floors"][new_key] = floor_data                    # re-insert under new key
+
+    # --- Rename Discord category ---
+    category = discord.utils.get(interaction.guild.categories, name=old_name)
+    if category:
+        try:
+            await category.edit(name=new_name)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "⚠️ Floor data renamed in DB but I lack permissions to rename the Discord category.",
+                ephemeral=True)
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"⚠️ Floor data renamed in DB but Discord category rename failed: {e}",
+                ephemeral=True)
+    else:
+        # Non-fatal: category may have been manually deleted
+        log.warning("floor_rename: Discord category '%s' not found; skipping rename.", old_name)
+
+    save_data(data)
+
+    await interaction.followup.send(
+        f"✅ Floor **{old_name}** renamed to **{new_name}**. "
+        f"All room assignments preserved.", ephemeral=True)
+
+    await audit(interaction.guild,
+                f"Floor renamed: '{old_name}' → '{new_name}' "
+                f"by {interaction.user} ({interaction.user.id})")
+
+
 @bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
 @app_commands.describe(
     floor_name="Name of the floor this room belongs to",
@@ -698,6 +772,93 @@ async def dorm_create(
 
     await audit(interaction.guild,
                 f"Room created: '{room_name}' on '{floor['name']}' (cap {capacity}) "
+                f"by {interaction.user} ({interaction.user.id})")
+
+
+@bot.tree.command(name="dorm_rename", description="[Dev] Rename a dorm room without affecting occupant assignments.")
+@app_commands.describe(
+    floor_name="Floor this room belongs to",
+    old_room_name="Current room name",
+    new_room_name="New room name",
+)
+async def dorm_rename(
+    interaction: discord.Interaction,
+    floor_name: str,
+    old_room_name: str,
+    new_room_name: str,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can rename dorms.", ephemeral=True)
+
+    # --- Validation ---
+    f_key    = dorm_key_of(floor_name)
+    old_rkey = room_key_of(old_room_name)
+    new_rkey = room_key_of(new_room_name)
+    data     = load_data()
+
+    if f_key not in data["floors"]:
+        return await interaction.response.send_message(
+            f"❌ No floor named **{floor_name}** found.", ephemeral=True)
+
+    floor = data["floors"][f_key]
+
+    if old_rkey not in floor["rooms"]:
+        return await interaction.response.send_message(
+            f"❌ No room named **{old_room_name}** on floor **{floor_name}**.",
+            ephemeral=True)
+
+    if new_rkey == old_rkey:
+        return await interaction.response.send_message(
+            "❌ The new room name resolves to the same key as the current name. "
+            "Choose a more distinct name.", ephemeral=True)
+
+    if new_rkey in floor["rooms"]:
+        return await interaction.response.send_message(
+            f"❌ A room with the key `{new_rkey}` already exists on this floor "
+            f"(from name **{floor['rooms'][new_rkey]['name']}**). "
+            "Pick a different name.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # --- Data migration: rename key and display name; occupants list is preserved ---
+    room_data           = floor["rooms"].pop(old_rkey)
+    room_data["name"]   = new_room_name
+    floor["rooms"][new_rkey] = room_data
+
+    # --- Rename Discord text channel inside the floor's category ---
+    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+    if category:
+        channel = discord.utils.get(
+            interaction.guild.text_channels, name=old_rkey, category=category)
+        if channel:
+            try:
+                await channel.edit(name=new_rkey)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "⚠️ Room data renamed in DB but I lack permissions to rename the Discord channel.",
+                    ephemeral=True)
+            except discord.HTTPException as e:
+                await interaction.followup.send(
+                    f"⚠️ Room data renamed in DB but Discord channel rename failed: {e}",
+                    ephemeral=True)
+        else:
+            log.warning(
+                "dorm_rename: Discord channel '%s' not found in category '%s'; skipping.",
+                old_rkey, floor["name"])
+    else:
+        log.warning(
+            "dorm_rename: Discord category '%s' not found; skipping channel rename.", floor["name"])
+
+    save_data(data)
+
+    await interaction.followup.send(
+        f"✅ Room **{old_room_name}** on **{floor_name}** renamed to **{new_room_name}**. "
+        f"All occupant assignments preserved.", ephemeral=True)
+
+    await audit(interaction.guild,
+                f"Room renamed: '{old_room_name}' → '{new_room_name}' "
+                f"on floor '{floor_name}' "
                 f"by {interaction.user} ({interaction.user.id})")
 
 
@@ -1672,58 +1833,113 @@ async def oc_groupchat(
 #  HELP
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="oc_help", description="Show all available commands.")
-async def oc_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="OC Bot — Command Reference", color=discord.Color.gold())
-    embed.add_field(name="OC Management", inline=False, value=(
-        "`/oc_add` — Register a new OC (supports file upload; unlimited per user)\n"
-        "`/oc_edit` — Edit OC fields (only filled fields change)\n"
-        "`/oc_delete` — Delete your OC entirely\n"
-        "`/oc_list` — Browse/filter OCs with interactive paginator\n"
-    ))
-    embed.add_field(name="Floor/Dorm Management", inline=False, value=(
-        "`/floor_create` *(dev)* — Create a floor category\n"
-        "`/dorm_create` *(dev)* — Create a dorm room inside a floor\n"
-        "`/dorm_assign` — Assign an OC to a room\n"
-        "`/dorm_unassign` — Remove an OC from their room\n"
-        "`/dorm_view` — View floors and rooms interactively\n"
-    ))
-    embed.add_field(name="News & Announcements", inline=False, value=(
-        "`/news_post` *(dev)* — Post a news article\n"
-        "`/announce_schedule` *(dev)* — Schedule a future announcement\n"
-        "`/announce_list` *(dev)* — View pending scheduled announcements\n"
-        "`/announce_cancel` *(dev)* — Cancel a scheduled announcement\n"
-    ))
-    embed.add_field(name="Instagram", inline=False, value=(
-        "`/ig_post` — Post 1–10 photos (files or URLs) as your OC (Like & Comment included)\n"
-    ))
-    embed.add_field(name="Messaging", inline=False, value=(
-        "`/oc_dm` — Private DM channel between two OCs\n"
-        "`/oc_groupchat` — Group chat for multiple OCs\n"
-        "`/debut_notify` *(dev)* — Send a debut contract DM\n"
-        "`/dev_dm` *(dev)* — Message a user directly with optional reply button\n"
-    ))
-    embed.add_field(name="Notes", inline=False, value=(
-        f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
-        f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
-        f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
-        f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
-        f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
-        f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
-        f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
-        f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
-        f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
-        f"Scheduled time format: YYYY-MM-DD HH:MM (UTC)\n"
-        f"Up to {MAX_PHOTOS} photos per Instagram post\n"
-    ))
+@bot.tree.command(name="help", description="Show available bot commands.")
+async def help_cmd(interaction: discord.Interaction):
+    dev = is_dev(interaction)
+
+    if dev:
+        embed = discord.Embed(
+            title="OC Bot — Full Command Reference (Dev)",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="OC Management", inline=False, value=(
+            "`/oc_add` — Register a new OC\n"
+            "`/oc_edit` — Edit OC fields\n"
+            "`/oc_delete` — Delete your OC\n"
+            "`/oc_list` — Browse/filter OCs with paginator\n"
+        ))
+        embed.add_field(name="Floor/Dorm Management", inline=False, value=(
+            "`/dorm_assign` — Assign an OC to a room\n"
+            "`/dorm_unassign` — Remove an OC from their room\n"
+            "`/dorm_view` — View floors and rooms interactively\n"
+        ))
+        embed.add_field(name="News & Announcements", inline=False, value=(
+            "`/announce_list` — View pending scheduled announcements\n"
+        ))
+        embed.add_field(name="Instagram", inline=False, value=(
+            "`/ig_post` — Post 1–10 photos as your OC\n"
+        ))
+        embed.add_field(name="Messaging", inline=False, value=(
+            "`/oc_dm` — Private DM channel between two OCs\n"
+            "`/oc_groupchat` — Group chat for multiple OCs\n"
+        ))
+        embed.add_field(name="⚙️ Dev Tools", inline=False, value=(
+            "`/floor_create` — Create a floor category\n"
+            "`/floor_rename` — Rename a floor (preserves assignments)\n"
+            "`/dorm_create` — Create a dorm room inside a floor\n"
+            "`/dorm_rename` — Rename a dorm room (preserves occupants)\n"
+            "`/news_post` — Post a news article embed\n"
+            "`/announce_schedule` — Schedule a future announcement\n"
+            "`/announce_cancel` — Cancel a scheduled announcement\n"
+            "`/debut_notify` — Send a debut contract DM\n"
+            "`/dev_dm` — Message a user directly\n"
+            "`/shutdown` — Gracefully shut down the bot with a final DB backup\n"
+        ))
+        embed.add_field(name="Notes", inline=False, value=(
+            f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
+            f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
+            f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
+            f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
+            f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
+            f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
+            f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
+            f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
+            f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
+            f"Scheduled time format: YYYY-MM-DD HH:MM (UTC)\n"
+            f"Up to {MAX_PHOTOS} photos per Instagram post\n"
+        ))
+        embed.set_footer(text="You are seeing this view because you have Administrator permissions.")
+
+    else:
+        embed = discord.Embed(
+            title="OC Bot — Command Reference",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="OC Management", inline=False, value=(
+            "`/oc_add` — Register a new OC (supports file upload; unlimited per user)\n"
+            "`/oc_edit` — Edit OC fields (only filled fields change)\n"
+            "`/oc_delete` — Delete your OC entirely\n"
+            "`/oc_list` — Browse/filter OCs with interactive paginator\n"
+        ))
+        embed.add_field(name="Floor/Dorm Management", inline=False, value=(
+            "`/dorm_assign` — Assign an OC to a room\n"
+            "`/dorm_unassign` — Remove an OC from their room\n"
+            "`/dorm_view` — View floors and rooms interactively\n"
+        ))
+        embed.add_field(name="Instagram", inline=False, value=(
+            "`/ig_post` — Post 1–10 photos (files or URLs) as your OC\n"
+        ))
+        embed.add_field(name="Messaging", inline=False, value=(
+            "`/oc_dm` — Private DM channel between two OCs\n"
+            "`/oc_groupchat` — Group chat for multiple OCs\n"
+        ))
+        embed.add_field(name="Notes", inline=False, value=(
+            f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
+            f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
+            f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
+            f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
+            f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
+            f"Debut channel: `#{DEBUT_CHANNEL_NAME}`\n"
+            f"Up to {MAX_PHOTOS} photos per Instagram post\n"
+        ))
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─── Shutdown & Emergency Backup ───────────────────────────────────────────────
 def _handle_shutdown(signum, frame):
-    """Triggered on SIGTERM or SIGINT. Forces a final async backup before exit."""
-    log.info("Shutdown signal received. Forcing final DB backup…")
-    asyncio.run_coroutine_threadsafe(_emergency_backup(), bot.loop)
+    """Triggered on SIGTERM or SIGINT."""
+    log.info("Shutdown signal received (signal %s). Running emergency backup…", signum)
+    # Schedule the coroutine and wait for it to complete before the process dies.
+    future = asyncio.run_coroutine_threadsafe(_emergency_backup(), bot.loop)
+    try:
+        # Block the signal-handler thread for up to 15 seconds.
+        future.result(timeout=15)
+    except Exception as e:
+        log.error("Emergency backup during shutdown raised: %s", e)
+    finally:
+        log.info("Shutdown complete. Exiting.")
+        sys.exit(0)
 
 async def _emergency_backup():
     global DATA_DIRTY
@@ -1743,8 +1959,27 @@ async def _emergency_backup():
             except Exception as e:
                 log.error(f"Emergency backup failed: {e}")
             break
-    # Give the coroutine time to finish before process exits
-    await asyncio.sleep(3)
+
+
+@bot.tree.command(name="shutdown", description="[Dev] Gracefully shut down the bot with a final DB backup.")
+async def shutdown_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction):
+        return await interaction.response.send_message(
+            "❌ Only devs can shut down the bot.", ephemeral=True)
+
+    await interaction.response.send_message(
+        "🔴 Shutdown initiated. Performing final DB backup before going offline…",
+        ephemeral=True)
+
+    await audit(
+        interaction.guild,
+        f"[SHUTDOWN] Bot shutdown initiated by {interaction.user} "
+        f"({interaction.user.id}) at {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    await _emergency_backup()
+    log.info("Graceful shutdown via /shutdown command by %s.", interaction.user)
+    await bot.close()
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
