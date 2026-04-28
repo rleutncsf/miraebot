@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -77,6 +78,44 @@ def save_data(data: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     DATA_DIRTY = True
+
+async def push_backup_to_discord(data: dict, reason: str = "mutation") -> None:
+    global DATA_DIRTY
+    if not DB_LOADED:
+        log.debug("push_backup_to_discord: DB not yet loaded, skipping upload.")
+        return
+
+    try:
+        payload_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+        if len(payload_bytes) > 8_000_000:  # 8 MB Discord limit
+            log.error("push_backup_to_discord: payload too large (%d bytes), skipping upload.", len(payload_bytes))
+            return
+
+        for guild in bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
+            if ch:
+                file = discord.File(io.BytesIO(payload_bytes), filename="data.json")
+                new_msg = await ch.send(
+                    f"[BACKUP] {reason} — {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                    file=file
+                )
+                DATA_DIRTY = False
+                log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
+
+                try:
+                    await ch.purge(limit=50, check=lambda m: m.author == bot.user and m.id != new_msg.id)
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Could not purge old backups: {e}")
+                
+                return
+            
+        log.warning("push_backup_to_discord: No guild with #%s found.", DB_BACKUP_CHANNEL_NAME)
+    except Exception as e:
+        log.error("push_backup_to_discord failed: %s", e)
+
+async def save_and_backup(data: dict, reason: str = "mutation") -> None:
+    save_data(data)
+    await push_backup_to_discord(data, reason=reason)
 
 def _validate_backup(parsed: dict) -> bool:
     if not isinstance(parsed, dict):
@@ -297,7 +336,7 @@ async def on_ready():
 
 
 # ─── Automated Backup loop ─────────────────────────────────────────────────────
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def auto_backup_db():
     global DATA_DIRTY
     if not DATA_DIRTY or not DB_LOADED:
@@ -305,28 +344,13 @@ async def auto_backup_db():
     
     if not os.path.exists(DATA_FILE):
         return
-
-    for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
-        if ch:
-            try:
-                # Upload first
-                file = discord.File(DATA_FILE, filename="data.json")
-                new_msg = await ch.send(
-                    f"Automated DB Backup - {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                    file=file
-                )
-                DATA_DIRTY = False
-                log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
-
-                # Then clean up old backups (skip the one just posted)
-                try:
-                    await ch.purge(limit=50, check=lambda m: m.author == bot.user and m.id != new_msg.id)
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"Could not purge old backups: {e}")
-                break
-            except Exception as e:
-                log.error(f"Backup failed: {e}")
+    
+    log.warning("auto_backup_db: DATA_DIRTY is still True after 5 minutes — triggering catch-up backup.")
+    try:
+        data = load_data()
+        await push_backup_to_discord(data, reason="auto-watchdog")
+    except Exception as e:
+        log.error(f"Watchdog backup failed: {e}")
 
 
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
@@ -406,6 +430,7 @@ async def check_scheduled():
             await ch.send(embed=embed)
         entry["fired"] = True
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="check_scheduled"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OC MANAGEMENT
@@ -475,6 +500,7 @@ async def oc_add(
         "registered_at": now_iso(),
     }
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_add"))
 
     embed = build_oc_embed(data["ocs"][key], key)
     await interaction.response.send_message(
@@ -595,6 +621,8 @@ async def oc_edit(
                     room["occupants"].append(new_key)
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_edit"))
+    
     embed = build_oc_embed(oc, new_key)
     await interaction.response.send_message(
         f"**{oc['name']}** updated.\n\n**Changes:**\n" + "\n".join(changes),
@@ -637,6 +665,7 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
             dm["participants"].remove(key)
             
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_delete"))
     
     await interaction.response.send_message(f"✅ **{oc['name']}** has been deleted.", ephemeral=True)
     await audit(interaction.guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
@@ -743,6 +772,7 @@ async def floor_create(interaction: discord.Interaction, floor_name: str):
 
     data["floors"][key] = {"name": floor_name, "rooms": {}}
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_create"))
 
     category = discord.utils.get(interaction.guild.categories, name=floor_name)
     if category is None:
@@ -811,6 +841,7 @@ async def floor_rename(interaction: discord.Interaction, old_name: str, new_name
         log.warning("floor_rename: Discord category '%s' not found; skipping rename.", old_name)
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_rename"))
 
     await interaction.followup.send(
         f"✅ Floor **{old_name}** renamed to **{new_name}**. "
@@ -874,6 +905,7 @@ async def dorm_create(
             ch_name, category=category, overwrites=overwrites)
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_create"))
 
     await interaction.followup.send(
         f"🚪 Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
@@ -959,6 +991,7 @@ async def dorm_rename(
             "dorm_rename: Discord category '%s' not found; skipping channel rename.", floor["name"])
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_rename"))
 
     await interaction.followup.send(
         f"✅ Room **{old_room_name}** on **{floor_name}** renamed to **{new_room_name}**. "
@@ -1043,6 +1076,7 @@ async def dorm_relocate(
         log.warning(f"dorm_relocate: Source or target category missing; skipping channel edit for '{r_key}'.")
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_relocate"))
 
     occupants_display = ", ".join(
         data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
@@ -1108,6 +1142,7 @@ async def dorm_assign(
 
     room_data["occupants"].append(oc_key)
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_assign"))
 
     category = discord.utils.get(interaction.guild.categories, name=floor["name"])
     ch_name = f"{r_key}"
@@ -1153,6 +1188,7 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
             if oc_key in room_data["occupants"]:
                 room_data["occupants"].remove(oc_key)
                 save_data(data)
+                asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_unassign"))
                 
                 category = discord.utils.get(interaction.guild.categories, name=floor["name"])
                 ch = discord.utils.get(interaction.guild.text_channels, name=f"{r_key}", category=category)
@@ -1239,6 +1275,7 @@ async def dorm_kick(
             ephemeral=True)
 
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_kick"))
 
     lines = "\n".join(
         f"• **{name}** removed from **{room}** on **{floor}**"
@@ -1661,6 +1698,7 @@ async def announce_schedule(
         "fired":     False,
     }
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_schedule"))
 
     await interaction.response.send_message(
         f"✅ Announcement **{title}** scheduled for:\n"
@@ -1721,6 +1759,8 @@ async def announce_cancel(interaction: discord.Interaction, sched_id: str):
     title = data["scheduled"][sched_id]["title"]
     del data["scheduled"][sched_id]
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
+    
     await interaction.response.send_message(
         f"Scheduled announcement **{title}** cancelled.", ephemeral=True)
 
@@ -1764,6 +1804,7 @@ class IGPostView(discord.ui.View):
         self.likes    = post["likes"]
         self._update_like_label()
         save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_like_btn"))
 
         await interaction.response.edit_message(view=self)
 
@@ -1806,6 +1847,7 @@ class IGPostView(discord.ui.View):
         )
         post["thread_id"] = thread.id
         save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_comment_btn"))
 
         await interaction.response.send_message(
             f"💬 Comment thread created: {thread.mention}", ephemeral=True)
@@ -1885,6 +1927,7 @@ async def ig_post(
     }
     data["instagram"][post_id] = post_obj
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post"))
 
     ig_ch = discord.utils.get(interaction.guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
     if not ig_ch:
@@ -1932,6 +1975,7 @@ async def ig_post(
 
     data["instagram"][post_id]["channel_id"] = ig_ch.id
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post_final"))
 
     await audit(interaction.guild,
                 f"IG post by OC '{oc_name}' ({handle}) "
@@ -2333,6 +2377,7 @@ class GCInviteView(discord.ui.View):
             "created_at":   now_iso(),
         }
         save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="gc_invite_accept"))
 
         await interaction.response.edit_message(
             content=(
@@ -2521,6 +2566,7 @@ async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
         "created_at":  now_iso(),
     }
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_dm"))
 
     embed = discord.Embed(
         title="OC DM",
@@ -2618,6 +2664,7 @@ async def oc_groupchat(
         "created_at":  now_iso(),
     }
     save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_groupchat"))
 
     oc_names_str = ", ".join(data["ocs"][k]["name"] for k in all_keys)
     embed = discord.Embed(
@@ -2760,24 +2807,14 @@ def _handle_shutdown(signum, frame):
         sys.exit(0)
 
 async def _emergency_backup():
-    global DATA_DIRTY
     if not os.path.exists(DATA_FILE):
         return
-    for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
-        if ch:
-            try:
-                file = discord.File(DATA_FILE, filename="data.json")
-                new_msg = await ch.send(
-                    f"[EMERGENCY BACKUP] Shutdown signal — {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                    file=file
-                )
-                DATA_DIRTY = False
-                log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
-                log.info("Emergency backup completed.")
-            except Exception as e:
-                log.error(f"Emergency backup failed: {e}")
-            break
+    try:
+        data = load_data()
+        await push_backup_to_discord(data, reason="EMERGENCY-SHUTDOWN")
+        log.info("Emergency backup completed via push_backup_to_discord.")
+    except Exception as e:
+        log.error("Emergency backup failed: %s", e)
 
 
 @bot.tree.command(
