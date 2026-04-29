@@ -44,7 +44,7 @@ BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [2, 3, 4]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
-JST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
+KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
@@ -442,10 +442,10 @@ async def auto_backup_db():
 
 
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
-@tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 JST
+@tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 KST
 async def check_birthdays():
     # Note: get_age() returns the new age on their exact birthday date, so "turns N today" is accurate.
-    today_jst = datetime.now(JST).date()
+    today_kst = datetime.now(KST).date()
     data       = load_data()
 
     for guild in bot.guilds:
@@ -456,7 +456,7 @@ async def check_birthdays():
         for oc in data["ocs"].values():
             try:
                 bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-                if bday.month != today_jst.month or bday.day != today_jst.day:
+                if bday.month != today_kst.month or bday.day != today_kst.day:
                     continue
 
                 age        = get_age(oc["birthday"])
@@ -472,14 +472,14 @@ async def check_birthdays():
                         + (f"Owned by {owner_mention}" if owner_mention else "")
                     ),
                     color=discord.Color.from_rgb(255, 182, 193),
-                    timestamp=datetime.now(JST),
+                    timestamp=datetime.now(KST),
                 )
                 if oc.get("profile_picture"):
                     embed.set_thumbnail(url=oc["profile_picture"])
                 embed.add_field(name="Birthday", value=format_birthday_long(oc["birthday"]), inline=True)
                 if age:
                     embed.add_field(name="Turning", value=str(age), inline=True)
-                embed.set_footer(text="Birthday recognized in JST (GMT+9)")
+                embed.set_footer(text="Birthday recognized in KST (GMT+9)")
 
                 await ch.send(embed=embed)
             except Exception as e:
@@ -759,94 +759,47 @@ async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = N
     await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
-class BirthdayPaginatorView(discord.ui.View):
-    def __init__(self, ocs_sorted: list):
-        super().__init__(timeout=300)
-        self.ocs = ocs_sorted
-        self.current_index = 0
-        self._update_buttons()
-
-    def _update_buttons(self):
-        if not hasattr(self, "prev_btn"): return
-        self.prev_btn.disabled = self.current_index == 0
-        self.next_btn.disabled = self.current_index == len(self.ocs) - 1
-
-    def get_embed(self):
-        oc = self.ocs[self.current_index]
-        today_jst = datetime.now(JST).date()
-        days_until = days_until_birthday(oc["birthday"], today_jst)
-        bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-
-        embed = discord.Embed(
-            title="🎂 OC Birthday Calendar",
-            color=discord.Color.from_rgb(255, 182, 193),
-        )
-        if oc.get("profile_picture"):
-            embed.set_thumbnail(url=oc["profile_picture"])
-
-        status_str = ""
-        age_label = ""
-        age_val = ""
-
-        if days_until < 365:
-            if days_until == 0:
-                status_str = "🎉 Today!"
-            else:
-                status_str = f"📅 In {days_until} day(s)"
-            age_label = "Turning"
-            age_val = str(today_jst.year - bday.year)
-            embed.description = ""
-        elif days_until < 9999:
-            pass_date = date(today_jst.year, bday.month, bday.day)
-            status_str = f"✅ Turned {today_jst.year - bday.year} on {pass_date.strftime('%B %d')}"
-            age_label = "Turned"
-            age_val = str(today_jst.year - bday.year)
-            embed.description = "— Past Birthdays This Year —"
-        else:
-            status_str = "Unknown"
-            age_label = "Age"
-            age_val = str(get_age(oc["birthday"]))
-
-        owner_id = oc.get("owner_id")
-        owner_mention = f"<@{owner_id}>" if owner_id else "Unknown"
-
-        embed.add_field(name="OC Name", value=oc["name"], inline=True)
-        embed.add_field(name="Birthday", value=format_birthday_long(oc["birthday"]), inline=True)
-        embed.add_field(name="Status", value=status_str, inline=True)
-        embed.add_field(name=age_label, value=age_val, inline=True)
-        embed.add_field(name="Owner", value=owner_mention, inline=True)
-
-        embed.set_footer(text=f"Result {self.current_index + 1} of {len(self.ocs)}  ·  Sorted by proximity to today (JST)")
-        return embed
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="prev_bday")
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index -= 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="next_bday")
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index += 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-@bot.tree.command(name="birthday_list", description="View all OC birthdays sorted by proximity to today.")
+@bot.tree.command(name="birthday_list", description="View the next 7 upcoming OC birthdays.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def birthday_list(interaction: discord.Interaction):
     data = load_data()
     ocs = list(data["ocs"].values())
-    if not ocs: return await interaction.response.send_message("❌ No OCs registered yet.", ephemeral=True)
+    if not ocs:
+        return await interaction.response.send_message("❌ No OCs registered yet.", ephemeral=True)
 
-    today_jst = datetime.now(JST).date()
-    ocs_sorted = sorted(ocs, key=lambda o: days_until_birthday(o["birthday"], today_jst))
+    today_kst = datetime.now(KST).date()
+    ocs_sorted = sorted(ocs, key=lambda o: days_until_birthday(o["birthday"], today_kst))
+    top7 = ocs_sorted[:7]
 
-    view = BirthdayPaginatorView(ocs_sorted)
-    if len(ocs_sorted) == 1:
-        view.clear_items()
+    lines = []
+    for i, oc in enumerate(top7, start=1):
+        days = days_until_birthday(oc["birthday"], today_kst)
+        bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
+        bday_display = bday.strftime("%B %d")
 
-    await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=False)
+        if days == 0:
+            status = "🎉 Today!"
+        elif days < 365:
+            status = f"📅 in {days} day(s)"
+        else:
+            pass_date = date(today_kst.year, bday.month, bday.day)
+            status = f"✅ Turned {today_kst.year - bday.year} on {pass_date.strftime('%B %d')}"
+
+        owner_id = oc.get("owner_id")
+        owner_str = f"<@{owner_id}>" if owner_id else "Unknown"
+        lines.append(f"**{i}.** **{oc['name']}** — {bday_display} ({status})  · {owner_str}")
+
+    embed = discord.Embed(
+        title="🎂 Upcoming Birthdays",
+        description="\n".join(lines),
+        color=discord.Color.from_rgb(255, 182, 193),
+        timestamp=datetime.now(KST),
+    )
+    embed.set_footer(
+        text=f"Showing {len(top7)} of {len(ocs_sorted)} OCs  ·  Sorted by proximity to today (KST)"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1161,6 +1114,29 @@ async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name
     occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
     await interaction.response.send_message(f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n👥 Occupants: {occupants_display}")
     await audit(interaction.guild, f"OC '{oc_name}' assigned to '{room_name}' by {interaction.user}")
+
+    if len(room_data["occupants"]) == room_data["capacity"]:
+        log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+        if log_ch:
+            occupants_names = [
+                data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"]
+            ]
+            full_embed = discord.Embed(
+                title="🏠 Dorm Room Now Full",
+                description=(
+                    f"**{room_data['name']}** on **{floor['name']}** is now at full capacity "
+                    f"({room_data['capacity']}/{room_data['capacity']})."
+                ),
+                color=discord.Color.red(),
+                timestamp=now_utc(),
+            )
+            full_embed.add_field(
+                name="Occupants",
+                value="\n".join(f"• {name}" for name in occupants_names),
+                inline=False,
+            )
+            full_embed.set_footer(text=f"Assignment triggered by {interaction.user.display_name}")
+            await log_ch.send(embed=full_embed)
 
 
 @bot.tree.command(name="dorm_unassign", description="Remove an OC from their room.")
@@ -1611,12 +1587,12 @@ async def ig_post(
     embed.set_image(url=photos[0])
 
     if len(photos) == 1:
-        embed.set_footer(text=f"1 photo  ·  post id: {post_id}")
+        embed.set_footer(text="📸 1 photo")
         last_msg = await ig_ch.send(embed=embed, view=view)
         data["instagram"][post_id]["message_id"] = last_msg.id
         data["instagram"][post_id]["last_message_id"] = last_msg.id
     else:
-        embed.set_footer(text=f"{len(photos)} photo(s)  ·  post id: {post_id}")
+        embed.set_footer(text=f"📸 {len(photos)} photo(s)")
         first_msg = await ig_ch.send(embed=embed)
         data["instagram"][post_id]["message_id"] = first_msg.id
 
@@ -1628,7 +1604,7 @@ async def ig_post(
 
         last_embed = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
         last_embed.set_image(url=photos[-1])
-        last_embed.set_footer(text=f"Photo {len(photos)}/{len(photos)}  ·  post id: {post_id}")
+        last_embed.set_footer(text=f"📸 Photo {len(photos)}/{len(photos)}")
         last_msg = await ig_ch.send(embed=last_embed, view=view)
         data["instagram"][post_id]["last_message_id"] = last_msg.id
 
@@ -2176,6 +2152,70 @@ async def oc_groupchat(
     await audit(interaction.guild, f"Group chat '{group_name}' created with [{oc_names_str}] by {interaction.user}")
 
 
+@bot.tree.command(name="oc_groupchat_add", description="Add an OC to an existing OC group chat channel.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    target_channel="The existing group chat channel to add the OC to",
+    new_oc="Name of the OC to add to the group chat"
+)
+async def oc_groupchat_add(
+    interaction: discord.Interaction,
+    target_channel: discord.TextChannel,
+    new_oc: str,
+):
+    data = load_data()
+    new_oc_key = oc_key_of(new_oc)
+
+    if new_oc_key not in data["ocs"]:
+        return await interaction.response.send_message(f"❌ No OC named **{new_oc}** found.", ephemeral=True)
+
+    gc_id = None
+    gc = None
+    for k, v in data["groupchats"].items():
+        if v.get("channel_id") == target_channel.id:
+            gc_id = k
+            gc = v
+            break
+
+    if not gc:
+        return await interaction.response.send_message("❌ The selected channel is not a registered group chat.", ephemeral=True)
+
+    if new_oc_key in gc["participants"]:
+        return await interaction.response.send_message(f"❌ **{new_oc}** is already in this group chat.", ephemeral=True)
+
+    is_participant_owner = any(data["ocs"][p_key].get("owner_id") == interaction.user.id for p_key in gc["participants"] if p_key in data["ocs"])
+    if not is_participant_owner and not is_dev(interaction):
+        return await interaction.response.send_message("❌ You do not own any OCs in this group chat.", ephemeral=True)
+
+    gc["participants"].append(new_oc_key)
+
+    new_owner_id = data["ocs"][new_oc_key].get("owner_id")
+    new_owner_mention = f"<@{new_owner_id}>" if new_owner_id else "Unknown"
+
+    if new_owner_id:
+        new_owner_member = interaction.guild.get_member(new_owner_id)
+        if new_owner_member:
+            await target_channel.set_permissions(new_owner_member, view_channel=True, send_messages=True)
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_groupchat_add"))
+
+    oc_names_str = "\n".join(f"• {data['ocs'][k]['name']}" for k in gc["participants"] if k in data["ocs"])
+    
+    embed = discord.Embed(
+        title="👥 New Member Joined",
+        description=f"**{data['ocs'][new_oc_key]['name']}** (owned by {new_owner_mention}) has joined the group chat!",
+        color=discord.Color.blue(),
+        timestamp=now_utc()
+    )
+    embed.add_field(name="Current Members", value=oc_names_str, inline=False)
+
+    await target_channel.send(embed=embed)
+    await interaction.response.send_message(f"✅ **{new_oc}** added to {target_channel.mention}.", ephemeral=True)
+    await audit(interaction.guild, f"OC '{new_oc}' added to group chat #{target_channel.name} by {interaction.user}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2196,7 +2236,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/oc_edit` — Edit OC fields\n"
             "`/oc_delete` — Delete your OC\n"
             "`/oc_list` — Browse/filter OCs with paginator\n"
-            "`/birthday_list` — View all OC birthdays sorted by proximity to today\n"
+            "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
         ))
         embed.add_field(name="Floor/Dorm Management", inline=False, value=(
             "`/dorm_assign` — Assign an OC to a room\n"
@@ -2212,6 +2252,7 @@ async def help_cmd(interaction: discord.Interaction):
         embed.add_field(name="Messaging", inline=False, value=(
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
+            "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
         ))
         embed.add_field(name="Utility", inline=False, value=(
             "`/ping` — Check the bot's WebSocket latency\n"
@@ -2260,7 +2301,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/oc_edit` — Edit OC fields (only filled fields change)\n"
             "`/oc_delete` — Delete your OC entirely\n"
             "`/oc_list` — Browse/filter OCs with interactive paginator\n"
-            "`/birthday_list` — View all OC birthdays sorted by proximity to today\n"
+            "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
         ))
         embed.add_field(name="Floor/Dorm Management", inline=False, value=(
             "`/dorm_assign` — Assign an OC to a room\n"
@@ -2273,6 +2314,7 @@ async def help_cmd(interaction: discord.Interaction):
         embed.add_field(name="Messaging", inline=False, value=(
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
+            "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
         ))
         embed.add_field(name="Utility", inline=False, value=(
             "`/ping` — Check the bot's WebSocket latency\n"
