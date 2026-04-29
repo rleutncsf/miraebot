@@ -2376,9 +2376,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
-    t = threading.Thread(target=_run_http, daemon=True)
-    t.start()
-    log.info("Health-check HTTP server started on port %d", PORT)
-
     webserver.keep_alive()
     bot.run(token, log_handler=None)
