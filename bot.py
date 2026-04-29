@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -41,7 +42,7 @@ DB_BACKUP_CHANNEL_NAME    = "bot-db-backup"   # Automatic DB persistence channel
 INSTAGRAM_CHANNEL_NAME    = "instagram"
 BIRTHDAY_FORMAT           = "%Y/%m/%d"
 BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
-DORM_SIZES                = [2, 3, 4]
+DORM_SIZES                = [1, 2, 3, 4]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
 KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
@@ -66,10 +67,10 @@ DATA_DIRTY = False
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {"ocs": {}, "floors": {}, "dorms": {}, "instagram": {}, "dms": {},
-                "groupchats": {}, "scheduled": {}}
+                "groupchats": {}, "scheduled": {}, "reminders": {}}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled"):
+    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
         d.setdefault(k, {})
     return d
 
@@ -245,6 +246,13 @@ def now_utc() -> datetime:
 def now_iso() -> str:
     return now_utc().isoformat()
 
+def _safe_fmt(template: str, **kwargs) -> str:
+    """Format a template string, ignoring unknown placeholders gracefully."""
+    try:
+        return template.format(**kwargs)
+    except (KeyError, IndexError):
+        return template
+
 # ─── Audit helper ──────────────────────────────────────────────────────────────
 async def audit(guild: discord.Guild, message: str) -> None:
     ch = discord.utils.get(guild.text_channels, name=AUDIT_CHANNEL_NAME)
@@ -387,7 +395,7 @@ async def on_ready():
                                     if not _validate_backup(parsed):
                                         log.error("Backup file failed schema validation, skipping restore.")
                                         break
-                                    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled"):
+                                    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
                                         parsed.setdefault(k, {})
                                 except (json.JSONDecodeError, ValueError) as e:
                                     log.error(f"Backup file is corrupt, skipping restore: {e}")
@@ -423,6 +431,7 @@ async def on_ready():
 
     if not check_birthdays.is_running(): check_birthdays.start()
     if not check_scheduled.is_running(): check_scheduled.start()
+    if not check_reminders.is_running(): check_reminders.start()
     if not auto_backup_db.is_running():  auto_backup_db.start()
 
 
@@ -509,6 +518,47 @@ async def check_scheduled():
         entry["fired"] = True
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="check_scheduled"))
+
+
+# ─── Reminders loop ────────────────────────────────────────────────────────────
+@tasks.loop(minutes=1)
+async def check_reminders():
+    data = load_data()
+    reminders = data.get("reminders", {})
+    now = now_utc()
+    dirty = False
+
+    for rid, reminder in list(reminders.items()):
+        if reminder.get("fired"):
+            continue
+        fire_at = datetime.fromisoformat(reminder["fire_at"])
+        if now >= fire_at:
+            for guild in bot.guilds:
+                member = guild.get_member(reminder["user_id"])
+                if member:
+                    try:
+                        embed = discord.Embed(
+                            title="⏰ Reminder",
+                            description=reminder["message"],
+                            color=discord.Color.blurple(),
+                            timestamp=now_utc(),
+                        )
+                        embed.set_footer(text="Set by a server admin.")
+                        await member.send(embed=embed)
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        log.warning("check_reminders: could not DM user %s: %s", reminder["user_id"], e)
+                    break
+
+            reminder["fired"] = True
+            dirty = True
+
+    if dirty:
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="check_reminders"))
+
+@check_reminders.before_loop
+async def before_check_reminders():
+    await bot.wait_until_ready()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OC MANAGEMENT
@@ -731,6 +781,72 @@ class OCPaginatorView(discord.ui.View):
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
 
+class BirthdayPaginatorView(discord.ui.View):
+    PAGE_SIZE = 7
+
+    def __init__(self, ocs_sorted: list, today_kst):
+        super().__init__(timeout=300)
+        self.ocs_sorted = ocs_sorted
+        self.today_kst  = today_kst
+        self.page       = 0
+        self.total_pages = max(1, math.ceil(len(ocs_sorted) / self.PAGE_SIZE))
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = (self.page == 0)
+        self.next_btn.disabled = (self.page >= self.total_pages - 1)
+
+    def _get_page_ocs(self):
+        start = self.page * self.PAGE_SIZE
+        return self.ocs_sorted[start : start + self.PAGE_SIZE]
+
+    def get_embed(self):
+        page_ocs = self._get_page_ocs()
+        base_index = self.page * self.PAGE_SIZE
+        lines = []
+        for i, oc in enumerate(page_ocs, start=base_index + 1):
+            days = days_until_birthday(oc["birthday"], self.today_kst)
+            bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
+            bday_display = bday.strftime("%B %d")
+
+            if days == 0:
+                status = "🎉 Today!"
+            elif days < 365:
+                status = f"📅 in {days} day(s)"
+            else:
+                pass_date = date(self.today_kst.year, bday.month, bday.day)
+                status = f"✅ Turned {self.today_kst.year - bday.year} on {pass_date.strftime('%B %d')}"
+
+            lines.append(f"**{i}.** **{oc['name']}** — {bday_display} ({status})")
+
+        embed = discord.Embed(
+            title="🎂 Upcoming Birthdays",
+            description="\n".join(lines),
+            color=discord.Color.from_rgb(255, 182, 193),
+            timestamp=datetime.now(KST),
+        )
+        embed.set_footer(
+            text=(
+                f"Page {self.page + 1}/{self.total_pages}  ·  "
+                f"Showing {len(page_ocs)} of {len(self.ocs_sorted)} OCs  ·  "
+                f"Sorted by proximity to today (KST)"
+            )
+        )
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="bday_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="bday_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+
 @bot.tree.command(name="oc_list", description="Browse all OCs with optional filter.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -759,7 +875,7 @@ async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = N
     await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
-@bot.tree.command(name="birthday_list", description="View the next 7 upcoming OC birthdays.")
+@bot.tree.command(name="birthday_list", description="View the next 7 upcoming OC birthdays in a single list.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def birthday_list(interaction: discord.Interaction):
@@ -770,36 +886,9 @@ async def birthday_list(interaction: discord.Interaction):
 
     today_kst = datetime.now(KST).date()
     ocs_sorted = sorted(ocs, key=lambda o: days_until_birthday(o["birthday"], today_kst))
-    top7 = ocs_sorted[:7]
 
-    lines = []
-    for i, oc in enumerate(top7, start=1):
-        days = days_until_birthday(oc["birthday"], today_kst)
-        bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-        bday_display = bday.strftime("%B %d")
-
-        if days == 0:
-            status = "🎉 Today!"
-        elif days < 365:
-            status = f"📅 in {days} day(s)"
-        else:
-            pass_date = date(today_kst.year, bday.month, bday.day)
-            status = f"✅ Turned {today_kst.year - bday.year} on {pass_date.strftime('%B %d')}"
-
-        owner_id = oc.get("owner_id")
-        owner_str = f"<@{owner_id}>" if owner_id else "Unknown"
-        lines.append(f"**{i}.** **{oc['name']}** — {bday_display} ({status})  · {owner_str}")
-
-    embed = discord.Embed(
-        title="🎂 Upcoming Birthdays",
-        description="\n".join(lines),
-        color=discord.Color.from_rgb(255, 182, 193),
-        timestamp=datetime.now(KST),
-    )
-    embed.set_footer(
-        text=f"Showing {len(top7)} of {len(ocs_sorted)} OCs  ·  Sorted by proximity to today (KST)"
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=False)
+    view = BirthdayPaginatorView(ocs_sorted, today_kst)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -934,10 +1023,10 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
 @bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.describe(floor_name="Floor this room belongs to", room_name="Name for the room", capacity="Capacity (2, 3, or 4)")
+@app_commands.describe(floor_name="Floor this room belongs to", room_name="Name for the room", capacity="Capacity (1, 2, 3, or 4)")
 async def dorm_create(interaction: discord.Interaction, floor_name: str, room_name: str, capacity: int):
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can create dorms.", ephemeral=True)
-    if capacity not in DORM_SIZES: return await interaction.response.send_message("❌ Capacity must be 2, 3, or 4.", ephemeral=True)
+    if capacity not in DORM_SIZES: return await interaction.response.send_message(f"❌ Capacity must be one of: {', '.join(str(s) for s in DORM_SIZES)}.", ephemeral=True)
 
     data = load_data()
     f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
@@ -966,39 +1055,107 @@ async def dorm_create(interaction: discord.Interaction, floor_name: str, room_na
     await audit(interaction.guild, f"Room created: '{room_name}' on '{floor['name']}' by {interaction.user}")
 
 
-@bot.tree.command(name="dorm_rename", description="[Dev] Rename a dorm room without affecting occupant assignments.")
+@bot.tree.command(name="dorm_edit", description="[Dev] Rename and/or change the capacity of a dorm room while keeping all current occupants.")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.describe(floor_name="Floor this room belongs to", old_room_name="Current room name", new_room_name="New room name")
-async def dorm_rename(interaction: discord.Interaction, floor_name: str, old_room_name: str, new_room_name: str):
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can rename dorms.", ephemeral=True)
+@app_commands.describe(
+    floor_name="Floor this room belongs to",
+    room_name="Current name of the room to edit",
+    new_room_name="New display name for the room (optional — leave blank to keep current)",
+    new_capacity="New capacity: 1, 2, 3, or 4 (optional — leave blank to keep current)",
+)
+async def dorm_edit(
+    interaction: discord.Interaction,
+    floor_name: str,
+    room_name: str,
+    new_room_name: Optional[str] = None,
+    new_capacity: Optional[int] = None,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can edit dorm rooms.", ephemeral=True)
 
-    f_key, old_rkey, new_rkey = dorm_key_of(floor_name), room_key_of(old_room_name), room_key_of(new_room_name)
-    data = load_data()
+    if new_room_name is None and new_capacity is None:
+        return await interaction.response.send_message(
+            "❌ Provide at least one of: `new_room_name` or `new_capacity`.", ephemeral=True
+        )
 
-    if f_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
+    if new_capacity is not None and new_capacity not in DORM_SIZES:
+        return await interaction.response.send_message(
+            f"❌ Capacity must be one of: {', '.join(str(s) for s in DORM_SIZES)}.", ephemeral=True
+        )
+
+    f_key    = dorm_key_of(floor_name)
+    old_rkey = room_key_of(room_name)
+    data     = load_data()
+
+    if f_key not in data["floors"]:
+        return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
+
     floor = data["floors"][f_key]
-    if old_rkey not in floor["rooms"]: return await interaction.response.send_message(f"❌ No room named **{old_room_name}**.", ephemeral=True)
-    if new_rkey == old_rkey: return await interaction.response.send_message("❌ New name resolves to the same key.", ephemeral=True)
-    if new_rkey in floor["rooms"]: return await interaction.response.send_message("❌ A room with this key already exists.", ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True)
-    room_data = floor["rooms"].pop(old_rkey)
-    room_data["name"] = new_room_name
-    floor["rooms"][new_rkey] = room_data
+    if old_rkey not in floor["rooms"]:
+        return await interaction.response.send_message(f"❌ No room named **{room_name}** found on **{floor_name}**.", ephemeral=True)
 
-    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
-    if category:
-        channel = discord.utils.get(interaction.guild.text_channels, name=old_rkey, category=category)
-        if channel:
-            try: await channel.edit(name=new_rkey)
-            except discord.Forbidden: await interaction.followup.send("⚠️ Lacking permissions to rename Discord channel.", ephemeral=True)
-            except discord.HTTPException as e: await interaction.followup.send(f"⚠️ Discord channel rename failed: {e}", ephemeral=True)
+    room_data = floor["rooms"][old_rkey]
+    current_occupant_count = len(room_data.get("occupants", []))
+    changes = []
+
+    if new_capacity is not None:
+        old_cap = room_data["capacity"]
+        if new_capacity == old_cap:
+            return await interaction.response.send_message(
+                f"❌ The room already has a capacity of {old_cap}.", ephemeral=True
+            )
+        if new_capacity < current_occupant_count:
+            return await interaction.response.send_message(
+                f"❌ Cannot reduce capacity to {new_capacity} — room currently has "
+                f"{current_occupant_count} occupant(s). Remove occupants first with `/dorm_kick` or `/dorm_unassign`.",
+                ephemeral=True
+            )
+        room_data["capacity"] = new_capacity
+        changes.append(f"`capacity`: {old_cap} → {new_capacity}")
+
+    if new_room_name is not None:
+        new_rkey = room_key_of(new_room_name)
+
+        if new_rkey == old_rkey:
+            return await interaction.response.send_message("❌ New name resolves to the same key as current name.", ephemeral=True)
+        if new_rkey in floor["rooms"]:
+            return await interaction.response.send_message("❌ A room with that key already exists on this floor.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        floor["rooms"][new_rkey] = floor["rooms"].pop(old_rkey)
+        floor["rooms"][new_rkey]["name"] = new_room_name
+        changes.append(f"`name`: {room_name} → {new_room_name}")
+
+        category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+        if category:
+            channel = discord.utils.get(interaction.guild.text_channels, name=old_rkey, category=category)
+            if channel:
+                try:
+                    await channel.edit(name=new_rkey)
+                except discord.Forbidden:
+                    await interaction.followup.send("⚠️ Lacking permissions to rename the Discord channel.", ephemeral=True)
+                except discord.HTTPException as e:
+                    await interaction.followup.send(f"⚠️ Discord channel rename failed: {e}", ephemeral=True)
+    else:
+        await interaction.response.defer(ephemeral=True)
 
     save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_rename"))
-    await interaction.followup.send(f"✅ Room **{old_room_name}** renamed to **{new_room_name}**.", ephemeral=True)
-    await audit(interaction.guild, f"Room renamed: '{old_room_name}' → '{new_room_name}' on '{floor_name}' by {interaction.user}")
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_edit"))
+
+    change_summary = "\n".join(f"• {c}" for c in changes)
+    final_name = new_room_name or room_name
+    await interaction.followup.send(
+        f"✅ Dorm **{final_name}** on **{floor_name}** updated:\n{change_summary}\n"
+        f"({current_occupant_count} occupant(s) retained)",
+        ephemeral=True
+    )
+    await audit(
+        interaction.guild,
+        f"Dorm edited: '{room_name}' on '{floor_name}' — {'; '.join(changes)} — by {interaction.user} ({interaction.user.id})"
+    )
 
 
 @bot.tree.command(name="dorm_relocate", description="[Dev] Move a dorm room from one floor to another.")
@@ -1254,7 +1411,7 @@ class DormPaginatorView(discord.ui.View):
         for r_key, room_data in floor["rooms"].items():
             occupants = [self.ocs[o]["name"] for o in room_data["occupants"] if o in self.ocs]
             is_full   = len(room_data["occupants"]) >= room_data["capacity"]
-            status    = "🔴 Full" if is_full else f"🟢 {room_data['capacity'] - len(room_data['occupants'])} spot(s) left"
+            status    = "🔴 Full" if is_full else "🟢 Available"
             occ_str   = ("🏠 " + ", ".join(occupants)) if occupants else "🪑 Empty"
             
             embed.add_field(
@@ -1368,7 +1525,7 @@ async def announce(
             warning_msgs.append(f"⚠️ OC '{oc_name}' not found; using raw string.")
 
     def _resolve(text: Optional[str]) -> Optional[str]:
-        if text is not None: return text.format(server=interaction.guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_display)
+        if text is not None: return _safe_fmt(text, server=interaction.guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_display)
         return None
 
     resolved_color = discord.Color.blurple()
@@ -1473,6 +1630,75 @@ async def announce_cancel(interaction: discord.Interaction, sched_id: str):
     asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
     await interaction.response.send_message(f"Scheduled announcement **{title}** cancelled.", ephemeral=True)
     await audit(interaction.guild, f"Announcement cancelled: '{title}' by {interaction.user}")
+
+
+@bot.tree.command(name="remind", description="[Dev] Send a timed reminder DM to a user.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    user="The server member to remind",
+    message="Reminder message body (supports {user} placeholder for their display name)",
+    fire_at="When to send the reminder — format: YYYY-MM-DD HH:MM",
+    timezone_str="Timezone for fire_at (default: UTC)",
+)
+@app_commands.choices(timezone_str=[
+    app_commands.Choice(name="UTC",                            value="UTC"),
+    app_commands.Choice(name="KST — Asia/Tokyo (GMT+9)",       value="Asia/Tokyo"),
+    app_commands.Choice(name="KST — Asia/Seoul (GMT+9)",       value="Asia/Seoul"),
+    app_commands.Choice(name="PST+8 — Asia/Manila (GMT+8)",    value="Asia/Manila"),
+    app_commands.Choice(name="EST — America/New_York (GMT-5)", value="America/New_York"),
+    app_commands.Choice(name="PST — America/Los_Angeles (GMT-8)", value="America/Los_Angeles"),
+    app_commands.Choice(name="BST/GMT — Europe/London",        value="Europe/London"),
+])
+async def remind_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    message: str,
+    fire_at: str,
+    timezone_str: Optional[str] = None,
+):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can set reminders.", ephemeral=True)
+
+    tz_str = timezone_str or "UTC"
+    try:
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        return await interaction.response.send_message("❌ Unknown timezone.", ephemeral=True)
+
+    try:
+        naive_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M")
+        local_dt = naive_dt.replace(tzinfo=tz)
+        fire_dt  = local_dt.astimezone(timezone.utc)
+    except ValueError:
+        return await interaction.response.send_message("❌ Format must be YYYY-MM-DD HH:MM.", ephemeral=True)
+
+    if fire_dt <= now_utc():
+        return await interaction.response.send_message("❌ Reminder time must be in the future.", ephemeral=True)
+
+    if len(message) > 2000:
+        return await interaction.response.send_message("❌ Message must be 2000 characters or fewer.", ephemeral=True)
+
+    data = load_data()
+    rid = f"remind_{int(fire_dt.timestamp())}_{user.id}"
+    data["reminders"][rid] = {
+        "user_id": user.id,
+        "message": message,
+        "fire_at": fire_dt.isoformat(),
+        "created_by": interaction.user.id,
+        "fired": False,
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="remind_set"))
+
+    fire_display = fire_dt.strftime("%Y-%m-%d %H:%M UTC")
+    await interaction.response.send_message(
+        f"⏰ Reminder set for {user.mention} at **{fire_display}**.", ephemeral=True
+    )
+    await audit(
+        interaction.guild,
+        f"[REMIND] Reminder set for {user} ({user.id}) at {fire_display} by {interaction.user}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1722,7 +1948,8 @@ async def dev_dm(
     def _build_embed(recipient: discord.Member) -> discord.Embed:
         def _resolve(text: Optional[str]) -> str:
             if not text: return ""
-            return text.format(
+            return _safe_fmt(
+                text,
                 server=interaction.guild.name, user=interaction.user.display_name,
                 oc=oc_display, oc_owner=oc_owner_display,
                 date=now_utc().strftime("%B %d, %Y"), recipient=recipient.display_name
@@ -1799,7 +2026,7 @@ class DebutView(discord.ui.View):
         if member and channel:
             await channel.set_permissions(member, view_channel=True, send_messages=True)
             if self.custom_channel_message:
-                await channel.send(self.custom_channel_message.format(member=member.mention, oc=self.oc_name, group=self.group_name))
+                await channel.send(_safe_fmt(self.custom_channel_message, member=member.mention, oc=self.oc_name, group=self.group_name))
 
             await interaction.response.edit_message(content=f"You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to the debuts channel.", view=None)
         else:
@@ -1814,7 +2041,9 @@ class DebutView(discord.ui.View):
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
-    oc_name="OC name", group_name="Group name", message="Custom debut message",
+    oc_name="OC name",
+    group_name="Group/company name (used as {group} placeholder in title, message, footnote, note fields)",
+    message="Custom debut message",
     channel_message="Message posted in #debuts after acceptance", embed_title="Optional custom title",
     embed_color="Optional hex color", accept_label="Optional custom accept button label",
     accept_color="Optional accept button color", decline_label="Optional custom decline button label",
@@ -1860,16 +2089,19 @@ async def debut_notify(
                 interaction.guild.me: discord.PermissionOverwrite(view_channel=True),
             })
 
-    actual_title = embed_title.format(oc=oc_name, group=group_name) if embed_title else f"Debut Contract  —  {oc_name}  |  {group_name}"
+    actual_title = _safe_fmt(embed_title, oc=oc_name, group=group_name) if embed_title else f"Debut Contract  —  {oc_name}  |  {group_name}"
 
-    embed = discord.Embed(title=actual_title, description=message, color=resolved_color, timestamp=now_utc())
+    embed = discord.Embed(title=actual_title, description=_safe_fmt(message, oc=oc_name, group=group_name), color=resolved_color, timestamp=now_utc())
     if oc.get("profile_picture"): embed.set_thumbnail(url=oc["profile_picture"])
     embed.add_field(name="OC", value=oc_name, inline=True)
     embed.add_field(name="Group", value=group_name, inline=True)
 
-    if oc_placeholder: embed.add_field(name="Note", value=oc_placeholder.format(oc=oc_name, group=group_name), inline=False)
-    if footnote: embed.set_footer(text=footnote.format(oc=oc_name, group=group_name, server=interaction.guild.name))
-    else: embed.set_footer(text=f"From: {interaction.guild.name}")
+    if oc_placeholder:
+        embed.add_field(name="Note", value=_safe_fmt(oc_placeholder, oc=oc_name, group=group_name), inline=False)
+    if footnote:
+        embed.set_footer(text=_safe_fmt(footnote, oc=oc_name, group=group_name, server=interaction.guild.name))
+    else:
+        embed.set_footer(text=f"From: {interaction.guild.name}")
 
     view = DebutView(
         guild_id=interaction.guild.id, user_id=member.id, oc_name=oc_name, group_name=group_name,
@@ -1981,7 +2213,7 @@ async def gc_invite(
         "oc": oc["name"], "group": group_name, "server": interaction.guild.name,
         "owner": member.display_name, "channel": target_channel.name,
     }
-    def _r(text: Optional[str]) -> Optional[str]: return text.format(**_fmt) if text else None
+    def _r(text: Optional[str]) -> Optional[str]: return _safe_fmt(text, **_fmt) if text else None
 
     warning_msgs = []
     resolved_color = discord.Color.purple()
@@ -2227,56 +2459,56 @@ async def help_cmd(interaction: discord.Interaction):
     dev = is_dev(interaction)
 
     if dev:
-        embed = discord.Embed(
-            title="OC Bot — Full Command Reference (Dev)",
-            color=discord.Color.gold()
-        )
-        embed.add_field(name="OC Management", inline=False, value=(
+        embed1 = discord.Embed(title="OC Bot — Full Command Reference (Dev) [1/2]", color=discord.Color.gold())
+        embed1.add_field(name="OC Management", inline=False, value=(
             "`/oc_add` — Register a new OC\n"
             "`/oc_edit` — Edit OC fields\n"
             "`/oc_delete` — Delete your OC\n"
             "`/oc_list` — Browse/filter OCs with paginator\n"
             "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
         ))
-        embed.add_field(name="Floor/Dorm Management", inline=False, value=(
+        embed1.add_field(name="Floor/Dorm Management", inline=False, value=(
             "`/dorm_assign` — Assign an OC to a room\n"
             "`/dorm_unassign` — Remove an OC from their room\n"
             "`/dorm_view` — View floors and rooms via dropdown selector\n"
         ))
-        embed.add_field(name="News & Announcements", inline=False, value=(
+        embed1.add_field(name="News & Announcements", inline=False, value=(
             "`/announce_list` — View pending scheduled announcements\n"
         ))
-        embed.add_field(name="Instagram", inline=False, value=(
+        embed1.add_field(name="Instagram", inline=False, value=(
             "`/ig_post` — Post 1–10 photos as your OC\n"
         ))
-        embed.add_field(name="Messaging", inline=False, value=(
+        embed1.add_field(name="Messaging", inline=False, value=(
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
             "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
         ))
-        embed.add_field(name="Utility", inline=False, value=(
+        embed1.add_field(name="Utility", inline=False, value=(
             "`/ping` — Check the bot's WebSocket latency\n"
         ))
-        embed.add_field(name="⚙️ Dev Tools", inline=False, value=(
+
+        embed2 = discord.Embed(title="OC Bot — Full Command Reference (Dev) [2/2]", color=discord.Color.gold())
+        embed2.add_field(name="⚙️ Dev Tools", inline=False, value=(
             "`/floor_create` — Create a floor category\n"
-            "`/floor_rename` — Rename a floor (preserves assignments)\n"
-            "`/floor_delete` — Permanently delete a floor (and all rooms) with OC owner notification\n"
-            "`/dorm_create` — Create a dorm room inside a floor\n"
-            "`/dorm_rename` — Rename a dorm room (preserves occupants)\n"
-            "`/dorm_relocate` — Move a dorm room from one floor to another\n"
-            "`/dorm_delete` — Permanently delete a single dorm room with OC owner notification\n"
-            "`/dorm_kick` — Force-remove a user's OC(s) from their dorm assignment\n"
-            "`/announce` — Post an immediate custom announcement to any channel\n"
+            "`/floor_rename` — Rename a floor\n"
+            "`/floor_delete` — Delete a floor and all its rooms\n"
+            "`/dorm_create` — Create a dorm room\n"
+            "`/dorm_edit` — Edit a dorm's name and/or capacity\n"
+            "`/dorm_relocate` — Move a dorm to another floor\n"
+            "`/dorm_delete` — Delete a single dorm room\n"
+            "`/dorm_kick` — Force-remove OC(s) from a dorm\n"
+            "`/announce` — Post an immediate announcement\n"
             "`/news_post` — Post a news article embed\n"
-            "`/send_embed` — Post a custom embed to any channel as a custom identity\n"
+            "`/send_embed` — Post a custom embed to any channel\n"
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
             "`/debut_notify` — Send a debut contract DM\n"
-            "`/gc_invite` — Invite a debuted OC's owner to a GC with full placeholder support and custom button styling\n"
-            "`/dev_dm` — Message up to 5 users directly with OC context and rich placeholder support\n"
-            "`/startup` — Manually revive the bot, re-sync commands, restart tasks\n"
+            "`/gc_invite` — Invite an OC's owner to a group chat\n"
+            "`/dev_dm` — Message up to 5 users directly\n"
+            "`/remind` — Set a timed reminder for a user\n"
+            "`/startup` — Re-sync commands and restart task loops\n"
         ))
-        embed.add_field(name="Notes", inline=False, value=(
+        embed2.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
             f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
             f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
@@ -2289,37 +2521,39 @@ async def help_cmd(interaction: discord.Interaction):
             f"Scheduled time format: YYYY-MM-DD HH:MM (specify timezone; default UTC)\n"
             f"Up to {MAX_PHOTOS} photos per Instagram post\n"
         ))
-        embed.set_footer(text="You are seeing this view because you have Administrator permissions.")
+        embed2.set_footer(text="You are seeing this view because you have Administrator permissions.")
+
+        await interaction.response.send_message(embed=embed1, ephemeral=True)
+        await interaction.followup.send(embed=embed2, ephemeral=True)
 
     else:
-        embed = discord.Embed(
-            title="OC Bot — Command Reference",
-            color=discord.Color.gold()
-        )
-        embed.add_field(name="OC Management", inline=False, value=(
-            "`/oc_add` — Register a new OC (supports file upload; unlimited per user)\n"
-            "`/oc_edit` — Edit OC fields (only filled fields change)\n"
+        embed1 = discord.Embed(title="OC Bot — Command Reference [1/2]", color=discord.Color.gold())
+        embed1.add_field(name="OC Management", inline=False, value=(
+            "`/oc_add` — Register a new OC\n"
+            "`/oc_edit` — Edit OC fields)\n"
             "`/oc_delete` — Delete your OC entirely\n"
             "`/oc_list` — Browse/filter OCs with interactive paginator\n"
             "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
         ))
-        embed.add_field(name="Floor/Dorm Management", inline=False, value=(
+        embed1.add_field(name="Floor/Dorm Management", inline=False, value=(
             "`/dorm_assign` — Assign an OC to a room\n"
             "`/dorm_unassign` — Remove an OC from their room\n"
             "`/dorm_view` — View floors and rooms via dropdown selector\n"
         ))
-        embed.add_field(name="Instagram", inline=False, value=(
+        embed1.add_field(name="Instagram", inline=False, value=(
             "`/ig_post` — Post 1–10 photos (files or URLs) as your OC\n"
         ))
-        embed.add_field(name="Messaging", inline=False, value=(
+        embed1.add_field(name="Messaging", inline=False, value=(
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
             "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
         ))
-        embed.add_field(name="Utility", inline=False, value=(
+
+        embed2 = discord.Embed(title="OC Bot — Command Reference [2/2]", color=discord.Color.gold())
+        embed2.add_field(name="Utility", inline=False, value=(
             "`/ping` — Check the bot's WebSocket latency\n"
         ))
-        embed.add_field(name="Notes", inline=False, value=(
+        embed2.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
             f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
             f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
@@ -2329,7 +2563,8 @@ async def help_cmd(interaction: discord.Interaction):
             f"Up to {MAX_PHOTOS} photos per Instagram post\n"
         ))
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed1, ephemeral=True)
+        await interaction.followup.send(embed=embed2, ephemeral=True)
 
 
 # ─── Shutdown & Emergency Backup ───────────────────────────────────────────────
@@ -2375,7 +2610,12 @@ async def startup_cmd(interaction: discord.Interaction):
         log.error("Unexpected error during /startup sync: %s", e)
 
     task_lines = []
-    for task_obj, label in [(check_birthdays, "check_birthdays"), (check_scheduled, "check_scheduled"), (auto_backup_db, "auto_backup_db")]:
+    for task_obj, label in [
+        (check_birthdays, "check_birthdays"),
+        (check_scheduled, "check_scheduled"),
+        (check_reminders, "check_reminders"),
+        (auto_backup_db, "auto_backup_db")
+    ]:
         if not task_obj.is_running():
             task_obj.start()
             task_lines.append(f"🔄 `{label}` — restarted.")
