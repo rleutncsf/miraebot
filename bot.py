@@ -307,17 +307,6 @@ intents.guilds  = True
 # This allows users to add the bot to their account for use in DMs and private channels.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Allow the tree to be installed both by guilds and by individual users
-bot.tree._default_installation_types = [
-    discord.app_commands.AppInstallationType.guild,
-    discord.app_commands.AppInstallationType.user,
-]
-bot.tree._default_interaction_contexts = [
-    discord.app_commands.AppCommandContext.guild,
-    discord.app_commands.AppCommandContext.bot_dm,
-    discord.app_commands.AppCommandContext.private_channel,
-]
-
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
