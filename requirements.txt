@@ -1,4 +1,4 @@
 # Use a modern version of discord.py to support app_commands, modals, and views
-discord.py>=2.3.2
+discord.py>=2.4.0
 flask>=3.0.3
 backports.zoneinfo; python_version < "3.9"
