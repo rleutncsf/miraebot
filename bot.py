@@ -1946,7 +1946,7 @@ class DevDMView(discord.ui.View):
         await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
 
 
-@bot.tree.command(name="dev_dm", description="[Dev] Message users directly (Supports {recipient}, {oc}, {oc_owner}, {group}, {server}, {date}, {channel}).")
+@bot.tree.command(name="dev_dm", description="[Dev] Message users directly.")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
@@ -2647,7 +2647,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
             "`/debut_notify` — Send a debut contract DM\n"
-            "`/dev_dm` — Message up to 5 users directly (Supports placeholders: {recipient}, {oc}, {oc_owner}, {group}, {server}, {date}, {channel})\n"
+            "`/dev_dm` — Message up to 5 users directly\n"
             "`/remind` — Set a timed reminder for a user\n"
             "`/startup` — Re-sync commands and restart task loops\n"
         ))
