@@ -148,28 +148,56 @@ async def save_and_backup(data: dict, reason: str = "mutation") -> None:
     save_data(data)
     await push_backup_to_discord(data, reason=reason)
 
-async def persist_image_attachment(attachment: discord.Attachment) -> Optional[str]:
+async def persist_image_attachment(
+    attachment: discord.Attachment,
+    *,
+    retries: int = 2,
+) -> Optional[str]:
     """
     Re-uploads a Discord CDN attachment to the bot-assets channel so the URL
     is controlled by the bot and won't expire. Returns the permanent CDN URL.
+    On all failures, returns None and logs a WARNING so callers can fallback
+    gracefully to the raw attachment URL with a logged caveat.
     """
     if not attachment.content_type or not attachment.content_type.startswith("image/"):
         return None
-    try:
-        image_bytes = await attachment.read()
-        file_obj = discord.File(
-            io.BytesIO(image_bytes),
-            filename=attachment.filename,
-            description=f"Persisted asset from user upload. Original: {attachment.id}"
-        )
-        for guild in bot.guilds:
-            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
-            if ch:
-                msg = await ch.send(file=file_obj)
-                if msg.attachments:
-                    return msg.attachments[0].url
-    except Exception as e:
-        log.error("persist_image_attachment failed: %s", e)
+        
+    asset_channel_found = False
+    for guild in bot.guilds:
+        if discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME):
+            asset_channel_found = True
+            break
+            
+    if not asset_channel_found:
+        log.error("persist_image_attachment: %s channel not found on any guild.", ASSET_CHANNEL_NAME)
+        return None
+
+    for attempt in range(1, retries + 1):
+        try:
+            image_bytes = await attachment.read()
+            file_obj = discord.File(
+                io.BytesIO(image_bytes),
+                filename=attachment.filename,
+                description=f"Persisted asset. Origin: {attachment.id}",
+            )
+            for guild in bot.guilds:
+                ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+                if ch:
+                    msg = await ch.send(file=file_obj)
+                    if msg.attachments:
+                        return msg.attachments[0].url
+        except (discord.HTTPException, discord.Forbidden) as e:
+            log.warning(
+                "persist_image_attachment attempt %d/%d failed: %s", attempt, retries, e
+            )
+            if attempt < retries:
+                await asyncio.sleep(1.5 * attempt)
+                
+    log.error(
+        "persist_image_attachment: all %d attempts failed for attachment_id=%s. "
+        "Embed will use the raw CDN URL — it will expire.",
+        retries, attachment.id,
+    )
     return None
 
 def _validate_backup(parsed: dict) -> bool:
@@ -305,6 +333,48 @@ def _safe_fmt(template: str, **kwargs) -> str:
         return template.format(**kwargs)
     except (KeyError, IndexError):
         return template
+
+def _resolve_notify_recipients(
+    guild: discord.Guild,
+    data: dict,
+    oc_names: list[str],
+    direct_users: list[discord.Member],
+) -> tuple[list[tuple[Optional[str], discord.Member]], list[str]]:
+    """
+    Returns:
+        resolved: list of (oc_key_or_None, member) pairs in send order.
+                  OC-contextualized entries come first; direct user-only entries last.
+        warnings: list of human-readable warning strings for the followup.
+    """
+    resolved: list[tuple[Optional[str], discord.Member]] = []
+    warnings: list[str] = []
+    seen_member_ids: set[int] = set()
+
+    for oc_n in oc_names:
+        key = oc_key_of(oc_n)
+        if key not in data["ocs"]:
+            warnings.append(f"❌ No OC named **{oc_n}** found.")
+            continue
+        oc = data["ocs"][key]
+        owner_id = oc.get("owner_id")
+        if not owner_id:
+            warnings.append(f"❌ **{oc_n}** has no registered owner.")
+            continue
+        member = guild.get_member(owner_id)
+        if not member:
+            warnings.append(f"❌ Owner of **{oc_n}** is not in this server.")
+            continue
+        if member.id not in seen_member_ids:
+            seen_member_ids.add(member.id)
+            resolved.append((key, member))
+
+    for member in direct_users:
+        if member.id not in seen_member_ids:
+            seen_member_ids.add(member.id)
+            resolved.append((None, member))
+
+    return resolved, warnings
+
 
 # ─── Audit helper ──────────────────────────────────────────────────────────────
 async def audit(guild: discord.Guild, message: str) -> None:
@@ -675,7 +745,15 @@ async def oc_add(
     if profile_picture_file:
         if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
             return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
-        pic_url = await persist_image_attachment(profile_picture_file) or profile_picture_file.url
+            
+        pic_url = await persist_image_attachment(profile_picture_file)
+        if pic_url is None:
+            log.warning(
+                "persist_image_attachment returned None for user=%s file=%s; "
+                "falling back to raw attachment URL which will expire.",
+                interaction.user.id, profile_picture_file.filename,
+            )
+            pic_url = profile_picture_file.url
     elif profile_picture_url:
         if not valid_image_url(profile_picture_url):
             return await interaction.followup.send("❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).", ephemeral=True)
@@ -758,7 +836,15 @@ async def oc_edit(
     if profile_picture_file:
         if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
             return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
-        pic_url = await persist_image_attachment(profile_picture_file) or profile_picture_file.url
+            
+        pic_url = await persist_image_attachment(profile_picture_file)
+        if pic_url is None:
+            log.warning(
+                "persist_image_attachment returned None for user=%s file=%s; "
+                "falling back to raw attachment URL which will expire.",
+                interaction.user.id, profile_picture_file.filename,
+            )
+            pic_url = profile_picture_file.url
     elif profile_picture_url:
         if not valid_image_url(profile_picture_url):
             return await interaction.followup.send("❌ Profile picture must be a direct image URL.", ephemeral=True)
@@ -1919,6 +2005,12 @@ async def ig_post(
         if file:
             if not file.content_type or not file.content_type.startswith("image/"): return await interaction.followup.send("❌ Files must be images.", ephemeral=True)
             persistent = await persist_image_attachment(file)
+            if persistent is None:
+                log.warning(
+                    "persist_image_attachment returned None for user=%s file=%s; "
+                    "falling back to raw attachment URL which will expire.",
+                    interaction.user.id, file.filename,
+                )
             photos.append(persistent or file.url)
         elif url:
             if not valid_image_url(url): return await interaction.followup.send(f"❌ Invalid image URL: `{url}`", ephemeral=True)
@@ -2437,6 +2529,360 @@ async def debut_notify(
     await interaction.followup.send("\n".join(result_lines) or "No contracts sent.", ephemeral=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  NOTIFY (Unified Dev DM / Debut)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NotifyCustomView(discord.ui.View):
+    """
+    Combined view that may contain:
+    - An accept/decline button pair (from DebutView logic)
+    - A reply button (from DevDMView logic)
+    All are optional; only buttons whose data is provided are added.
+    """
+    def __init__(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        dev_id: int,
+        oc_name: str,
+        group_name: str,
+        transport_channel_id: Optional[int],
+        custom_channel_message: Optional[str],
+        # Debut button config
+        show_debut_buttons: bool,
+        accept_label: str,
+        accept_style: discord.ButtonStyle,
+        decline_label: str,
+        decline_style: discord.ButtonStyle,
+        # Reply button config
+        show_reply_button: bool,
+        reply_label: str,
+        reply_style: discord.ButtonStyle,
+    ):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.dev_id = dev_id
+        self.oc_name = oc_name
+        self.group_name = group_name
+        self.transport_channel_id = transport_channel_id
+        self.custom_channel_message = custom_channel_message
+
+        if show_debut_buttons:
+            accept_btn = discord.ui.Button(
+                label=accept_label, style=accept_style, custom_id="notify_custom_accept"
+            )
+            decline_btn = discord.ui.Button(
+                label=decline_label, style=decline_style, custom_id="notify_custom_decline"
+            )
+            accept_btn.callback  = self._accept_callback
+            decline_btn.callback = self._decline_callback
+            self.add_item(accept_btn)
+            self.add_item(decline_btn)
+
+        if show_reply_button:
+            reply_btn = discord.ui.Button(
+                label=reply_label, style=reply_style, custom_id="notify_custom_reply"
+            )
+            reply_btn.callback = self._reply_callback
+            self.add_item(reply_btn)
+
+    async def _accept_callback(self, interaction: discord.Interaction):
+        guild   = bot.get_guild(self.guild_id)
+        member  = guild.get_member(self.user_id) if guild else None
+        channel = guild.get_channel(self.transport_channel_id) if guild and self.transport_channel_id else None
+        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
+
+        if member and channel:
+            await channel.set_permissions(member, view_channel=True, send_messages=True)
+            if self.custom_channel_message:
+                await channel.send(_safe_fmt(
+                    self.custom_channel_message,
+                    member=member.mention,
+                    oc=self.oc_name,
+                    group=self.group_name,
+                    user=member.display_name,
+                    server=guild.name if guild else "",
+                    channel=channel.mention
+                ))
+
+            if debut_log_ch:
+                notif = discord.Embed(
+                    title="✅ Debut Contract Accepted",
+                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**.",
+                    color=discord.Color.green(),
+                    timestamp=now_utc()
+                )
+                notif.add_field(name="OC", value=self.oc_name, inline=True)
+                notif.add_field(name="Group", value=self.group_name, inline=True)
+                notif.add_field(name="Channel Granted", value=channel.mention, inline=True)
+                await debut_log_ch.send(embed=notif)
+
+            await interaction.response.edit_message(
+                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to {channel.mention}.",
+                view=None
+            )
+        elif member:
+            if debut_log_ch:
+                notif = discord.Embed(
+                    title="⚠️ Debut Contract Accepted (Channel Missing)",
+                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned channel was not found.",
+                    color=discord.Color.orange(),
+                    timestamp=now_utc()
+                )
+                notif.add_field(name="OC", value=self.oc_name, inline=True)
+                notif.add_field(name="Group", value=self.group_name, inline=True)
+                await debut_log_ch.send(embed=notif)
+
+            await interaction.response.edit_message(
+                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned target channel could not be found.",
+                view=None
+            )
+        else:
+            await interaction.response.edit_message(content="❌ Could not complete the debut — server or channel not found.", view=None)
+
+    async def _decline_callback(self, interaction: discord.Interaction):
+        guild  = bot.get_guild(self.guild_id)
+        member = guild.get_member(self.user_id) if guild else None
+        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
+
+        if debut_log_ch:
+            notif = discord.Embed(
+                title="❌ Debut Contract Declined",
+                description=f"{member.mention if member else f'User {self.user_id}'} declined the debut contract for **{self.oc_name}** in **{self.group_name}**.",
+                color=discord.Color.red(),
+                timestamp=now_utc()
+            )
+            notif.add_field(name="OC", value=self.oc_name, inline=True)
+            notif.add_field(name="Group", value=self.group_name, inline=True)
+            await debut_log_ch.send(embed=notif)
+
+        await interaction.response.edit_message(content=f"You declined the debut contract for **{self.oc_name}** in **{self.group_name}**.", view=None)
+
+    async def _reply_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
+
+
+@bot.tree.command(
+    name="notify",
+    description="[Dev] Send a structured DM to one or more OCs/users — Selection, Q&A, or Custom.",
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.choices(type=[
+    app_commands.Choice(name="Selection — debut contract with automated congratulations", value="selection"),
+    app_commands.Choice(name="Q&A — prompt with mandatory reply button",                  value="qa"),
+    app_commands.Choice(name="Custom — full control over all elements",                    value="custom"),
+])
+@app_commands.describe(
+    type            = "Message type: 'selection' (debut contract), 'qa' (Q&A prompt), 'custom' (full control).",
+    oc_name         = "Primary OC to notify (by registered OC name).",
+    oc_name2        = "Additional OC to notify.",
+    oc_name3        = "Additional OC to notify.",
+    oc_name4        = "Additional OC to notify.",
+    oc_name5        = "Additional OC to notify.",
+    user            = "Direct Discord member to DM (used alongside or instead of OC targets).",
+    user2           = "Additional direct member recipient.",
+    user3           = "Additional direct member recipient.",
+    group_name      = "Group/company name — fills {group} placeholder everywhere.",
+    message         = "Body text for the embed. Supports {oc}, {group}, {recipient}, {server} placeholders.",
+    target_channel  = "Channel to grant access to on acceptance (Selection type only; defaults to #debuts).",
+    channel_message = "Message posted in the transport channel after acceptance (Selection type only).",
+    embed_title     = "Custom embed title. Supports {oc}, {group} placeholders.",
+    embed_color     = "Hex color for the embed (e.g. #FFD700).",
+    thumbnail_url   = "Thumbnail URL override (Selection/Custom). Falls back to OC profile picture.",
+    image_url       = "Main body image URL (Q&A/Custom only).",
+    footnote        = "Embed footer text. Supports {oc}, {group}, {server}, {recipient} placeholders.",
+    oc_placeholder  = "Optional 'Note' field appended to the embed (Selection/Custom). Supports {oc}, {group}.",
+    accept_label    = "Label for the Accept button (Selection/Custom). Max 80 chars.",
+    accept_color    = "Color for the Accept button (Selection/Custom): green, red, grey, blurple.",
+    decline_label   = "Label for the Decline button (Selection/Custom). Max 80 chars.",
+    decline_color   = "Color for the Decline button (Selection/Custom).",
+    require_response= "Whether recipients get a reply button (Q&A/Custom). Defaults True for Q&A.",
+    reply_label     = "Label for the Reply button (Q&A/Custom). Max 80 chars.",
+    reply_color     = "Color for the Reply button.",
+)
+async def notify_cmd(
+    interaction: discord.Interaction,
+    type: app_commands.Choice[str],
+    group_name: str,
+    oc_name:  Optional[str] = None,
+    oc_name2: Optional[str] = None,
+    oc_name3: Optional[str] = None,
+    oc_name4: Optional[str] = None,
+    oc_name5: Optional[str] = None,
+    user:  Optional[discord.Member] = None,
+    user2: Optional[discord.Member] = None,
+    user3: Optional[discord.Member] = None,
+    message:         Optional[str] = None,
+    target_channel:  Optional[discord.TextChannel] = None,
+    channel_message: Optional[str] = None,
+    embed_title:     Optional[str] = None,
+    embed_color:     Optional[str] = None,
+    thumbnail_url:   Optional[str] = None,
+    image_url:       Optional[str] = None,
+    footnote:        Optional[str] = None,
+    oc_placeholder:  Optional[str] = None,
+    accept_label:    Optional[str] = None,
+    accept_color:    Optional[str] = None,
+    decline_label:   Optional[str] = None,
+    decline_color:   Optional[str] = None,
+    require_response: bool = False,
+    reply_label:     Optional[str] = None,
+    reply_color:     Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
+
+    if accept_label  and len(accept_label)  > 80: return await interaction.response.send_message("❌ accept_label > 80 chars.", ephemeral=True)
+    if decline_label and len(decline_label) > 80: return await interaction.response.send_message("❌ decline_label > 80 chars.", ephemeral=True)
+    if reply_label   and len(reply_label)   > 80: return await interaction.response.send_message("❌ reply_label > 80 chars.", ephemeral=True)
+    if thumbnail_url and not valid_image_url(thumbnail_url): return await interaction.response.send_message("❌ Invalid thumbnail URL.", ephemeral=True)
+    if image_url     and not valid_image_url(image_url):     return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
+
+    mode = type.value
+
+    if mode == "qa" and not message:
+        return await interaction.response.send_message("❌ The 'message' parameter is required for Q&A type.", ephemeral=True)
+    if mode == "custom" and not any([oc_name, oc_name2, oc_name3, oc_name4, oc_name5, user, user2, user3]):
+        return await interaction.response.send_message("❌ At least one OC or user recipient is required.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+
+    raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4, oc_name5] if n]
+    raw_users = [u for u in [user, user2, user3] if u]
+
+    resolved_targets, warning_msgs = _resolve_notify_recipients(guild, data, raw_oc_names, raw_users)
+
+    if not resolved_targets:
+        warn_str = "\n".join(dict.fromkeys(warning_msgs))
+        if warn_str: warn_str = "\n" + warn_str
+        return await interaction.followup.send(f"❌ No valid recipients could be resolved.{warn_str}", ephemeral=True)
+
+    debut_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME)
+    if not debut_ch and mode in ("selection", "custom"):
+        cat = discord.utils.get(guild.categories, name="Special")
+        if not cat: cat = await guild.create_category("Special")
+        debut_ch = await guild.create_text_channel(
+            DEBUT_CHANNEL_NAME, category=cat,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True),
+            })
+            
+    transport_ch = target_channel if target_channel else debut_ch
+
+    successes = []
+    failures  = []
+
+    for oc_key, member in resolved_targets:
+        oc = data["ocs"][oc_key] if oc_key else None
+        display_oc = oc["name"] if oc else ""
+
+        def _r(text: Optional[str]) -> str:
+            if not text: return ""
+            return _safe_fmt(
+                text,
+                oc=display_oc, group=group_name, server=guild.name, 
+                recipient=member.display_name, channel=getattr(interaction.channel, "name", ""),
+                date=now_utc().strftime("%B %d, %Y")
+            )
+
+        if mode == "selection":
+            actual_msg = message or "Congratulations, {oc}! You have been selected to join {group}. Please review and respond to your debut contract below."
+            actual_title = embed_title or "🎉 Debut Selection — {oc} | {group}"
+            actual_color = embed_color or "#FFD700"  # gold
+            actual_note = oc_placeholder or "Your OC has been chosen to debut with {group}! Please accept or decline below."
+            actual_req_resp = False
+            show_debut = True
+        elif mode == "qa":
+            actual_msg = message or ""
+            actual_title = embed_title or "📋 Q&A from Dev"
+            actual_color = embed_color or "#DA373C"  # brand_red
+            actual_note = None
+            actual_req_resp = True if require_response is None else require_response
+            show_debut = False
+        else: # custom
+            actual_msg = message or ""
+            actual_title = embed_title or ""
+            actual_color = embed_color or "#5865F2"  # blurple
+            actual_note = oc_placeholder
+            actual_req_resp = require_response
+            show_debut = bool(accept_label or decline_label)
+
+        try: r_color = discord.Color(int(actual_color.lstrip('#'), 16))
+        except ValueError: r_color = discord.Color.blurple()
+
+        embed = discord.Embed(title=_r(actual_title), description=_r(actual_msg), color=r_color, timestamp=now_utc())
+
+        if oc:
+            resolved_thumbnail = thumbnail_url if thumbnail_url else oc.get("profile_picture")
+            if resolved_thumbnail:
+                embed.set_thumbnail(url=resolved_thumbnail)
+            if mode in ("selection", "custom"):
+                embed.add_field(name="OC", value=display_oc, inline=True)
+                embed.add_field(name="Group", value=group_name, inline=True)
+
+        if mode in ("qa", "custom") and image_url:
+            embed.set_image(url=image_url)
+
+        if actual_note and oc:
+            embed.add_field(name="Note", value=_r(actual_note), inline=False)
+            
+        if footnote:
+            embed.set_footer(text=_r(footnote))
+        elif actual_req_resp:
+            embed.set_footer(text="A response is requested.")
+
+        view = NotifyCustomView(
+            guild_id=guild.id,
+            user_id=member.id,
+            dev_id=interaction.user.id,
+            oc_name=display_oc,
+            group_name=group_name,
+            transport_channel_id=transport_ch.id if transport_ch else None,
+            custom_channel_message=channel_message,
+            show_debut_buttons=show_debut,
+            accept_label=accept_label or "Accept",
+            accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
+            decline_label=decline_label or "Decline",
+            decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
+            show_reply_button=actual_req_resp,
+            reply_label=reply_label or "Reply to Dev",
+            reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary),
+        )
+
+        try:
+            if mode == "selection" and not message:
+                dm_content = "You have received a debut contract. Please accept or decline below."
+            else:
+                dm_content = None
+
+            await member.send(content=dm_content, embed=embed, view=view if (show_debut or actual_req_resp) else None)
+            
+            tgt_str = f"{member.mention} (**{display_oc}**)" if oc else member.mention
+            successes.append(tgt_str)
+            await audit(guild, f"[NOTIFY/{mode.upper()}] Sent to {member} ({member.id}) OC='{oc_key or 'N/A'}' group='{group_name}' by {interaction.user}")
+        except discord.Forbidden:
+            tgt_str = f"{member.mention} (**{display_oc}**)" if oc else member.mention
+            failures.append(f"{tgt_str} — DMs likely disabled")
+
+    result_lines = []
+    if successes: result_lines.append("✅ Sent to: " + ", ".join(successes))
+    if failures:  result_lines.append("❌ Failed: "  + ", ".join(failures))
+    warn_str = "\n".join(dict.fromkeys(warning_msgs))
+    if warn_str: result_lines.append(warn_str)
+
+    if not successes and failures:
+        result_lines.insert(0, "❌ No messages were delivered. All recipients have DMs disabled.")
+
+    await interaction.followup.send("\n".join(result_lines) or "No messages sent.", ephemeral=True)
+
+
 class GCInviteView(discord.ui.View):
     def __init__(
         self, guild_id: int, invitee_user_id: int, oc_key: str, oc_name: str,
@@ -2593,6 +3039,124 @@ async def gc_invite(
 
     await interaction.followup.send(
         "\n".join(result_lines) or "✅ All invites sent.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="gc_remove_oc",
+    description="[Dev] Remove an OC from a debut group GC channel.",
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name        = "Name of the OC to remove from the GC.",
+    target_channel = "The GC channel to remove the OC from.",
+    notify_user    = "Whether to DM the OC owner informing them of the removal (default: True).",
+    reason         = "Optional reason included in the DM and audit log.",
+)
+async def gc_remove_oc(
+    interaction: discord.Interaction,
+    oc_name: str,
+    target_channel: discord.TextChannel,
+    notify_user: bool = True,
+    reason: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not guild:
+        return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]:
+        return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+
+    oc = data["ocs"][oc_key]
+    owner_id = oc.get("owner_id")
+    member = guild.get_member(owner_id) if owner_id else None
+
+    if member:
+        try:
+            await target_channel.set_permissions(
+                member,
+                overwrite=None  
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            return await interaction.followup.send(
+                f"❌ Failed to revoke channel permissions: {e}", ephemeral=True
+            )
+
+    removed_from: list[str] = []
+    for gc_key, gc_entry in data["groupchats"].items():
+        if gc_entry.get("channel_id") == target_channel.id:
+            participants: list = gc_entry.get("participants", [])
+            if oc_key in participants:
+                participants.remove(oc_key)
+                gc_entry["participants"] = participants
+                removed_from.append(gc_key)
+
+    await save_and_backup(data, reason="gc_remove_oc")
+
+    if notify_user and member:
+        try:
+            dm_embed = discord.Embed(
+                title="📢 Group Chat Access Removed",
+                description=(
+                    f"Your OC **{oc['name']}** has been removed from the group chat "
+                    f"**{target_channel.name}** by a server administrator."
+                ),
+                color=discord.Color.orange(),
+                timestamp=now_utc(),
+            )
+            if reason:
+                dm_embed.add_field(name="Reason", value=reason, inline=False)
+            dm_embed.set_footer(text=f"Contact a dev if you believe this was an error.")
+            if oc.get("profile_picture"):
+                dm_embed.set_thumbnail(url=oc["profile_picture"])
+            await member.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass  
+
+    try:
+        notice_embed = discord.Embed(
+            description=f"**{oc['name']}** has left the group chat.",
+            color=discord.Color.greyple(),
+            timestamp=now_utc(),
+        )
+        await target_channel.send(embed=notice_embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    result_embed = discord.Embed(
+        title="✅ OC Removed from GC",
+        color=discord.Color.green(),
+        timestamp=now_utc(),
+    )
+    result_embed.add_field(name="OC", value=oc["name"], inline=True)
+    result_embed.add_field(name="Channel", value=target_channel.mention, inline=True)
+    result_embed.add_field(
+        name="Owner Notified",
+        value="✅" if (notify_user and member) else "⚠️ Member not in server or DMs off",
+        inline=True,
+    )
+    if reason:
+        result_embed.add_field(name="Reason", value=reason, inline=False)
+    
+    if not removed_from:
+        result_embed.set_footer(text=f"⚠️ OC was not tracked in any GC data entry for this channel. | Executed by {interaction.user}")
+    else:
+        result_embed.set_footer(text=f"Executed by {interaction.user}")
+
+    await interaction.followup.send(embed=result_embed, ephemeral=True)
+
+    await audit(
+        guild,
+        f"[GC_REMOVE_OC] OC '{oc['name']}' (key={oc_key}) removed from #{target_channel.name} "
+        f"by {interaction.user} ({interaction.user.id}). Reason: {reason or 'none'}. "
+        f"notify_user={notify_user}"
     )
 
 
@@ -2877,8 +3441,10 @@ async def help_cmd(interaction: discord.Interaction):
             "`/send_embed` — Post a custom embed to any channel\n"
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
-            "`/debut_notify` — Send debut contract to 1–5 OCs, with custom transport channel support\n"
-            "`/dev_dm` — Message up to 5 users directly\n"
+            "`/notify` — Unified Selection/Q&A/Custom DM to multiple OCs and/or users at once\n"
+            "`/debut_notify` (legacy) — Send debut contract to 1–5 OCs\n"
+            "`/dev_dm` (legacy) — Message up to 5 users directly\n"
+            "`/gc_remove_oc` — Remove an OC from a debut group GC channel\n"
             "`/remind` — Set a timed reminder for a user\n"
             "`/startup` — Re-sync commands and restart task loops\n"
             "`/refresh_assets` — Re-upload any expired CDN attachment URLs (OC pictures, IG posts)\n"
@@ -2959,6 +3525,7 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
     data = load_data()
     refreshed = 0
     failed = 0
+    url_remap: dict[str, str] = {}
 
     def _is_cdn_attachment(url: str) -> bool:
         """Heuristic: is this a raw Discord CDN attachment link (not a user-supplied direct URL)?"""
@@ -2969,7 +3536,6 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
         url = oc.get("profile_picture", "")
         if _is_cdn_attachment(url):
             try:
-                # Fetch the image bytes directly via HTTP since the URL may still be valid
                 async with bot.http._HTTPClient__session.get(url) as resp:
                     if resp.status == 200:
                         img_bytes = await resp.read()
@@ -2981,7 +3547,9 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
                             if ch:
                                 msg = await ch.send(file=file_obj)
                                 if msg.attachments:
-                                    oc["profile_picture"] = msg.attachments[0].url
+                                    new_url = msg.attachments[0].url
+                                    url_remap[url] = new_url
+                                    oc["profile_picture"] = new_url
                                     refreshed += 1
                                     break
                     else:
@@ -3007,7 +3575,9 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
                                 if ch:
                                     msg = await ch.send(file=file_obj)
                                     if msg.attachments:
-                                        new_photos.append(msg.attachments[0].url)
+                                        new_url = msg.attachments[0].url
+                                        url_remap[photo_url] = new_url
+                                        new_photos.append(new_url)
                                         refreshed += 1
                                         break
                         else:
@@ -3023,6 +3593,47 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
 
     await save_and_backup(data, reason="refresh_assets")
 
+    # -- Second Pass: Patch old embed messages --
+    embed_patched = 0
+    channels_to_scan: list[discord.TextChannel] = []
+    
+    for guild in bot.guilds:
+        for ch_name in (LOG_CHANNEL_NAME, DEBUT_CHANNEL_NAME, DEV_RESPONSE_CHANNEL_NAME):
+            ch = discord.utils.get(guild.text_channels, name=ch_name)
+            if ch:
+                channels_to_scan.append(ch)
+        for entry in data["dms"].values():
+            ch = guild.get_channel(entry.get("channel_id", 0))
+            if isinstance(ch, discord.TextChannel):
+                channels_to_scan.append(ch)
+        for entry in data["groupchats"].values():
+            ch = guild.get_channel(entry.get("channel_id", 0))
+            if isinstance(ch, discord.TextChannel):
+                channels_to_scan.append(ch)
+
+    for ch in channels_to_scan:
+        try:
+            async for msg in ch.history(limit=200):
+                if msg.author != bot.user or not msg.embeds:
+                    continue
+                for embed in msg.embeds:
+                    dirty = False
+                    e = embed.copy()
+                    if e.thumbnail and e.thumbnail.url in url_remap:
+                        e.set_thumbnail(url=url_remap[e.thumbnail.url])
+                        dirty = True
+                    if e.image and e.image.url in url_remap:
+                        e.set_image(url=url_remap[e.image.url])
+                        dirty = True
+                    if dirty:
+                        try:
+                            await msg.edit(embed=e)
+                            embed_patched += 1
+                        except (discord.Forbidden, discord.HTTPException):
+                            log.debug("refresh_assets: failed to edit message %s in %s", msg.id, ch.name)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     embed = discord.Embed(
         title="🔄 Asset Refresh Complete",
         color=discord.Color.green() if not failed else discord.Color.orange(),
@@ -3030,6 +3641,7 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
     )
     embed.add_field(name="✅ Refreshed", value=str(refreshed), inline=True)
     embed.add_field(name="❌ Failed", value=str(failed), inline=True)
+    embed.add_field(name="🖼️ Embeds Patched", value=str(embed_patched), inline=True)
     embed.set_footer(text=f"Run by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
