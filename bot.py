@@ -39,6 +39,7 @@ DEBUT_CHANNEL_NAME        = "debuts"
 NEWS_CHANNEL_NAME         = "announcements"
 DEV_RESPONSE_CHANNEL_NAME = "dev-responses"   # Dev DM responses
 DB_BACKUP_CHANNEL_NAME    = "bot-db-backup"   # Automatic DB persistence channel
+ASSET_CHANNEL_NAME        = "bot-assets"      # Persistent bot image uploads
 INSTAGRAM_CHANNEL_NAME    = "instagram"
 BIRTHDAY_FORMAT           = "%Y/%m/%d"
 BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
@@ -46,6 +47,7 @@ DORM_SIZES                = [1, 2, 3, 4]
 MAX_PHOTOS                = 10
 PORT                      = int(os.environ.get("PORT", 8080))
 KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
+PRIMARY_GUILD_ID          = int(os.environ.get("PRIMARY_GUILD_ID", "0"))
 
 FILTERABLE_FIELDS  = ["gender", "pronouns", "face_claim", "main_skill",
                       "ethnicity", "nationality"]
@@ -146,6 +148,30 @@ async def save_and_backup(data: dict, reason: str = "mutation") -> None:
     save_data(data)
     await push_backup_to_discord(data, reason=reason)
 
+async def persist_image_attachment(attachment: discord.Attachment) -> Optional[str]:
+    """
+    Re-uploads a Discord CDN attachment to the bot-assets channel so the URL
+    is controlled by the bot and won't expire. Returns the permanent CDN URL.
+    """
+    if not attachment.content_type or not attachment.content_type.startswith("image/"):
+        return None
+    try:
+        image_bytes = await attachment.read()
+        file_obj = discord.File(
+            io.BytesIO(image_bytes),
+            filename=attachment.filename,
+            description=f"Persisted asset from user upload. Original: {attachment.id}"
+        )
+        for guild in bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+            if ch:
+                msg = await ch.send(file=file_obj)
+                if msg.attachments:
+                    return msg.attachments[0].url
+    except Exception as e:
+        log.error("persist_image_attachment failed: %s", e)
+    return None
+
 def _validate_backup(parsed: dict) -> bool:
     if not isinstance(parsed, dict):
         return False
@@ -215,22 +241,14 @@ def get_age(birthday_str: str):
         return None
 
 def days_until_birthday(birthday_str: str, today: date) -> int:
-    """
-    Returns the number of days until the OC's next birthday occurrence from `today`.
-    If the birthday has already occurred this year (month/day < today), returns a
-    LARGE sentinel value (e.g. 365 + days since it passed) so that past birthdays
-    sort after upcoming ones, while still being internally ordered by recency.
-    Returns 9999 on parse error.
-    """
     try:
         bday = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
         this_year_bday = date(today.year, bday.month, bday.day)
         if this_year_bday >= today:
-            return (this_year_bday - today).days          # upcoming: 0–364
+            return (this_year_bday - today).days
         else:
-            # Already passed: use large base offset plus days since it passed
-            days_ago = (today - this_year_bday).days      # 1–364
-            return 365 + days_ago                         # 366–729
+            days_ago = (today - this_year_bday).days
+            return 365 + days_ago
     except Exception:
         return 9999
 
@@ -241,11 +259,18 @@ def format_birthday_long(birthday_str: str) -> str:
     except Exception:
         return birthday_str
 
+def resolve_guild(interaction: discord.Interaction) -> Optional[discord.Guild]:
+    """Resolves interaction guild, or falls back to PRIMARY_GUILD_ID for DM usages."""
+    return interaction.guild or bot.get_guild(PRIMARY_GUILD_ID)
+
 def is_dev(interaction: discord.Interaction) -> bool:
-    if interaction.guild is None:
+    guild = resolve_guild(interaction)
+    if guild is None:
         return False
-    return (interaction.guild.owner_id == interaction.user.id
-            or interaction.user.guild_permissions.administrator)
+    member = guild.get_member(interaction.user.id)
+    if member is None:
+        return False
+    return (guild.owner_id == member.id or member.guild_permissions.administrator)
 
 def resolve_button_style(value: Optional[str], default: discord.ButtonStyle) -> discord.ButtonStyle:
     if value:
@@ -283,6 +308,7 @@ def _safe_fmt(template: str, **kwargs) -> str:
 
 # ─── Audit helper ──────────────────────────────────────────────────────────────
 async def audit(guild: discord.Guild, message: str) -> None:
+    if not guild: return
     ch = discord.utils.get(guild.text_channels, name=AUDIT_CHANNEL_NAME)
     if ch:
         ts = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -338,9 +364,12 @@ intents         = discord.Intents.default()
 intents.members = True
 intents.guilds  = True
 
-# DEPLOYMENT NOTE: In the Discord Developer Portal → Installation, ensure both
-# "Guild Install" and "User Install" are enabled. User install scope: applications.commands.
-# This allows users to add the bot to their account for use in DMs and private channels.
+# DEPLOYMENT NOTE (DM support):
+# In the Discord Developer Portal → OAuth2 → Installation:
+#   - Under "Install Link" → "Discord Provided Link", ensure scope includes: bot, applications.commands
+#   - Under "Default Install Settings" → "User Install": add scope "applications.commands"
+# This allows the bot to be added to a user's account, enabling /command usage in DMs.
+# Set PRIMARY_GUILD_ID in your environment to your server's numeric ID.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 class _Health(BaseHTTPRequestHandler):
@@ -388,6 +417,7 @@ async def on_ready():
 
     if not DB_LOADED:
         for guild in bot.guilds:
+            # DB Backup Bootstrap
             ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
             if not ch:
                 try:
@@ -404,7 +434,7 @@ async def on_ready():
                         slowmode_delay=21600
                     )
                 except Exception:
-                    continue
+                    pass
 
             if ch:
                 try:
@@ -435,7 +465,28 @@ async def on_ready():
                                 break
                 except Exception as e:
                     log.error(f"Error fetching DB backup: {e}")
-                break
+
+            # Asset Channel Bootstrap
+            asset_ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+            if not asset_ch:
+                try:
+                    cat = discord.utils.get(guild.categories, name="Special")
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        guild.me: discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True,
+                            attach_files=True, read_message_history=True, manage_messages=True
+                        )
+                    }
+                    asset_ch = await guild.create_text_channel(
+                        ASSET_CHANNEL_NAME,
+                        category=cat,
+                        overwrites=overwrites,
+                        topic="⚙️ Bot-managed persistent image asset store. Do not delete messages here.",
+                        slowmode_delay=21600
+                    )
+                except Exception as e:
+                    log.warning("Could not create %s channel: %s", ASSET_CHANNEL_NAME, e)
 
         DB_LOADED = True
 
@@ -481,7 +532,6 @@ async def auto_backup_db():
 # ─── Birthday loop ─────────────────────────────────────────────────────────────
 @tasks.loop(time=_dt.time(hour=15, minute=0, tzinfo=timezone.utc))  # 15:00 UTC = 00:00 KST
 async def check_birthdays():
-    # Note: get_age() returns the new age on their exact birthday date, so "turns N today" is accurate.
     today_kst = datetime.now(KST).date()
     data       = load_data()
 
@@ -593,8 +643,8 @@ async def before_check_reminders():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="oc_add", description="Register a new OC to the database (unlimited OCs per user).")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     name="OC's full name", birthday=f"Birthday in {BIRTHDAY_DISPLAY}", gender="OC's gender",
     pronouns="Pronouns (e.g. she/her)", face_claim="Face claim", main_skill="Primary skill", 
@@ -610,31 +660,36 @@ async def oc_add(
     profile_picture_url: Optional[str] = None, profile_picture_file: Optional[discord.Attachment] = None,
     form_link: Optional[str] = None
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context. Set PRIMARY_GUILD_ID.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
     try:
         datetime.strptime(birthday, BIRTHDAY_FORMAT)
     except ValueError:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             f"❌ Birthday must be in **{BIRTHDAY_DISPLAY}** format (e.g. `2000/06/25`).", ephemeral=True)
 
     pic_url = None
     if profile_picture_file:
         if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
-            return await interaction.response.send_message("❌ Attached file must be an image.", ephemeral=True)
-        pic_url = profile_picture_file.url
+            return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
+        pic_url = await persist_image_attachment(profile_picture_file) or profile_picture_file.url
     elif profile_picture_url:
         if not valid_image_url(profile_picture_url):
-            return await interaction.response.send_message("❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).", ephemeral=True)
+            return await interaction.followup.send("❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).", ephemeral=True)
         pic_url = profile_picture_url
     else:
-        return await interaction.response.send_message("❌ A profile picture is required. Provide either a URL or upload a file.", ephemeral=True)
+        return await interaction.followup.send("❌ A profile picture is required. Provide either a URL or upload a file.", ephemeral=True)
 
     if form_link and not valid_url(form_link):
-        return await interaction.response.send_message("❌ Form link must start with http:// or https://.", ephemeral=True)
+        return await interaction.followup.send("❌ Form link must start with http:// or https://.", ephemeral=True)
 
     data = load_data()
     key  = oc_key_of(name)
     if key in data["ocs"]:
-        return await interaction.response.send_message(f"❌ An OC named **{name}** already exists. Use /oc_edit to update.", ephemeral=True)
+        return await interaction.followup.send(f"❌ An OC named **{name}** already exists. Use /oc_edit to update.", ephemeral=True)
 
     data["ocs"][key] = {
         "name": name, "profile_picture": pic_url, "birthday": birthday,
@@ -647,9 +702,9 @@ async def oc_add(
     asyncio.ensure_future(push_backup_to_discord(data, reason="oc_add"))
 
     embed = build_oc_embed(data["ocs"][key], key)
-    await interaction.response.send_message(f"**{name}** registered successfully.", embed=embed, ephemeral=True)
+    await interaction.followup.send(f"**{name}** registered successfully.", embed=embed, ephemeral=True)
 
-    log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+    log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
     if log_ch:
         log_embed = discord.Embed(
             title="✨ New OC Logged",
@@ -662,12 +717,12 @@ async def oc_add(
         log_embed.add_field(name="OC ID", value=f"`{oc_key_of(name)}`", inline=True)
         await log_ch.send(embed=log_embed)
 
-    await audit(interaction.guild, f"OC added: '{name}' by {interaction.user} ({interaction.user.id})")
+    await audit(guild, f"OC added: '{name}' by {interaction.user} ({interaction.user.id})")
 
 
 @bot.tree.command(name="oc_edit", description="Edit an existing OC (only filled fields are changed).")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     oc_name="Name of the OC to edit", name="New name", 
     profile_picture_url="New image URL (optional)", profile_picture_file="Upload new image file (optional)",
@@ -681,31 +736,36 @@ async def oc_edit(
     birthday: Optional[str] = None, gender: Optional[str] = None, pronouns: Optional[str] = None, face_claim: Optional[str] = None,
     main_skill: Optional[str] = None, ethnicity: Optional[str] = None, nationality: Optional[str] = None, form_link: Optional[str] = None
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context. Set PRIMARY_GUILD_ID.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
     data = load_data()
     key  = oc_key_of(oc_name)
     if key not in data["ocs"]:
-        return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+        return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
     oc = data["ocs"][key]
     if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
-        return await interaction.response.send_message("❌ You can only edit your own OCs.", ephemeral=True)
+        return await interaction.followup.send("❌ You can only edit your own OCs.", ephemeral=True)
 
     if birthday:
         try: datetime.strptime(birthday, BIRTHDAY_FORMAT)
-        except ValueError: return await interaction.response.send_message(f"❌ Birthday must be **{BIRTHDAY_DISPLAY}**.", ephemeral=True)
+        except ValueError: return await interaction.followup.send(f"❌ Birthday must be **{BIRTHDAY_DISPLAY}**.", ephemeral=True)
 
     pic_url = None
     if profile_picture_file:
         if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
-            return await interaction.response.send_message("❌ Attached file must be an image.", ephemeral=True)
-        pic_url = profile_picture_file.url
+            return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
+        pic_url = await persist_image_attachment(profile_picture_file) or profile_picture_file.url
     elif profile_picture_url:
         if not valid_image_url(profile_picture_url):
-            return await interaction.response.send_message("❌ Profile picture must be a direct image URL.", ephemeral=True)
+            return await interaction.followup.send("❌ Profile picture must be a direct image URL.", ephemeral=True)
         pic_url = profile_picture_url
 
     if form_link and not valid_url(form_link):
-        return await interaction.response.send_message("❌ Form link must be a valid URL.", ephemeral=True)
+        return await interaction.followup.send("❌ Form link must be a valid URL.", ephemeral=True)
 
     updates = {
         "name": name, "birthday": birthday, "gender": gender, "pronouns": pronouns, 
@@ -727,7 +787,7 @@ async def oc_edit(
             oc[field] = val
 
     if not changes:
-        return await interaction.response.send_message("❌ No changes were provided.", ephemeral=True)
+        return await interaction.followup.send("❌ No changes were provided.", ephemeral=True)
 
     new_key = oc_key_of(oc["name"])
     if new_key != key:
@@ -742,14 +802,17 @@ async def oc_edit(
     asyncio.ensure_future(push_backup_to_discord(data, reason="oc_edit"))
     
     embed = build_oc_embed(oc, new_key)
-    await interaction.response.send_message(f"**{oc['name']}** updated.\n\n**Changes:**\n" + "\n".join(changes), embed=embed, ephemeral=True)
+    await interaction.followup.send(f"**{oc['name']}** updated.\n\n**Changes:**\n" + "\n".join(changes), embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="oc_delete", description="Delete an OC entirely.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(oc_name="Name of the OC to delete")
 async def oc_delete(interaction: discord.Interaction, oc_name: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data = load_data()
     key  = oc_key_of(oc_name)
     if key not in data["ocs"]:
@@ -772,7 +835,7 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
     asyncio.ensure_future(push_backup_to_discord(data, reason="oc_delete"))
     
     await interaction.response.send_message(f"✅ **{oc['name']}** has been deleted.", ephemeral=True)
-    await audit(interaction.guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
+    await audit(guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
 
 
 class OCPaginatorView(discord.ui.View):
@@ -923,10 +986,13 @@ async def birthday_list(interaction: discord.Interaction):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="floor_create", description="[Dev] Create a new floor category.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(floor_name="Display name for the floor (e.g. 1st Floor)")
 async def floor_create(interaction: discord.Interaction, floor_name: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can create floors.", ephemeral=True)
     data = load_data()
     key  = dorm_key_of(floor_name)
@@ -936,18 +1002,21 @@ async def floor_create(interaction: discord.Interaction, floor_name: str):
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="floor_create"))
 
-    category = discord.utils.get(interaction.guild.categories, name=floor_name)
-    if category is None: await interaction.guild.create_category(floor_name)
+    category = discord.utils.get(guild.categories, name=floor_name)
+    if category is None: await guild.create_category(floor_name)
 
     await interaction.response.send_message(f"🏢 Floor **{floor_name}** created.\nUse `/dorm_create` to add rooms.", ephemeral=True)
-    await audit(interaction.guild, f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
+    await audit(guild, f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
 
 
 @bot.tree.command(name="floor_rename", description="[Dev] Rename a floor without affecting room assignments.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(old_name="Current floor name", new_name="New floor name")
 async def floor_rename(interaction: discord.Interaction, old_name: str, new_name: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can rename floors.", ephemeral=True)
 
     old_key = dorm_key_of(old_name)
@@ -963,7 +1032,7 @@ async def floor_rename(interaction: discord.Interaction, old_name: str, new_name
     floor_data["name"] = new_name
     data["floors"][new_key] = floor_data
 
-    category = discord.utils.get(interaction.guild.categories, name=old_name)
+    category = discord.utils.get(guild.categories, name=old_name)
     if category:
         try: await category.edit(name=new_name)
         except discord.Forbidden: await interaction.followup.send("⚠️ Lacking permissions to rename Discord category.", ephemeral=True)
@@ -972,14 +1041,17 @@ async def floor_rename(interaction: discord.Interaction, old_name: str, new_name
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="floor_rename"))
     await interaction.followup.send(f"✅ Floor **{old_name}** renamed to **{new_name}**.", ephemeral=True)
-    await audit(interaction.guild, f"Floor renamed: '{old_name}' → '{new_name}' by {interaction.user} ({interaction.user.id})")
+    await audit(guild, f"Floor renamed: '{old_name}' → '{new_name}' by {interaction.user} ({interaction.user.id})")
 
 
 @bot.tree.command(name="floor_delete", description="[Dev] Permanently delete a floor and all its dorm rooms.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(floor_name="Floor to delete", confirm="Type the floor name exactly to confirm")
 async def floor_delete(interaction: discord.Interaction, floor_name: str, confirm: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can delete floors.", ephemeral=True)
     f_key = dorm_key_of(floor_name)
     data = load_data()
@@ -995,7 +1067,7 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
         for oc_key in room_data.get("occupants", []):
             displaced.setdefault(oc_key, []).append(room_data["name"])
             
-    category = discord.utils.get(interaction.guild.categories, name=floor_data["name"])
+    category = discord.utils.get(guild.categories, name=floor_data["name"])
     if category:
         for ch in list(category.channels):
             try: await ch.delete(reason=f"Floor '{floor_data['name']}' deleted by dev")
@@ -1024,7 +1096,7 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
     displaced_bullets = []
     for owner_id, o_data in owners_dict.items():
         for o_n in o_data["oc_names"]: displaced_bullets.append(f"• {o_n} (<@{owner_id}>)")
-        try: owner = await interaction.guild.fetch_member(owner_id)
+        try: owner = await guild.fetch_member(owner_id)
         except (discord.NotFound, discord.HTTPException):
             failed_dms.append(f"<@{owner_id}>")
             continue
@@ -1044,14 +1116,17 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
     dev_embed.add_field(name="DM Status", value=dm_status, inline=False)
     
     await interaction.followup.send(embed=dev_embed, ephemeral=True)
-    await audit(interaction.guild, f"Floor deleted: '{floor_data['name']}' — {len(displaced)} OCs displaced by {interaction.user}")
+    await audit(guild, f"Floor deleted: '{floor_data['name']}' — {len(displaced)} OCs displaced by {interaction.user}")
 
 
 @bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(floor_name="Floor this room belongs to", room_name="Name for the room", capacity="Capacity (1, 2, 3, or 4)")
 async def dorm_create(interaction: discord.Interaction, floor_name: str, room_name: str, capacity: int):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can create dorms.", ephemeral=True)
     if capacity not in DORM_SIZES: return await interaction.response.send_message(f"❌ Capacity must be one of: {', '.join(str(s) for s in DORM_SIZES)}.", ephemeral=True)
 
@@ -1065,26 +1140,26 @@ async def dorm_create(interaction: discord.Interaction, floor_name: str, room_na
     await interaction.response.defer(ephemeral=True)
     floor["rooms"][r_key] = {"name": room_name, "capacity": capacity, "occupants": []}
     
-    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
-    if category is None: category = await interaction.guild.create_category(floor["name"])
+    category = discord.utils.get(guild.categories, name=floor["name"])
+    if category is None: category = await guild.create_category(floor["name"])
 
-    if not discord.utils.get(interaction.guild.text_channels, name=r_key, category=category):
+    if not discord.utils.get(guild.text_channels, name=r_key, category=category):
         overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me:           discord.PermissionOverwrite(view_channel=True),
         }
-        if interaction.guild.owner: overwrites[interaction.guild.owner] = discord.PermissionOverwrite(view_channel=True)
-        await interaction.guild.create_text_channel(r_key, category=category, overwrites=overwrites)
+        if guild.owner: overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
+        await guild.create_text_channel(r_key, category=category, overwrites=overwrites)
 
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_create"))
     await interaction.followup.send(f"🚪 Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
-    await audit(interaction.guild, f"Room created: '{room_name}' on '{floor['name']}' by {interaction.user}")
+    await audit(guild, f"Room created: '{room_name}' on '{floor['name']}' by {interaction.user}")
 
 
 @bot.tree.command(name="dorm_edit", description="[Dev] Rename and/or change the capacity of a dorm room while keeping all current occupants.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     floor_name="Floor this room belongs to",
     room_name="Current name of the room to edit",
@@ -1098,6 +1173,9 @@ async def dorm_edit(
     new_room_name: Optional[str] = None,
     new_capacity: Optional[int] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction):
         return await interaction.response.send_message("❌ Only devs can edit dorm rooms.", ephemeral=True)
 
@@ -1156,9 +1234,9 @@ async def dorm_edit(
         floor["rooms"][new_rkey]["name"] = new_room_name
         changes.append(f"`name`: {room_name} → {new_room_name}")
 
-        category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+        category = discord.utils.get(guild.categories, name=floor["name"])
         if category:
-            channel = discord.utils.get(interaction.guild.text_channels, name=old_rkey, category=category)
+            channel = discord.utils.get(guild.text_channels, name=old_rkey, category=category)
             if channel:
                 try:
                     await channel.edit(name=new_rkey)
@@ -1180,16 +1258,19 @@ async def dorm_edit(
         ephemeral=True
     )
     await audit(
-        interaction.guild,
+        guild,
         f"Dorm edited: '{room_name}' on '{floor_name}' — {'; '.join(changes)} — by {interaction.user} ({interaction.user.id})"
     )
 
 
 @bot.tree.command(name="dorm_relocate", description="[Dev] Move a dorm room from one floor to another.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(room_name="Room to move", source_floor="Current floor", target_floor="Destination floor")
 async def dorm_relocate(interaction: discord.Interaction, room_name: str, source_floor: str, target_floor: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can relocate dorm rooms.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
 
@@ -1205,15 +1286,15 @@ async def dorm_relocate(interaction: discord.Interaction, room_name: str, source
     room_data = data["floors"][src_fkey]["rooms"].pop(r_key)
     data["floors"][tgt_fkey]["rooms"][r_key] = room_data
 
-    src_category = discord.utils.get(interaction.guild.categories, name=data["floors"][src_fkey]["name"])
-    tgt_category = discord.utils.get(interaction.guild.categories, name=data["floors"][tgt_fkey]["name"])
+    src_category = discord.utils.get(guild.categories, name=data["floors"][src_fkey]["name"])
+    tgt_category = discord.utils.get(guild.categories, name=data["floors"][tgt_fkey]["name"])
     
     if not tgt_category:
-        try: tgt_category = await interaction.guild.create_category(data["floors"][tgt_fkey]["name"])
+        try: tgt_category = await guild.create_category(data["floors"][tgt_fkey]["name"])
         except (discord.Forbidden, discord.HTTPException) as e: tgt_category = None
 
     if src_category and tgt_category:
-        channel = discord.utils.get(interaction.guild.text_channels, name=r_key, category=src_category)
+        channel = discord.utils.get(guild.text_channels, name=r_key, category=src_category)
         if channel:
             try: await channel.edit(category=tgt_category)
             except discord.HTTPException: pass
@@ -1227,14 +1308,17 @@ async def dorm_relocate(interaction: discord.Interaction, room_name: str, source
     embed.add_field(name="Moved From", value=data["floors"][src_fkey]["name"], inline=True)
     embed.add_field(name="Moved To", value=data["floors"][tgt_fkey]["name"], inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
-    await audit(interaction.guild, f"Room relocated: '{room_data['name']}' to '{data['floors'][tgt_fkey]['name']}' by {interaction.user}")
+    await audit(guild, f"Room relocated: '{room_data['name']}' to '{data['floors'][tgt_fkey]['name']}' by {interaction.user}")
 
 
 @bot.tree.command(name="dorm_delete", description="[Dev] Permanently delete a single dorm room from a floor.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(floor_name="Floor the room belongs to", room_name="Room to delete", confirm="Type the room name exactly to confirm")
 async def dorm_delete(interaction: discord.Interaction, floor_name: str, room_name: str, confirm: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can delete dorm rooms.", ephemeral=True)
             
     f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
@@ -1249,9 +1333,9 @@ async def dorm_delete(interaction: discord.Interaction, floor_name: str, room_na
     room_data = floor["rooms"].pop(r_key)
     displaced_oc_keys = list(room_data.get("occupants", []))
     
-    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
+    category = discord.utils.get(guild.categories, name=floor["name"])
     if category:
-        ch = discord.utils.get(interaction.guild.text_channels, name=r_key, category=category)
+        ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
         if ch:
             try: await ch.delete()
             except (discord.Forbidden, discord.HTTPException): pass
@@ -1262,14 +1346,17 @@ async def dorm_delete(interaction: discord.Interaction, floor_name: str, room_na
     dev_embed = discord.Embed(title="🗑️ Dorm Deleted", color=discord.Color.red(), timestamp=now_utc())
     dev_embed.add_field(name="Room", value=room_data["name"], inline=True)
     await interaction.followup.send(embed=dev_embed, ephemeral=True)
-    await audit(interaction.guild, f"Dorm deleted: '{room_data['name']}' on '{floor['name']}' by {interaction.user}")
+    await audit(guild, f"Dorm deleted: '{room_data['name']}' on '{floor['name']}' by {interaction.user}")
 
 
 @bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm room.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(oc_name="OC name", floor_name="Floor name", room_name="Room name")
 async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name: str, room_name: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data   = load_data()
     oc_key, f_key, r_key = oc_key_of(oc_name), dorm_key_of(floor_name), room_key_of(room_name)
 
@@ -1291,16 +1378,16 @@ async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_assign"))
 
-    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
-    channel = discord.utils.get(interaction.guild.text_channels, name=r_key, category=category)
+    category = discord.utils.get(guild.categories, name=floor["name"])
+    channel = discord.utils.get(guild.text_channels, name=r_key, category=category)
     if channel: await channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
 
     occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
-    await interaction.response.send_message(f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n👥 Occupants: {occupants_display}")
-    await audit(interaction.guild, f"OC '{oc_name}' assigned to '{room_name}' by {interaction.user}")
+    await interaction.response.send_message(f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n👥 Occupants: {occupants_display}", ephemeral=True)
+    await audit(guild, f"OC '{oc_name}' assigned to '{room_name}' by {interaction.user}")
 
     if len(room_data["occupants"]) == room_data["capacity"]:
-        log_ch = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+        log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_ch:
             occupants_names = [
                 data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"]
@@ -1324,10 +1411,13 @@ async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name
 
 
 @bot.tree.command(name="dorm_unassign", description="Remove an OC from their room.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(oc_name="Name of the OC to unassign")
 async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data   = load_data()
     oc_key = oc_key_of(oc_name)
     if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
@@ -1339,22 +1429,25 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
                 save_data(data)
                 asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_unassign"))
                 
-                category = discord.utils.get(interaction.guild.categories, name=floor["name"])
-                ch = discord.utils.get(interaction.guild.text_channels, name=r_key, category=category)
+                category = discord.utils.get(guild.categories, name=floor["name"])
+                ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
                 if ch: await ch.set_permissions(interaction.user, overwrite=None)
                     
-                await interaction.response.send_message(f"🚶 **{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.")
-                await audit(interaction.guild, f"OC '{oc_name}' unassigned by {interaction.user}")
+                await interaction.response.send_message(f"🚶 **{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.", ephemeral=True)
+                await audit(guild, f"OC '{oc_name}' unassigned by {interaction.user}")
                 return
 
     await interaction.response.send_message(f"❌ **{oc_name}** is not assigned to any dorm room.", ephemeral=True)
 
 
 @bot.tree.command(name="dorm_kick", description="[Dev] Force-remove a user's OC(s) from all dorm assignments.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(user="User whose OC(s) should be removed", oc_name="Optional specific OC to remove")
 async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_name: Optional[str] = None):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can force-remove.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
 
@@ -1373,8 +1466,8 @@ async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_n
                     room_data["occupants"].remove(oc_k)
                     removed.append((data["ocs"][oc_k]["name"], floor["name"], room_data["name"]))
 
-                    category = discord.utils.get(interaction.guild.categories, name=floor["name"])
-                    ch = discord.utils.get(interaction.guild.text_channels, name=r_key, category=category)
+                    category = discord.utils.get(guild.categories, name=floor["name"])
+                    ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
                     if ch:
                         try: await ch.set_permissions(user, overwrite=None)
                         except discord.Forbidden: pass
@@ -1386,7 +1479,7 @@ async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_n
 
     lines = "\n".join(f"• **{name}** removed from **{room}**" for name, floor, room in removed)
     await interaction.followup.send(f"🚷 Dorm kick complete for {user.mention}:\n{lines}", ephemeral=True)
-    await audit(interaction.guild, f"Dorm kick: {user} by {interaction.user}")
+    await audit(guild, f"Dorm kick: {user} by {interaction.user}")
 
 
 class DormPaginatorView(discord.ui.View):
@@ -1449,15 +1542,15 @@ class DormPaginatorView(discord.ui.View):
         return embed
 
 @bot.tree.command(name="dorm_view", description="View floors and dorm occupancy.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def dorm_view(interaction: discord.Interaction):
     data = load_data()
     if not data["floors"]: return await interaction.response.send_message("❌ No floors have been created yet.", ephemeral=True)
 
     items = list(data["floors"].items())
     view = DormPaginatorView(items, data["ocs"])
-    await interaction.response.send_message(embed=view.get_embed(), view=view)
+    await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1465,14 +1558,17 @@ async def dorm_view(interaction: discord.Interaction):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="news_post", description="[Dev] Post a news article embed.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(title="Article headline", content="Article body", image_url="Optional image URL")
 async def news_post(interaction: discord.Interaction, title: str, content: str, image_url: Optional[str] = None):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can post news.", ephemeral=True)
     if image_url and not valid_image_url(image_url): return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
 
-    news_ch = discord.utils.get(interaction.guild.text_channels, name=NEWS_CHANNEL_NAME)
+    news_ch = discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
     if not news_ch: return await interaction.response.send_message(f"❌ Channel `#{NEWS_CHANNEL_NAME}` not found.", ephemeral=True)
 
     embed = discord.Embed(title=title, description=content, color=discord.Color.red(), timestamp=now_utc())
@@ -1481,12 +1577,12 @@ async def news_post(interaction: discord.Interaction, title: str, content: str, 
 
     await news_ch.send(embed=embed)
     await interaction.response.send_message(f"Article **{title}** posted.", ephemeral=True)
-    await audit(interaction.guild, f"News posted: '{title}' by {interaction.user}")
+    await audit(guild, f"News posted: '{title}' by {interaction.user}")
 
 
 @bot.tree.command(name="send_embed", description="[Dev] Post a custom embed to any channel as a custom identity.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     channel="Target text channel", title="Embed title (1-256 chars)", content="Embed description (1-4096 chars)",
     custom_username="Optional custom sender name", avatar_url="Optional custom sender avatar URL",
@@ -1497,6 +1593,9 @@ async def send_embed(
     custom_username: Optional[str] = None, avatar_url: Optional[str] = None, color: Optional[str] = None,
     image_url: Optional[str] = None, footer_text: Optional[str] = None
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can send custom embeds.", ephemeral=True)
     if len(title) < 1 or len(title) > 256: return await interaction.response.send_message("❌ Title must be 1-256 characters.", ephemeral=True)
     if len(content) < 1 or len(content) > 4096: return await interaction.response.send_message("❌ Content must be 1-4096 characters.", ephemeral=True)
@@ -1514,7 +1613,7 @@ async def send_embed(
 
     await channel.send(embed=embed)
     await interaction.response.send_message(f"✅ Embed sent to {channel.mention}.{warning_msg}", ephemeral=True)
-    await audit(interaction.guild, f"[SEND_EMBED] '{title}' to #{channel.name} by {interaction.user}")
+    await audit(guild, f"[SEND_EMBED] '{title}' to #{channel.name} by {interaction.user}")
 
 
 class AnnounceView(discord.ui.View):
@@ -1527,8 +1626,8 @@ class AnnounceView(discord.ui.View):
 
 
 @bot.tree.command(name="announce", description="[Dev] Post a styled announcement embed to any channel immediately.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(channel="Target channel", title="Announcement title", content="Announcement body")
 async def announce(
     interaction: discord.Interaction, channel: discord.TextChannel, title: str, content: str,
@@ -1538,6 +1637,9 @@ async def announce(
     button2_label: Optional[str] = None, button2_color: Optional[str] = None, button2_url: Optional[str] = None,
     ping_role: Optional[discord.Role] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can post announcements.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
 
@@ -1552,7 +1654,7 @@ async def announce(
             warning_msgs.append(f"⚠️ OC '{oc_name}' not found; using raw string.")
 
     def _resolve(text: Optional[str]) -> Optional[str]:
-        if text is not None: return _safe_fmt(text, server=interaction.guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_display)
+        if text is not None: return _safe_fmt(text, server=guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_display)
         return None
 
     resolved_color = discord.Color.blurple()
@@ -1577,18 +1679,21 @@ async def announce(
     warn_str = "\n".join(warning_msgs)
     if warn_str: warn_str = "\n" + warn_str
     await interaction.followup.send(f"✅ Announcement posted to {channel.mention}.{warn_str}", ephemeral=True)
-    await audit(interaction.guild, f"[ANNOUNCE] '{title}' to #{channel.name} by {interaction.user}")
+    await audit(guild, f"[ANNOUNCE] '{title}' to #{channel.name} by {interaction.user}")
 
 
 @bot.tree.command(name="announce_schedule", description="[Dev] Schedule an announcement for a future time.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(title="Title", content="Body text", fire_at="YYYY-MM-DD HH:MM", channel="Channel", timezone_str="Timezone")
 @app_commands.choices(timezone_str=TIMEZONE_CHOICES)
 async def announce_schedule(
     interaction: discord.Interaction, title: str, content: str, fire_at: str,
     channel: Optional[discord.TextChannel] = None, image_url: Optional[str] = None, timezone_str: Optional[str] = None
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can schedule announcements.", ephemeral=True)
     tz_str = timezone_str or "UTC"
     try: tz = ZoneInfo(tz_str)
@@ -1602,7 +1707,7 @@ async def announce_schedule(
 
     if fire_dt <= now_utc(): return await interaction.response.send_message("❌ Time must be in the future.", ephemeral=True)
 
-    resolved_ch = channel or discord.utils.get(interaction.guild.text_channels, name=NEWS_CHANNEL_NAME)
+    resolved_ch = channel or discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
     if not resolved_ch: return await interaction.response.send_message("❌ Target channel not found.", ephemeral=True)
 
     data = load_data()
@@ -1618,12 +1723,12 @@ async def announce_schedule(
     local_display = fire_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
     fire_display   = f"{local_display} {tz_str}  ({fire_dt.strftime('%Y-%m-%d %H:%M UTC')})"
     await interaction.response.send_message(f"✅ Scheduled for **{fire_display}**.", ephemeral=True)
-    await audit(interaction.guild, f"Scheduled announcement '{title}' by {interaction.user}")
+    await audit(guild, f"Scheduled announcement '{title}' by {interaction.user}")
 
 
 @bot.tree.command(name="announce_list", description="[Dev] List all pending scheduled announcements.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def announce_list(interaction: discord.Interaction):
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can view scheduled announcements.", ephemeral=True)
     data = load_data()
@@ -1638,10 +1743,13 @@ async def announce_list(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="announce_cancel", description="[Dev] Cancel a scheduled announcement by ID.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(sched_id="Announcement ID")
 async def announce_cancel(interaction: discord.Interaction, sched_id: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can cancel announcements.", ephemeral=True)
     data = load_data()
     if sched_id not in data["scheduled"]: return await interaction.response.send_message(f"❌ No scheduled announcement with ID `{sched_id}`.", ephemeral=True)
@@ -1651,12 +1759,12 @@ async def announce_cancel(interaction: discord.Interaction, sched_id: str):
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
     await interaction.response.send_message(f"Scheduled announcement **{title}** cancelled.", ephemeral=True)
-    await audit(interaction.guild, f"Announcement cancelled: '{title}' by {interaction.user}")
+    await audit(guild, f"Announcement cancelled: '{title}' by {interaction.user}")
 
 
 @bot.tree.command(name="remind", description="[Dev] Send a timed reminder DM to a user.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     user="The server member to remind",
     message="Reminder message body (supports {user} placeholder for their display name)",
@@ -1671,6 +1779,9 @@ async def remind_cmd(
     fire_at: str,
     timezone_str: Optional[str] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction):
         return await interaction.response.send_message("❌ Only devs can set reminders.", ephemeral=True)
 
@@ -1711,7 +1822,7 @@ async def remind_cmd(
         f"⏰ Reminder set for {user.mention} at **{fire_display}**.", ephemeral=True
     )
     await audit(
-        interaction.guild,
+        guild,
         f"[REMIND] Reminder set for {user} ({user.id}) at {fire_display} by {interaction.user}"
     )
 
@@ -1747,15 +1858,18 @@ class IGPostView(discord.ui.View):
 
     @discord.ui.button(label="💬 Comment", style=discord.ButtonStyle.primary, custom_id="ig_comment_btn")
     async def comment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = resolve_guild(interaction)
+        if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
         data = load_data()
         if self.post_id not in data["instagram"]: return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
 
         post = data["instagram"][self.post_id]
         if post.get("thread_id"):
-            thread = interaction.guild.get_thread(post["thread_id"])
+            thread = guild.get_thread(post["thread_id"])
             if thread: return await interaction.response.send_message(f"💬 Thread is already open: {thread.mention}", ephemeral=True)
 
-        ch = interaction.guild.get_channel(post.get("channel_id"))
+        ch = guild.get_channel(post.get("channel_id"))
         if not ch: return await interaction.response.send_message("❌ Original channel not found.", ephemeral=True)
 
         try: msg = await ch.fetch_message(post["message_id"])
@@ -1769,8 +1883,8 @@ class IGPostView(discord.ui.View):
 
 
 @bot.tree.command(name="ig_post", description="Post an Instagram-style photo post as your OC.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(oc_name="Your OC's name", username="Instagram username (no @)", caption="Post caption")
 async def ig_post(
     interaction: discord.Interaction, oc_name: str, username: str, caption: str,
@@ -1785,9 +1899,14 @@ async def ig_post(
     photo9_url: Optional[str] = None, photo9_file: Optional[discord.Attachment] = None,
     photo10_url: Optional[str] = None, photo10_file: Optional[discord.Attachment] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
     data = load_data()
     oc_key = oc_key_of(oc_name)
-    if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+    if oc_key not in data["ocs"]: return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
     pairs = [
         (photo1_url, photo1_file), (photo2_url, photo2_file), (photo3_url, photo3_file), (photo4_url, photo4_file),
@@ -1798,13 +1917,14 @@ async def ig_post(
     photos = []
     for url, file in pairs:
         if file:
-            if not file.content_type or not file.content_type.startswith("image/"): return await interaction.response.send_message("❌ Files must be images.", ephemeral=True)
-            photos.append(file.url)
+            if not file.content_type or not file.content_type.startswith("image/"): return await interaction.followup.send("❌ Files must be images.", ephemeral=True)
+            persistent = await persist_image_attachment(file)
+            photos.append(persistent or file.url)
         elif url:
-            if not valid_image_url(url): return await interaction.response.send_message(f"❌ Invalid image URL: `{url}`", ephemeral=True)
+            if not valid_image_url(url): return await interaction.followup.send(f"❌ Invalid image URL: `{url}`", ephemeral=True)
             photos.append(url)
 
-    if not photos: return await interaction.response.send_message("❌ At least one photo is required.", ephemeral=True)
+    if not photos: return await interaction.followup.send("❌ At least one photo is required.", ephemeral=True)
 
     oc = data["ocs"][oc_key]
     handle = username if username.startswith("@") else f"@{username}"
@@ -1817,10 +1937,10 @@ async def ig_post(
     }
     save_data(data)
 
-    ig_ch = discord.utils.get(interaction.guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
-    if not ig_ch: return await interaction.response.send_message(f"❌ Channel `#{INSTAGRAM_CHANNEL_NAME}` not found.", ephemeral=True)
+    ig_ch = discord.utils.get(guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
+    if not ig_ch: return await interaction.followup.send(f"❌ Channel `#{INSTAGRAM_CHANNEL_NAME}` not found.", ephemeral=True)
 
-    await interaction.response.send_message(f"📸 Posting to {ig_ch.mention}…", ephemeral=True)
+    await interaction.followup.send(f"📸 Posting to {ig_ch.mention}…", ephemeral=True)
 
     view = IGPostView(post_id, likes=0)
     embed = discord.Embed(description=f"**{handle}**  {caption}", color=discord.Color.from_rgb(225, 48, 108), timestamp=now_utc())
@@ -1852,7 +1972,7 @@ async def ig_post(
     data["instagram"][post_id]["channel_id"] = ig_ch.id
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post_final"))
-    await audit(interaction.guild, f"IG post by OC '{oc_name}' by {interaction.user}  post_id={post_id}")
+    await audit(guild, f"IG post by OC '{oc_name}' by {interaction.user}  post_id={post_id}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1947,8 +2067,8 @@ class DevDMView(discord.ui.View):
 
 
 @bot.tree.command(name="dev_dm", description="[Dev] Message users directly.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     message="Message content",
     user="Primary user to message", user2="Optional additional recipient", user3="Optional additional recipient",
@@ -1972,6 +2092,9 @@ async def dev_dm(
     footnote: Optional[str] = None, thumbnail_url: Optional[str] = None, image_url: Optional[str] = None,
     group_name: Optional[str] = None, oc_target: Optional[str] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
     if reply_label and len(reply_label) > 80: return await interaction.response.send_message("❌ reply_label exceeds 80 characters.", ephemeral=True)
     if thumbnail_url and not valid_image_url(thumbnail_url): return await interaction.response.send_message("❌ Invalid thumbnail URL.", ephemeral=True)
@@ -2007,7 +2130,7 @@ async def dev_dm(
             return await interaction.followup.send(
                 f"❌ **{oc_target}** has no registered owner.", ephemeral=True
             )
-        resolved_from_oc = interaction.guild.get_member(oc_t_owner_id)
+        resolved_from_oc = guild.get_member(oc_t_owner_id)
         if not resolved_from_oc:
             return await interaction.followup.send(
                 f"❌ Owner of **{oc_target}** is not in this server.", ephemeral=True
@@ -2029,7 +2152,7 @@ async def dev_dm(
             oc_display = data["ocs"][oc_key]["name"]
             owner_id = data["ocs"][oc_key].get("owner_id")
             if owner_id:
-                member = interaction.guild.get_member(owner_id)
+                member = guild.get_member(owner_id)
                 if member: oc_owner_display = member.display_name
         else:
             warning_msgs.append(f"⚠️ OC '{oc_name}' not found; {{oc}} placeholder will be empty.")
@@ -2051,7 +2174,7 @@ async def dev_dm(
             if not text: return ""
             return _safe_fmt(
                 text,
-                server=interaction.guild.name, user=interaction.user.display_name,
+                server=guild.name, user=interaction.user.display_name,
                 oc=oc_display, oc_owner=oc_owner_display,
                 group=group_name or "", channel=getattr(interaction.channel, "name", ""),
                 date=now_utc().strftime("%B %d, %Y"), recipient=recipient.display_name
@@ -2071,7 +2194,7 @@ async def dev_dm(
         return embed
 
     view = DevDMView(
-        guild_id=interaction.guild.id, dev_id=interaction.user.id,
+        guild_id=guild.id, dev_id=interaction.user.id,
         reply_label=reply_label or "Reply to Dev", reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary)
     ) if require_response else None
 
@@ -2092,7 +2215,7 @@ async def dev_dm(
     if warn_str: result_lines.append(warn_str)
 
     await interaction.followup.send("\n".join(result_lines), ephemeral=True)
-    await audit(interaction.guild, f"Dev DM sent to {[str(r.id) for r in recipients]} by {interaction.user}. Requires response: {require_response}")
+    await audit(guild, f"Dev DM sent to {[str(r.id) for r in recipients]} by {interaction.user}. Requires response: {require_response}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2100,13 +2223,13 @@ async def dev_dm(
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DebutView(discord.ui.View):
-    def __init__(self, guild_id: int, user_id: int, oc_name: str, group_name: str, debut_channel_id: int, custom_channel_message: Optional[str] = None, accept_label: Optional[str] = None, accept_style: Optional[discord.ButtonStyle] = None, decline_label: Optional[str] = None, decline_style: Optional[discord.ButtonStyle] = None):
+    def __init__(self, guild_id: int, user_id: int, oc_name: str, group_name: str, transport_channel_id: int, custom_channel_message: Optional[str] = None, accept_label: Optional[str] = None, accept_style: Optional[discord.ButtonStyle] = None, decline_label: Optional[str] = None, decline_style: Optional[discord.ButtonStyle] = None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.user_id = user_id
         self.oc_name = oc_name
         self.group_name = group_name
-        self.debut_channel_id = debut_channel_id
+        self.transport_channel_id = transport_channel_id
         self.custom_channel_message = custom_channel_message
 
         for child in self.children:
@@ -2122,100 +2245,196 @@ class DebutView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild   = bot.get_guild(self.guild_id)
         member  = guild.get_member(self.user_id) if guild else None
-        channel = guild.get_channel(self.debut_channel_id) if guild else None
+        channel = guild.get_channel(self.transport_channel_id) if guild else None
+        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
 
         if member and channel:
             await channel.set_permissions(member, view_channel=True, send_messages=True)
             if self.custom_channel_message:
-                await channel.send(_safe_fmt(self.custom_channel_message, member=member.mention, oc=self.oc_name, group=self.group_name))
+                await channel.send(_safe_fmt(
+                    self.custom_channel_message,
+                    member=member.mention,
+                    oc=self.oc_name,
+                    group=self.group_name,
+                    user=member.display_name,
+                    server=guild.name if guild else "",
+                    channel=channel.mention
+                ))
 
-            await interaction.response.edit_message(content=f"You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to the debuts channel.", view=None)
+            if debut_log_ch:
+                notif = discord.Embed(
+                    title="✅ Debut Contract Accepted",
+                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**.",
+                    color=discord.Color.green(),
+                    timestamp=now_utc()
+                )
+                notif.add_field(name="OC", value=self.oc_name, inline=True)
+                notif.add_field(name="Group", value=self.group_name, inline=True)
+                notif.add_field(name="Channel Granted", value=channel.mention, inline=True)
+                await debut_log_ch.send(embed=notif)
+
+            await interaction.response.edit_message(
+                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to {channel.mention}.",
+                view=None
+            )
+        elif member:
+            if debut_log_ch:
+                notif = discord.Embed(
+                    title="⚠️ Debut Contract Accepted (Channel Missing)",
+                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned channel was not found.",
+                    color=discord.Color.orange(),
+                    timestamp=now_utc()
+                )
+                notif.add_field(name="OC", value=self.oc_name, inline=True)
+                notif.add_field(name="Group", value=self.group_name, inline=True)
+                await debut_log_ch.send(embed=notif)
+
+            await interaction.response.edit_message(
+                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned target channel could not be found.",
+                view=None
+            )
         else:
             await interaction.response.edit_message(content="❌ Could not complete the debut — server or channel not found.", view=None)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="debut_decline")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild  = bot.get_guild(self.guild_id)
+        member = guild.get_member(self.user_id) if guild else None
+        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
+
+        if debut_log_ch:
+            notif = discord.Embed(
+                title="❌ Debut Contract Declined",
+                description=f"{member.mention if member else f'User {self.user_id}'} declined the debut contract for **{self.oc_name}** in **{self.group_name}**.",
+                color=discord.Color.red(),
+                timestamp=now_utc()
+            )
+            notif.add_field(name="OC", value=self.oc_name, inline=True)
+            notif.add_field(name="Group", value=self.group_name, inline=True)
+            await debut_log_ch.send(embed=notif)
+
         await interaction.response.edit_message(content=f"You declined the debut contract for **{self.oc_name}** in **{self.group_name}**.", view=None)
 
 
 @bot.tree.command(name="debut_notify", description="[Dev] DM a user a debut contract for their OC.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     oc_name="OC name",
     group_name="Group/company name (used as {group} placeholder in title, message, footnote, note fields)",
     message="Custom debut message",
-    channel_message="Message posted in #debuts after acceptance", embed_title="Optional custom title",
+    target_channel="Channel to grant the user access to upon accepting (defaults to #debuts if omitted)",
+    channel_message="Message posted in transport channel after acceptance", embed_title="Optional custom title",
     embed_color="Optional hex color", accept_label="Optional custom accept button label",
     accept_color="Optional accept button color", decline_label="Optional custom decline button label",
     decline_color="Optional decline button color", footnote="Optional custom footer text",
-    oc_placeholder="Optional Note field added to the embed"
+    oc_placeholder="Optional Note field added to the embed. Supports {oc} and {group} placeholders.",
+    oc_name2="Optional additional OC to send a debut contract to",
+    oc_name3="Optional additional OC to send a debut contract to",
+    oc_name4="Optional additional OC to send a debut contract to",
+    oc_name5="Optional additional OC to send a debut contract to"
 )
 async def debut_notify(
     interaction: discord.Interaction, oc_name: str, group_name: str, message: str,
+    target_channel: Optional[discord.TextChannel] = None,
     channel_message: Optional[str] = None, embed_title: Optional[str] = None, embed_color: Optional[str] = None,
     accept_label: Optional[str] = None, accept_color: Optional[str] = None, decline_label: Optional[str] = None,
     decline_color: Optional[str] = None, footnote: Optional[str] = None, oc_placeholder: Optional[str] = None,
+    oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None, oc_name5: Optional[str] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can send debut notifications.", ephemeral=True)
     if accept_label and len(accept_label) > 80: return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
     if decline_label and len(decline_label) > 80: return await interaction.response.send_message("❌ decline_label exceeds 80 characters.", ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
+
     data = load_data()
-    oc_key = oc_key_of(oc_name)
-
-    if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    oc = data["ocs"][oc_key]
-    owner_id = oc.get("owner_id")
-    if not owner_id: return await interaction.response.send_message(f"❌ **{oc_name}** has no registered owner.", ephemeral=True)
-
-    member = interaction.guild.get_member(owner_id)
-    if not member: return await interaction.response.send_message(f"❌ Owner not in this server.", ephemeral=True)
-
     warning_msgs = []
+
     resolved_color = discord.Color.gold()
     if embed_color:
         try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
         except ValueError: warning_msgs.append("⚠️ Invalid color hex, using default.")
 
-    debut_ch = discord.utils.get(interaction.guild.text_channels, name=DEBUT_CHANNEL_NAME)
+    debut_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME)
     if not debut_ch:
-        cat = discord.utils.get(interaction.guild.categories, name="Special")
-        if not cat: cat = await interaction.guild.create_category("Special")
-        debut_ch = await interaction.guild.create_text_channel(
+        cat = discord.utils.get(guild.categories, name="Special")
+        if not cat: cat = await guild.create_category("Special")
+        debut_ch = await guild.create_text_channel(
             DEBUT_CHANNEL_NAME, category=cat,
             overwrites={
-                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.guild.me: discord.PermissionOverwrite(view_channel=True),
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True),
             })
 
-    actual_title = _safe_fmt(embed_title, oc=oc_name, group=group_name) if embed_title else f"Debut Contract  —  {oc_name}  |  {group_name}"
+    transport_ch = target_channel if target_channel else debut_ch
 
-    embed = discord.Embed(title=actual_title, description=_safe_fmt(message, oc=oc_name, group=group_name), color=resolved_color, timestamp=now_utc())
-    if oc.get("profile_picture"): embed.set_thumbnail(url=oc["profile_picture"])
-    embed.add_field(name="OC", value=oc_name, inline=True)
-    embed.add_field(name="Group", value=group_name, inline=True)
+    raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4, oc_name5] if n]
+    successes = []
+    failures  = []
 
-    if oc_placeholder:
-        embed.add_field(name="Note", value=_safe_fmt(oc_placeholder, oc=oc_name, group=group_name), inline=False)
-    if footnote:
-        embed.set_footer(text=_safe_fmt(footnote, oc=oc_name, group=group_name, server=interaction.guild.name))
+    for oc_n in raw_oc_names:
+        oc_key = oc_key_of(oc_n)
+        if oc_key not in data["ocs"]:
+            warning_msgs.append(f"❌ No OC named **{oc_n}** found.")
+            continue
 
-    view = DebutView(
-        guild_id=interaction.guild.id, user_id=member.id, oc_name=oc_name, group_name=group_name,
-        debut_channel_id=debut_ch.id, custom_channel_message=channel_message,
-        accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-        decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger)
-    )
+        oc = data["ocs"][oc_key]
+        owner_id = oc.get("owner_id")
+        if not owner_id:
+            warning_msgs.append(f"❌ **{oc_n}** has no registered owner.")
+            continue
 
-    try:
-        await member.send(content=f"You have received a debut contract for your OC **{oc_name}** to join **{group_name}**. Please accept or decline below.", embed=embed, view=view)
-        warn_str = "\n".join(warning_msgs)
-        if warn_str: warn_str = "\n" + warn_str
-        await interaction.response.send_message(f"✅ Debut contract sent to {member.mention} for **{oc_name}** ({group_name}).{warn_str}", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"❌ Could not DM {member.mention} — they may have DMs disabled.", ephemeral=True)
+        member = guild.get_member(owner_id)
+        if not member:
+            warning_msgs.append(f"❌ Owner of **{oc_n}** is not in this server.")
+            continue
+
+        actual_title = _safe_fmt(embed_title, oc=oc["name"], group=group_name) if embed_title else f"Debut Contract  —  {oc['name']}  |  {group_name}"
+        embed = discord.Embed(title=actual_title, description=_safe_fmt(message, oc=oc["name"], group=group_name), color=resolved_color, timestamp=now_utc())
+        
+        if oc.get("profile_picture"):
+            embed.set_thumbnail(url=oc["profile_picture"])
+        embed.add_field(name="OC", value=oc["name"], inline=True)
+        embed.add_field(name="Group", value=group_name, inline=True)
+        
+        if oc_placeholder:
+            embed.add_field(name="Note", value=_safe_fmt(oc_placeholder, oc=oc["name"], group=group_name), inline=False)
+        if footnote:
+            embed.set_footer(text=_safe_fmt(footnote, oc=oc["name"], group=group_name, server=guild.name))
+
+        view = DebutView(
+            guild_id=guild.id, user_id=member.id,
+            oc_name=oc["name"], group_name=group_name,
+            transport_channel_id=transport_ch.id,
+            custom_channel_message=channel_message,
+            accept_label=accept_label,
+            accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
+            decline_label=decline_label,
+            decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger)
+        )
+
+        try:
+            await member.send(
+                content=f"You have received a debut contract for your OC **{oc['name']}** to join **{group_name}**. Please accept or decline below.",
+                embed=embed,
+                view=view
+            )
+            successes.append(f"{member.mention} (**{oc['name']}**)")
+            await audit(guild, f"Debut contract sent to {member} ({member.id}) for OC '{oc['name']}' group='{group_name}' by {interaction.user}")
+        except discord.Forbidden:
+            failures.append(f"{member.mention} (**{oc['name']}**) — DMs likely disabled")
+
+    result_lines = []
+    if successes: result_lines.append("✅ Sent to: " + ", ".join(successes))
+    if failures:  result_lines.append("❌ Failed: "  + ", ".join(failures))
+    warn_str = "\n".join(dict.fromkeys(warning_msgs))
+    if warn_str: result_lines.append(warn_str)
+
+    await interaction.followup.send("\n".join(result_lines) or "No contracts sent.", ephemeral=True)
 
 
 class GCInviteView(discord.ui.View):
@@ -2271,8 +2490,8 @@ class GCInviteView(discord.ui.View):
 
 
 @bot.tree.command(name="gc_invite", description="Send a group-chat invite to one or more OC owners.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     oc_name="OC to invite", group_name="Display name for GC", message="Custom invitation message",
     target_channel="Existing channel to grant access to",
@@ -2290,7 +2509,10 @@ async def gc_invite(
     decline_label: Optional[str] = None, decline_color: Optional[str] = None,
     oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None, oc_name5: Optional[str] = None,
 ):
-    if not target_channel.permissions_for(interaction.guild.me).manage_permissions:
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
+    if not target_channel.permissions_for(guild.me).manage_permissions:
         return await interaction.response.send_message(f"❌ I lack Manage Permissions in {target_channel.mention}.", ephemeral=True)
     if accept_label and len(accept_label) > 80: return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
     if decline_label and len(decline_label) > 80: return await interaction.response.send_message("❌ decline_label exceeds 80 characters.", ephemeral=True)
@@ -2299,7 +2521,7 @@ async def gc_invite(
 
     raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4, oc_name5] if n]
     data = load_data()
-    dev_ids = [m.id for m in interaction.guild.members if (m.guild_permissions.administrator or m.id == interaction.guild.owner_id) and not m.bot]
+    dev_ids = [m.id for m in guild.members if (m.guild_permissions.administrator or m.id == guild.owner_id) and not m.bot]
 
     warning_msgs = []
     resolved_color = discord.Color.purple()
@@ -2323,13 +2545,13 @@ async def gc_invite(
             warning_msgs.append(f"❌ **{oc_n}** has no registered owner.")
             continue
 
-        member = interaction.guild.get_member(owner_id)
+        member = guild.get_member(owner_id)
         if not member:
             warning_msgs.append(f"❌ Owner of **{oc_n}** not in server.")
             continue
 
         _fmt = {
-            "oc": oc["name"], "group": group_name, "server": interaction.guild.name,
+            "oc": oc["name"], "group": group_name, "server": guild.name,
             "owner": member.display_name, "channel": target_channel.name,
         }
         def _r(text: Optional[str]) -> Optional[str]: return _safe_fmt(text, **_fmt) if text else None
@@ -2351,7 +2573,7 @@ async def gc_invite(
         if _r(footnote): embed.set_footer(text=_r(footnote))
 
         view = GCInviteView(
-            guild_id=interaction.guild.id, invitee_user_id=member.id, oc_key=oc_key, oc_name=oc["name"],
+            guild_id=guild.id, invitee_user_id=member.id, oc_key=oc_key, oc_name=oc["name"],
             group_name=group_name, target_channel_id=target_channel.id, dev_ids=dev_ids,
             accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
             decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
@@ -2360,7 +2582,7 @@ async def gc_invite(
         try:
             await member.send(content=f"You have been invited to add your OC **{oc['name']}** to the group chat **{group_name}**. Accept or decline below.", embed=embed, view=view)
             successes.append(f"{member.mention} ({oc['name']})")
-            await audit(interaction.guild, f"GC invite sent to {member} for OC '{oc['name']}' group '{group_name}' target_channel=#{target_channel.name} by {interaction.user}")
+            await audit(guild, f"GC invite sent to {member} for OC '{oc['name']}' group '{group_name}' target_channel=#{target_channel.name} by {interaction.user}")
         except discord.Forbidden:
             failures.append(f"{member.mention} ({oc['name']})")
 
@@ -2379,10 +2601,13 @@ async def gc_invite(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="oc_dm", description="Open a private DM channel between two OCs.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(your_oc="Your OC's name", target_oc="OC to DM")
 async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data    = load_data()
     src_key = oc_key_of(your_oc)
     tgt_key = oc_key_of(target_oc)
@@ -2395,27 +2620,27 @@ async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
     src_oc       = data["ocs"][src_key]
     tgt_oc       = data["ocs"][tgt_key]
     tgt_owner_id = tgt_oc.get("owner_id")
-    tgt_member   = interaction.guild.get_member(tgt_owner_id) if tgt_owner_id else None
+    tgt_member   = guild.get_member(tgt_owner_id) if tgt_owner_id else None
 
     if dm_key in data["dms"]:
-        existing_ch = interaction.guild.get_channel(data["dms"][dm_key]["channel_id"])
+        existing_ch = guild.get_channel(data["dms"][dm_key]["channel_id"])
         if existing_ch:
             await existing_ch.set_permissions(interaction.user, view_channel=True, send_messages=True)
             if tgt_member: await existing_ch.set_permissions(tgt_member, view_channel=True, send_messages=True)
             return await interaction.response.send_message(f"DM channel: {existing_ch.mention}", ephemeral=True)
 
-    cat = discord.utils.get(interaction.guild.categories, name="OC DMs")
-    if not cat: cat = await interaction.guild.create_category("OC DMs")
+    cat = discord.utils.get(guild.categories, name="OC DMs")
+    if not cat: cat = await guild.create_category("OC DMs")
 
     ch_name    = f"dm-{src_key[:15]}-{tgt_key[:15]}"
     overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True),
         interaction.user:               discord.PermissionOverwrite(view_channel=True, send_messages=True),
     }
     if tgt_member: overwrites[tgt_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-    channel = await interaction.guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
+    channel = await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
     data["dms"][dm_key] = {"participants": [src_key, tgt_key], "channel_id": channel.id, "created_at": now_iso()}
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="oc_dm"))
@@ -2427,7 +2652,7 @@ async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
     )
     await channel.send(embed=embed)
     await interaction.response.send_message(f"DM channel created: {channel.mention}", ephemeral=True)
-    await audit(interaction.guild, f"OC DM opened: '{your_oc}' <-> '{target_oc}' by {interaction.user}")
+    await audit(guild, f"OC DM opened: '{your_oc}' <-> '{target_oc}' by {interaction.user}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2435,8 +2660,8 @@ async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="oc_groupchat", description="Create a group chat channel between multiple OCs.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     your_oc="Your OC", group_name="Group name",
     target_oc1="OC #1", target_oc2="OC #2", target_oc3="OC #3 (optional)",
@@ -2447,6 +2672,9 @@ async def oc_groupchat(
     target_oc1: str, target_oc2: str, target_oc3: Optional[str] = None,
     target_oc4: Optional[str] = None, target_oc5: Optional[str] = None,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data    = load_data()
     src_key = oc_key_of(your_oc)
 
@@ -2465,25 +2693,25 @@ async def oc_groupchat(
     if dupes: return await interaction.response.send_message(f"❌ Duplicate OC(s): {', '.join(f'**{d}**' for d in dupes)}", ephemeral=True)
 
     all_keys = [src_key] + target_keys
-    cat = discord.utils.get(interaction.guild.categories, name="OC Group Chats")
-    if not cat: cat = await interaction.guild.create_category("OC Group Chats")
+    cat = discord.utils.get(guild.categories, name="OC Group Chats")
+    if not cat: cat = await guild.create_category("OC Group Chats")
 
     ch_name    = "gc-" + group_name.lower().replace(" ", "-")[:28]
     overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.guild.me:           discord.PermissionOverwrite(view_channel=True),
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(view_channel=True),
         interaction.user:               discord.PermissionOverwrite(view_channel=True, send_messages=True),
     }
     members_added = [interaction.user]
     for oc_k in target_keys:
         owner_id = data["ocs"][oc_k].get("owner_id")
         if owner_id:
-            m = interaction.guild.get_member(owner_id)
+            m = guild.get_member(owner_id)
             if m and m not in members_added:
                 overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
                 members_added.append(m)
 
-    channel = await interaction.guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
+    channel = await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
 
     gc_id = f"gc_{int(now_utc().timestamp())}_{src_key[:8]}"
     data["groupchats"][gc_id] = {
@@ -2500,12 +2728,12 @@ async def oc_groupchat(
     )
     await channel.send(embed=embed)
     await interaction.response.send_message(f"Group chat **{group_name}** created: {channel.mention}", ephemeral=True)
-    await audit(interaction.guild, f"Group chat '{group_name}' created with [{oc_names_str}] by {interaction.user}")
+    await audit(guild, f"Group chat '{group_name}' created with [{oc_names_str}] by {interaction.user}")
 
 
 @bot.tree.command(name="oc_groupchat_add", description="Add an OC to an existing OC group chat channel.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     target_channel="The existing group chat channel to add the OC to",
     new_oc="Name of the OC to add to the group chat"
@@ -2515,6 +2743,9 @@ async def oc_groupchat_add(
     target_channel: discord.TextChannel,
     new_oc: str,
 ):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     data = load_data()
     new_oc_key = oc_key_of(new_oc)
 
@@ -2545,7 +2776,7 @@ async def oc_groupchat_add(
     new_owner_mention = f"<@{new_owner_id}>" if new_owner_id else "Unknown"
 
     if new_owner_id:
-        new_owner_member = interaction.guild.get_member(new_owner_id)
+        new_owner_member = guild.get_member(new_owner_id)
         if new_owner_member:
             await target_channel.set_permissions(new_owner_member, view_channel=True, send_messages=True)
 
@@ -2564,7 +2795,7 @@ async def oc_groupchat_add(
 
     await target_channel.send(embed=embed)
     await interaction.response.send_message(f"✅ **{new_oc}** added to {target_channel.mention}.", ephemeral=True)
-    await audit(interaction.guild, f"OC '{new_oc}' added to group chat #{target_channel.name} by {interaction.user}")
+    await audit(guild, f"OC '{new_oc}' added to group chat #{target_channel.name} by {interaction.user}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2646,10 +2877,11 @@ async def help_cmd(interaction: discord.Interaction):
             "`/send_embed` — Post a custom embed to any channel\n"
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
-            "`/debut_notify` — Send a debut contract DM\n"
+            "`/debut_notify` — Send debut contract to 1–5 OCs, with custom transport channel support\n"
             "`/dev_dm` — Message up to 5 users directly\n"
             "`/remind` — Set a timed reminder for a user\n"
             "`/startup` — Re-sync commands and restart task loops\n"
+            "`/refresh_assets` — Re-upload any expired CDN attachment URLs (OC pictures, IG posts)\n"
         ))
         embed2.add_field(name="Notes", inline=False, value=(
             f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
@@ -2661,8 +2893,10 @@ async def help_cmd(interaction: discord.Interaction):
             f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
             f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
             f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
+            f"Asset channel: `#{ASSET_CHANNEL_NAME}` (auto-created, stores persistent image uploads)\n"
             f"Scheduled time format: YYYY-MM-DD HH:MM (specify timezone; default UTC)\n"
             f"Up to {MAX_PHOTOS} photos per Instagram post\n"
+            f"PRIMARY_GUILD_ID env var required for DM command context resolution\n"
         ))
         
         embed1.set_footer(text="Use ◀ ▶ to navigate pages.")
@@ -2675,7 +2909,7 @@ async def help_cmd(interaction: discord.Interaction):
         embed1 = discord.Embed(title="OC Bot — Command Reference [1/2]", color=discord.Color.gold())
         embed1.add_field(name="OC Management", inline=False, value=(
             "`/oc_add` — Register a new OC\n"
-            "`/oc_edit` — Edit OC fields)\n"
+            "`/oc_edit` — Edit OC fields\n"
             "`/oc_delete` — Delete your OC entirely\n"
             "`/oc_list` — Browse/filter OCs with interactive paginator\n"
             "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
@@ -2713,6 +2947,93 @@ async def help_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed2, ephemeral=True)
 
 
+# ─── New Dev Command: Refresh Assets ───────────────────────────────────────────
+@bot.tree.command(name="refresh_assets", description="[Dev] Re-upload any expired CDN attachment URLs for OC pictures and IG posts.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def refresh_assets_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+    refreshed = 0
+    failed = 0
+
+    def _is_cdn_attachment(url: str) -> bool:
+        """Heuristic: is this a raw Discord CDN attachment link (not a user-supplied direct URL)?"""
+        return bool(url and "cdn.discordapp.com/attachments/" in url)
+
+    # -- OC profile pictures --
+    for oc_key, oc in data["ocs"].items():
+        url = oc.get("profile_picture", "")
+        if _is_cdn_attachment(url):
+            try:
+                # Fetch the image bytes directly via HTTP since the URL may still be valid
+                async with bot.http._HTTPClient__session.get(url) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        content_type = resp.headers.get("Content-Type", "image/png")
+                        ext = content_type.split("/")[-1].split(";")[0] or "png"
+                        file_obj = discord.File(io.BytesIO(img_bytes), filename=f"oc_{oc_key}.{ext}")
+                        for guild in bot.guilds:
+                            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+                            if ch:
+                                msg = await ch.send(file=file_obj)
+                                if msg.attachments:
+                                    oc["profile_picture"] = msg.attachments[0].url
+                                    refreshed += 1
+                                    break
+                    else:
+                        failed += 1
+            except Exception as e:
+                log.warning("refresh_assets: OC '%s' profile picture failed: %s", oc_key, e)
+                failed += 1
+
+    # -- Instagram post photos --
+    for post_id, post in data["instagram"].items():
+        new_photos = []
+        for photo_url in post.get("photos", []):
+            if _is_cdn_attachment(photo_url):
+                try:
+                    async with bot.http._HTTPClient__session.get(photo_url) as resp:
+                        if resp.status == 200:
+                            img_bytes = await resp.read()
+                            content_type = resp.headers.get("Content-Type", "image/png")
+                            ext = content_type.split("/")[-1].split(";")[0] or "png"
+                            file_obj = discord.File(io.BytesIO(img_bytes), filename=f"ig_{post_id}.{ext}")
+                            for guild in bot.guilds:
+                                ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+                                if ch:
+                                    msg = await ch.send(file=file_obj)
+                                    if msg.attachments:
+                                        new_photos.append(msg.attachments[0].url)
+                                        refreshed += 1
+                                        break
+                        else:
+                            new_photos.append(photo_url)
+                            failed += 1
+                except Exception as e:
+                    log.warning("refresh_assets: IG post '%s' photo failed: %s", post_id, e)
+                    new_photos.append(photo_url)
+                    failed += 1
+            else:
+                new_photos.append(photo_url)
+        post["photos"] = new_photos
+
+    await save_and_backup(data, reason="refresh_assets")
+
+    embed = discord.Embed(
+        title="🔄 Asset Refresh Complete",
+        color=discord.Color.green() if not failed else discord.Color.orange(),
+        timestamp=now_utc()
+    )
+    embed.add_field(name="✅ Refreshed", value=str(refreshed), inline=True)
+    embed.add_field(name="❌ Failed", value=str(failed), inline=True)
+    embed.set_footer(text=f"Run by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ─── Shutdown & Emergency Backup ───────────────────────────────────────────────
 def _handle_shutdown(signum, frame):
     log.info("Shutdown signal received (signal %s). Running emergency backup…", signum)
@@ -2736,9 +3057,12 @@ async def _emergency_backup():
 
 
 @bot.tree.command(name="startup", description="[Dev] Manually revive the bot: re-sync commands and restart task loops.")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def startup_cmd(interaction: discord.Interaction):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
 
@@ -2781,7 +3105,7 @@ async def startup_cmd(interaction: discord.Interaction):
     embed.set_footer(text=f"Initiated by {interaction.user} ({interaction.user.id})")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
-    await audit(interaction.guild, f"[STARTUP] Manual startup executed by {interaction.user}")
+    await audit(guild, f"[STARTUP] Manual startup executed by {interaction.user}")
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
