@@ -2343,7 +2343,7 @@ class CombinedNotifyView(discord.ui.View):
 
 @bot.tree.command(
     name="dev_notify",
-    description="[Dev] Send a structured notification DM to one or more OCs or users. Choose from Selection, Q&A, or Custom type."
+    description="[Dev] Send a DM to one or more OCs or users. Choose from three types."
 )
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
