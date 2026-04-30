@@ -97,31 +97,41 @@ TIMEZONE_CHOICES = [
 def _sanitize_data(d: dict) -> dict:
     """
     Coerce any top-level collection that must be a dict but was deserialized
-    as a list (corrupt / legacy JSON) back into a dict so .items() never
-    raises AttributeError: 'list' object has no attribute 'items'.
+    as a list (corrupt / legacy JSON) back into an empty dict so .items()
+    never raises AttributeError: 'list' object has no attribute 'items'.
     Also sanitises nested floor→rooms and room→occupants shapes.
     """
-    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
+    TOP_LEVEL_DICTS = ("ocs", "floors", "dorms", "instagram", "dms",
+                       "groupchats", "scheduled", "reminders")
+
+    for k in TOP_LEVEL_DICTS:
         d.setdefault(k, {})
-        if isinstance(d[k], list):
-            log.warning("load_data: '%s' was a list in stored data — resetting to empty dict.", k)
+        if not isinstance(d[k], dict):
+            log.warning(
+                "load_data: '%s' was %s in stored data — resetting to empty dict.",
+                k, type(d[k]).__name__
+            )
             d[k] = {}
 
+    # Sanitise floors → rooms → occupants
     for f_key, floor in list(d["floors"].items()):
         if not isinstance(floor, dict):
             log.warning("load_data: floor '%s' is not a dict — removing.", f_key)
             del d["floors"][f_key]
             continue
-        # rooms must be a dict {room_key: room_dict}
         if not isinstance(floor.get("rooms"), dict):
             log.warning(
                 "load_data: floor '%s'.rooms is %s, not dict — resetting to {}.",
                 f_key, type(floor.get("rooms")).__name__
             )
             floor["rooms"] = {}
-        # every room's occupants must be a list
-        for r_key, room in floor["rooms"].items():
+        for r_key, room in list(floor["rooms"].items()):
             if not isinstance(room, dict):
+                log.warning(
+                    "load_data: floor '%s' room '%s' is not a dict — removing.",
+                    f_key, r_key
+                )
+                del floor["rooms"][r_key]
                 continue
             if not isinstance(room.get("occupants"), list):
                 log.warning(
@@ -129,6 +139,30 @@ def _sanitize_data(d: dict) -> dict:
                     f_key, r_key
                 )
                 room["occupants"] = []
+
+    # Sanitise instagram posts
+    for post_id, post in list(d["instagram"].items()):
+        if not isinstance(post, dict):
+            log.warning("load_data: instagram post '%s' is not a dict — removing.", post_id)
+            del d["instagram"][post_id]
+            continue
+        if not isinstance(post.get("photos"), list):
+            post["photos"] = []
+
+    # Sanitise dms and groupchats
+    for top_key in ("dms", "groupchats"):
+        for entry_id, entry in list(d[top_key].items()):
+            if not isinstance(entry, dict):
+                log.warning("load_data: %s entry '%s' is not a dict — removing.", top_key, entry_id)
+                del d[top_key][entry_id]
+
+    # Sanitise scheduled and reminders
+    for top_key in ("scheduled", "reminders"):
+        for entry_id, entry in list(d[top_key].items()):
+            if not isinstance(entry, dict):
+                log.warning("load_data: %s entry '%s' is not a dict — removing.", top_key, entry_id)
+                del d[top_key][entry_id]
+
     return d
 
 
@@ -239,6 +273,9 @@ async def persist_image_attachment(
 def _validate_backup(parsed: dict) -> bool:
     if not isinstance(parsed, dict):
         return False
+    for key in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
+        if key in parsed and not isinstance(parsed[key], dict):
+            return False  # Reject list-shaped top-level collections
     if "ocs" in parsed:
         for v in parsed["ocs"].values():
             if not isinstance(v, dict):
@@ -460,10 +497,16 @@ def _build_available_rooms_text(data: dict) -> str:
             log.warning("_build_available_rooms_text: floor '%s'.rooms is not a dict, skipping.", f_key)
             continue
         for r_key, room in rooms.items():
-            occ   = len(room.get("occupants", []))
+            if not isinstance(room, dict):
+                continue
+            occupants = room.get("occupants", [])
+            if not isinstance(occupants, list):
+                room["occupants"] = []
+                occupants = []
+            occ   = len(occupants)
             cap   = room.get("capacity", 0)
             if occ < cap:
-                lines.append(f"**{floor['name']}** → {room['name']} [{occ}/{cap} spots taken]")
+                lines.append(f"**{floor.get('name', f_key)}** → {room.get('name', r_key)} [{occ}/{cap} spots taken]")
     return "\n".join(lines) if lines else "No rooms available."
 
 def _build_displaced_dm_embed(
@@ -578,12 +621,13 @@ async def on_ready():
                                         break
                                     for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
                                         parsed.setdefault(k, {})
+                                    parsed = _sanitize_data(parsed)
                                 except (json.JSONDecodeError, ValueError) as e:
                                     log.error(f"Backup file is corrupt, skipping restore: {e}")
                                     break
                                 
-                                with open(DATA_FILE, "wb") as f:
-                                    f.write(file_bytes)
+                                with open(DATA_FILE, "w", encoding="utf-8") as f:
+                                    json.dump(parsed, f, indent=2, ensure_ascii=False)
                                 log.info("Restored from backup — message_id=%s guild=%s", message.id, guild.id)
                                 break
                 except Exception as e:
@@ -700,16 +744,18 @@ async def check_birthdays():
 async def check_scheduled():
     data    = load_data()
     now     = now_utc()
-    to_fire = [k for k, v in data["scheduled"].items()
-               if datetime.fromisoformat(v["fire_at"]) <= now and not v.get("fired")]
+    scheduled = data.get("scheduled", {})
+    if not isinstance(scheduled, dict): return
+    to_fire = [k for k, v in scheduled.items()
+               if isinstance(v, dict) and "fire_at" in v and datetime.fromisoformat(v["fire_at"]) <= now and not v.get("fired")]
     if not to_fire: return
     for sched_key in to_fire:
-        entry = data["scheduled"][sched_key]
+        entry = scheduled[sched_key]
         for guild in bot.guilds:
-            ch = discord.utils.get(guild.text_channels, name=entry["channel"])
+            ch = discord.utils.get(guild.text_channels, name=entry.get("channel", ""))
             if not ch: continue
             embed = discord.Embed(
-                title=entry["title"], description=entry["content"],
+                title=entry.get("title", ""), description=entry.get("content", ""),
                 color=discord.Color.blurple(), timestamp=now,
             )
             if entry.get("image_url"):
@@ -726,28 +772,34 @@ async def check_scheduled():
 async def check_reminders():
     data = load_data()
     reminders = data.get("reminders", {})
+    if not isinstance(reminders, dict): return
     now = now_utc()
     dirty = False
 
     for rid, reminder in list(reminders.items()):
+        if not isinstance(reminder, dict): continue
         if reminder.get("fired"):
             continue
-        fire_at = datetime.fromisoformat(reminder["fire_at"])
+        if "fire_at" not in reminder: continue
+        try:
+            fire_at = datetime.fromisoformat(reminder["fire_at"])
+        except ValueError:
+            continue
         if now >= fire_at:
             for guild in bot.guilds:
-                member = guild.get_member(reminder["user_id"])
+                member = guild.get_member(reminder.get("user_id"))
                 if member:
                     try:
                         embed = discord.Embed(
                             title="⏰ Reminder",
-                            description=reminder["message"],
+                            description=reminder.get("message", ""),
                             color=discord.Color.blurple(),
                             timestamp=now_utc(),
                         )
                         embed.set_footer(text="Set by a server admin.")
                         await member.send(embed=embed)
                     except (discord.Forbidden, discord.HTTPException) as e:
-                        log.warning("check_reminders: could not DM user %s: %s", reminder["user_id"], e)
+                        log.warning("check_reminders: could not DM user %s: %s", reminder.get("user_id"), e)
                     break
 
             reminder["fired"] = True
@@ -932,8 +984,16 @@ async def oc_edit(
     if new_key != key:
         data["ocs"][new_key] = data["ocs"].pop(key)
         for floor in data["floors"].values():
-            for room in floor["rooms"].values():
-                if key in room["occupants"]:
+            if not isinstance(floor, dict): continue
+            rooms = floor.get("rooms", {})
+            if not isinstance(rooms, dict): continue
+            for room in rooms.values():
+                if not isinstance(room, dict): continue
+                occupants = room.get("occupants", [])
+                if not isinstance(occupants, list):
+                    room["occupants"] = []
+                    occupants = []
+                if key in occupants:
                     room["occupants"].remove(key)
                     room["occupants"].append(new_key)
 
@@ -963,12 +1023,27 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
             
     del data["ocs"][key]
     for floor in data["floors"].values():
-        for room in floor.get("rooms", {}).values():
-            if key in room.get("occupants", []): room["occupants"].remove(key)
+        if not isinstance(floor, dict): continue
+        rooms = floor.get("rooms", {})
+        if not isinstance(rooms, dict): continue
+        for room in rooms.values():
+            if not isinstance(room, dict): continue
+            occupants = room.get("occupants", [])
+            if not isinstance(occupants, list):
+                room["occupants"] = []
+                occupants = []
+            if key in occupants:
+                room["occupants"].remove(key)
     for gc in data["groupchats"].values():
-        if key in gc.get("participants", []): gc["participants"].remove(key)
+        if not isinstance(gc, dict): continue
+        participants = gc.get("participants", [])
+        if not isinstance(participants, list): gc["participants"] = []
+        elif key in participants: gc["participants"].remove(key)
     for dm in data["dms"].values():
-        if key in dm.get("participants", []): dm["participants"].remove(key)
+        if not isinstance(dm, dict): continue
+        participants = dm.get("participants", [])
+        if not isinstance(participants, list): dm["participants"] = []
+        elif key in participants: dm["participants"].remove(key)
             
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="oc_delete"))
@@ -1202,9 +1277,16 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
     floor_data = data["floors"].pop(f_key)
     
     displaced: dict[str, list[str]] = {}
-    for r_key, room_data in floor_data["rooms"].items():
-        for oc_key in room_data.get("occupants", []):
-            displaced.setdefault(oc_key, []).append(room_data["name"])
+    rooms = floor_data.get("rooms", {})
+    if isinstance(rooms, dict):
+        for r_key, room_data in rooms.items():
+            if not isinstance(room_data, dict): continue
+            occupants = room_data.get("occupants", [])
+            if not isinstance(occupants, list):
+                room_data["occupants"] = []
+                occupants = []
+            for oc_key in occupants:
+                displaced.setdefault(oc_key, []).append(room_data["name"])
             
     category = discord.utils.get(guild.categories, name=floor_data["name"])
     if category:
@@ -1246,7 +1328,7 @@ async def floor_delete(interaction: discord.Interaction, floor_name: str, confir
             
     dev_embed = discord.Embed(title="🗑️ Floor Deleted", color=discord.Color.red(), timestamp=now_utc())
     dev_embed.add_field(name="Floor", value=floor_data["name"], inline=True)
-    dev_embed.add_field(name="Rooms Deleted", value=f"{len(floor_data['rooms'])}", inline=True)
+    dev_embed.add_field(name="Rooms Deleted", value=f"{len(floor_data.get('rooms', {})) if isinstance(floor_data.get('rooms'), dict) else 0}", inline=True)
     if displaced_bullets: dev_embed.add_field(name="OCs Displaced", value=f"{oc_count}\n" + "\n".join(displaced_bullets), inline=False)
     else: dev_embed.add_field(name="OCs Displaced", value="0", inline=False)
         
@@ -1341,7 +1423,11 @@ async def dorm_edit(
         return await interaction.response.send_message(f"❌ No room named **{room_name}** found on **{floor_name}**.", ephemeral=True)
 
     room_data = floor["rooms"][old_rkey]
-    current_occupant_count = len(room_data.get("occupants", []))
+    occupants = room_data.get("occupants", [])
+    if not isinstance(occupants, list):
+        room_data["occupants"] = []
+        occupants = []
+    current_occupant_count = len(occupants)
     changes = []
 
     if new_capacity is not None:
@@ -1441,7 +1527,7 @@ async def dorm_relocate(interaction: discord.Interaction, room_name: str, source
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_relocate"))
 
-    occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"]) or "None"
+    occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data.get("occupants", []) if o in data["ocs"]) or "None"
     embed = discord.Embed(title="Dorm Relocated", color=discord.Color.green(), timestamp=now_utc())
     embed.add_field(name="Room", value=room_data["name"], inline=True)
     embed.add_field(name="Moved From", value=data["floors"][src_fkey]["name"], inline=True)
@@ -1506,11 +1592,24 @@ async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name
     if r_key not in floor["rooms"]: return await interaction.response.send_message(f"❌ Room **{room_name}** does not exist.", ephemeral=True)
 
     for f_k, f_v in data["floors"].items():
-        for r_k, r_v in f_v["rooms"].items():
-            if oc_key in r_v["occupants"]: return await interaction.response.send_message(f"❌ **{oc_name}** is already assigned to a room.", ephemeral=True)
+        if not isinstance(f_v, dict): continue
+        rooms = f_v.get("rooms", {})
+        if not isinstance(rooms, dict): continue
+        for r_k, r_v in rooms.items():
+            if not isinstance(r_v, dict): continue
+            occupants = r_v.get("occupants", [])
+            if not isinstance(occupants, list):
+                r_v["occupants"] = []
+                occupants = []
+            if oc_key in occupants: return await interaction.response.send_message(f"❌ **{oc_name}** is already assigned to a room.", ephemeral=True)
 
     room_data = floor["rooms"][r_key]
-    if len(room_data["occupants"]) >= room_data["capacity"]:
+    occupants = room_data.get("occupants", [])
+    if not isinstance(occupants, list):
+        room_data["occupants"] = []
+        occupants = []
+    
+    if len(occupants) >= room_data.get("capacity", 0):
         return await interaction.response.send_message(f"❌ **{room_name}** is full.", ephemeral=True)
 
     room_data["occupants"].append(oc_key)
@@ -1525,7 +1624,7 @@ async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name
     await interaction.response.send_message(f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n👥 Occupants: {occupants_display}", ephemeral=True)
     await audit(guild, f"OC '{oc_name}' assigned to '{room_name}' by {interaction.user}")
 
-    if len(room_data["occupants"]) == room_data["capacity"]:
+    if len(room_data["occupants"]) == room_data.get("capacity", 0):
         log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_ch:
             occupants_names = [
@@ -1562,17 +1661,25 @@ async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
     if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
 
     for f_key, floor in data["floors"].items():
-        for r_key, room_data in floor["rooms"].items():
-            if oc_key in room_data["occupants"]:
+        if not isinstance(floor, dict): continue
+        rooms = floor.get("rooms", {})
+        if not isinstance(rooms, dict): continue
+        for r_key, room_data in rooms.items():
+            if not isinstance(room_data, dict): continue
+            occupants = room_data.get("occupants", [])
+            if not isinstance(occupants, list):
+                room_data["occupants"] = []
+                occupants = []
+            if oc_key in occupants:
                 room_data["occupants"].remove(oc_key)
                 save_data(data)
                 asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_unassign"))
                 
-                category = discord.utils.get(guild.categories, name=floor["name"])
+                category = discord.utils.get(guild.categories, name=floor.get("name", "Unknown"))
                 ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
                 if ch: await ch.set_permissions(interaction.user, overwrite=None)
                     
-                await interaction.response.send_message(f"🚶 **{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.", ephemeral=True)
+                await interaction.response.send_message(f"🚶 **{oc_name}** removed from **{room_data.get('name', r_key)}** on **{floor.get('name', f_key)}**.", ephemeral=True)
                 await audit(guild, f"OC '{oc_name}' unassigned by {interaction.user}")
                 return
 
@@ -1599,13 +1706,21 @@ async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_n
 
     removed = []
     for f_key, floor in data["floors"].items():
-        for r_key, room_data in floor["rooms"].items():
+        if not isinstance(floor, dict): continue
+        rooms = floor.get("rooms", {})
+        if not isinstance(rooms, dict): continue
+        for r_key, room_data in rooms.items():
+            if not isinstance(room_data, dict): continue
+            occupants = room_data.get("occupants", [])
+            if not isinstance(occupants, list):
+                room_data["occupants"] = []
+                occupants = []
             for oc_k in candidate_keys:
-                if oc_k in room_data["occupants"]:
+                if oc_k in occupants:
                     room_data["occupants"].remove(oc_k)
-                    removed.append((data["ocs"][oc_k]["name"], floor["name"], room_data["name"]))
+                    removed.append((data["ocs"][oc_k]["name"], floor.get("name", "Unknown"), room_data.get("name", r_key)))
 
-                    category = discord.utils.get(guild.categories, name=floor["name"])
+                    category = discord.utils.get(guild.categories, name=floor.get("name", "Unknown"))
                     ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
                     if ch:
                         try: await ch.set_permissions(user, overwrite=None)
@@ -1628,21 +1743,25 @@ class DormPaginatorView(discord.ui.View):
         self.ocs = ocs
         self.current_index = 0
 
-        options = [
-            discord.SelectOption(
-                label=floor["name"][:100],
+        options = []
+        for i, (_, floor) in enumerate(floors_items[:25]):
+            if not isinstance(floor, dict):
+                continue
+            rooms_val = floor.get('rooms', {})
+            room_count = len(rooms_val) if isinstance(rooms_val, dict) else 0
+            options.append(discord.SelectOption(
+                label=floor.get("name", str(i))[:100],
                 value=str(i),
-                description=f"{len(floor['rooms'])} room(s)",
+                description=f"{room_count} room(s)",
                 default=(i == 0),
-            )
-            for i, (_, floor) in enumerate(floors_items[:25])
-        ]
+            ))
+            
         if len(floors_items) > 25:
             log.warning("dorm_view: more than 25 floors; dropdown truncated to 25.")
 
         self.floor_select = discord.ui.Select(
             placeholder="Select a floor…",
-            options=options,
+            options=options if options else [discord.SelectOption(label="None", value="0")],
             min_values=1,
             max_values=1,
             custom_id="dorm_floor_select",
@@ -1662,19 +1781,28 @@ class DormPaginatorView(discord.ui.View):
             return discord.Embed(title="No Floors", description="No floors have been created yet.")
             
         f_key, floor = self.floors[self.current_index]
-        embed = discord.Embed(title=f"Floor: {floor['name']}", color=discord.Color.green())
+        if not isinstance(floor, dict):
+            return discord.Embed(title="Error", description="Invalid floor data.")
+        embed = discord.Embed(title=f"Floor: {floor.get('name', 'Unknown')}", color=discord.Color.green())
         
-        if not floor["rooms"]:
+        rooms = floor.get("rooms", {})
+        if not isinstance(rooms, dict): rooms = {}
+        if not rooms:
             embed.description = "🪑 No rooms added yet. Use `/dorm_create` to add some."
             
-        for r_key, room_data in floor["rooms"].items():
-            occupants = [self.ocs[o]["name"] for o in room_data["occupants"] if o in self.ocs]
-            is_full   = len(room_data["occupants"]) >= room_data["capacity"]
+        for r_key, room_data in rooms.items():
+            if not isinstance(room_data, dict): continue
+            occupants = room_data.get("occupants", [])
+            if not isinstance(occupants, list):
+                room_data["occupants"] = []
+                occupants = []
+            occupant_names = [self.ocs[o]["name"] for o in occupants if o in self.ocs]
+            is_full   = len(occupants) >= room_data.get("capacity", 0)
             status    = "🔴 Full" if is_full else "🟢 Available"
-            occ_str   = ("🏠 " + ", ".join(occupants)) if occupants else "🪑 Empty"
+            occ_str   = ("🏠 " + ", ".join(occupant_names)) if occupant_names else "🪑 Empty"
             
             embed.add_field(
-                name=f"🚪 {room_data['name']}  [{len(room_data['occupants'])}/{room_data['capacity']}]  {status}",
+                name=f"🚪 {room_data.get('name', r_key)}  [{len(occupants)}/{room_data.get('capacity', 0)}]  {status}",
                 value=occ_str, inline=False)
                 
         embed.set_footer(text=f"Floor {self.current_index + 1} of {len(self.floors)}")
@@ -1871,13 +1999,16 @@ async def announce_schedule(
 async def announce_list(interaction: discord.Interaction):
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can view scheduled announcements.", ephemeral=True)
     data = load_data()
-    pending = {k: v for k, v in data["scheduled"].items() if not v.get("fired")}
+    pending = {k: v for k, v in data.get("scheduled", {}).items() if isinstance(v, dict) and not v.get("fired")}
     if not pending: return await interaction.response.send_message("No pending scheduled announcements.", ephemeral=True)
 
     embed = discord.Embed(title="Scheduled Announcements", color=discord.Color.blurple())
-    for k, v in sorted(pending.items(), key=lambda x: x[1]["fire_at"]):
-        fire_utc = datetime.fromisoformat(v["fire_at"])
-        embed.add_field(name=v["title"], value=f"Posts at: {fire_utc.strftime('%Y-%m-%d %H:%M UTC')}\nChannel: #{v['channel']}\nID: `{k}`", inline=False)
+    for k, v in sorted(pending.items(), key=lambda x: x[1].get("fire_at", "")):
+        try:
+            fire_utc = datetime.fromisoformat(v["fire_at"])
+            embed.add_field(name=v.get("title", "Untitled"), value=f"Posts at: {fire_utc.strftime('%Y-%m-%d %H:%M UTC')}\nChannel: #{v.get('channel', 'unknown')}\nID: `{k}`", inline=False)
+        except Exception:
+            pass
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1891,9 +2022,9 @@ async def announce_cancel(interaction: discord.Interaction, sched_id: str):
 
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can cancel announcements.", ephemeral=True)
     data = load_data()
-    if sched_id not in data["scheduled"]: return await interaction.response.send_message(f"❌ No scheduled announcement with ID `{sched_id}`.", ephemeral=True)
+    if sched_id not in data.get("scheduled", {}): return await interaction.response.send_message(f"❌ No scheduled announcement with ID `{sched_id}`.", ephemeral=True)
 
-    title = data["scheduled"][sched_id]["title"]
+    title = data["scheduled"][sched_id].get("title", "Untitled")
     del data["scheduled"][sched_id]
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
@@ -2014,7 +2145,7 @@ class IGPostView(discord.ui.View):
         try: msg = await ch.fetch_message(post["message_id"])
         except discord.NotFound: return await interaction.response.send_message("❌ Original message not found.", ephemeral=True)
 
-        thread = await msg.create_thread(name=f"Comments — {post['username']}", auto_archive_duration=10080)
+        thread = await msg.create_thread(name=f"Comments — {post.get('username', 'Unknown')}", auto_archive_duration=10080)
         post["thread_id"] = thread.id
         save_data(data)
         asyncio.ensure_future(push_backup_to_discord(data, reason="ig_comment_btn"))
@@ -3655,11 +3786,13 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
             ch = discord.utils.get(guild.text_channels, name=ch_name)
             if ch:
                 channels_to_scan.append(ch)
-        for entry in data["dms"].values():
+        for entry in data.get("dms", {}).values():
+            if not isinstance(entry, dict): continue
             ch = guild.get_channel(entry.get("channel_id", 0))
             if isinstance(ch, discord.TextChannel):
                 channels_to_scan.append(ch)
-        for entry in data["groupchats"].values():
+        for entry in data.get("groupchats", {}).values():
+            if not isinstance(entry, dict): continue
             ch = guild.get_channel(entry.get("channel_id", 0))
             if isinstance(ch, discord.TextChannel):
                 channels_to_scan.append(ch)
