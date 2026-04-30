@@ -94,15 +94,51 @@ TIMEZONE_CHOICES = [
 ]
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+def _sanitize_data(d: dict) -> dict:
+    """
+    Coerce any top-level collection that must be a dict but was deserialized
+    as a list (corrupt / legacy JSON) back into a dict so .items() never
+    raises AttributeError: 'list' object has no attribute 'items'.
+    Also sanitises nested floor→rooms and room→occupants shapes.
+    """
+    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
+        d.setdefault(k, {})
+        if isinstance(d[k], list):
+            log.warning("load_data: '%s' was a list in stored data — resetting to empty dict.", k)
+            d[k] = {}
+
+    for f_key, floor in list(d["floors"].items()):
+        if not isinstance(floor, dict):
+            log.warning("load_data: floor '%s' is not a dict — removing.", f_key)
+            del d["floors"][f_key]
+            continue
+        # rooms must be a dict {room_key: room_dict}
+        if not isinstance(floor.get("rooms"), dict):
+            log.warning(
+                "load_data: floor '%s'.rooms is %s, not dict — resetting to {}.",
+                f_key, type(floor.get("rooms")).__name__
+            )
+            floor["rooms"] = {}
+        # every room's occupants must be a list
+        for r_key, room in floor["rooms"].items():
+            if not isinstance(room, dict):
+                continue
+            if not isinstance(room.get("occupants"), list):
+                log.warning(
+                    "load_data: floor '%s' room '%s'.occupants is not a list — resetting to [].",
+                    f_key, r_key
+                )
+                room["occupants"] = []
+    return d
+
+
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {"ocs": {}, "floors": {}, "dorms": {}, "instagram": {}, "dms": {},
                 "groupchats": {}, "scheduled": {}, "reminders": {}}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
-        d.setdefault(k, {})
-    return d
+    return _sanitize_data(d)
 
 def save_data(data: dict) -> None:
     global DATA_DIRTY
@@ -228,7 +264,18 @@ def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
                 f"(must be 1–100). Value: {desc!r}"
             )
 
-        params = getattr(cmd, "_params", {})
+        # discord.py ≥ 2.3 stores _params as a dict; some internal builds or
+        # monkey-patched installs may return a list.  Guard both shapes.
+        params_raw = getattr(cmd, "_params", {})
+        if isinstance(params_raw, list):
+            # Convert positional list → synthetic dict keyed by index so the
+            # rest of the validation loop still works without changes.
+            params = {str(i): p for i, p in enumerate(params_raw)}
+        elif isinstance(params_raw, dict):
+            params = params_raw
+        else:
+            params = {}
+
         if len(params) > 25:
             violations.append(f"/{cmd.name}: has {len(params)} options (max 25).")
 
@@ -406,7 +453,13 @@ def build_oc_embed(oc: dict, key: str) -> discord.Embed:
 def _build_available_rooms_text(data: dict) -> str:
     lines = []
     for f_key, floor in data["floors"].items():
-        for r_key, room in floor["rooms"].items():
+        if not isinstance(floor, dict):
+            continue
+        rooms = floor.get("rooms", {})
+        if not isinstance(rooms, dict):
+            log.warning("_build_available_rooms_text: floor '%s'.rooms is not a dict, skipping.", f_key)
+            continue
+        for r_key, room in rooms.items():
             occ   = len(room.get("occupants", []))
             cap   = room.get("capacity", 0)
             if occ < cap:
