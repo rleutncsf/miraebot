@@ -63,6 +63,34 @@ BUTTON_COLOR_MAP = {
 DB_LOADED  = False
 DATA_DIRTY = False
 
+TIMEZONE_CHOICES = [
+    app_commands.Choice(name="UTC",                                        value="UTC"),
+    app_commands.Choice(name="KST — Asia/Seoul (GMT+9)",                   value="Asia/Seoul"),
+    app_commands.Choice(name="JST — Asia/Tokyo (GMT+9)",                   value="Asia/Tokyo"),
+    app_commands.Choice(name="CST — Asia/Shanghai (GMT+8)",                value="Asia/Shanghai"),
+    app_commands.Choice(name="HKT — Asia/Hong_Kong (GMT+8)",               value="Asia/Hong_Kong"),
+    app_commands.Choice(name="SGT — Asia/Singapore (GMT+8)",               value="Asia/Singapore"),
+    app_commands.Choice(name="PHT — Asia/Manila (GMT+8)",                  value="Asia/Manila"),
+    app_commands.Choice(name="WIB — Asia/Jakarta (GMT+7)",                 value="Asia/Jakarta"),
+    app_commands.Choice(name="ICT — Asia/Bangkok (GMT+7)",                 value="Asia/Bangkok"),
+    app_commands.Choice(name="IST — Asia/Kolkata (GMT+5:30)",              value="Asia/Kolkata"),
+    app_commands.Choice(name="PKT — Asia/Karachi (GMT+5)",                 value="Asia/Karachi"),
+    app_commands.Choice(name="GST — Asia/Dubai (GMT+4)",                   value="Asia/Dubai"),
+    app_commands.Choice(name="MSK — Europe/Moscow (GMT+3)",                value="Europe/Moscow"),
+    app_commands.Choice(name="EET — Europe/Helsinki (GMT+2/3 DST)",        value="Europe/Helsinki"),
+    app_commands.Choice(name="CET — Europe/Berlin (GMT+1/2 DST)",          value="Europe/Berlin"),
+    app_commands.Choice(name="BST/GMT — Europe/London (GMT+0/+1 DST)",     value="Europe/London"),
+    app_commands.Choice(name="EST — America/New_York (GMT-5/-4 DST)",      value="America/New_York"),
+    app_commands.Choice(name="CST — America/Chicago (GMT-6/-5 DST)",       value="America/Chicago"),
+    app_commands.Choice(name="MST — America/Denver (GMT-7/-6 DST)",        value="America/Denver"),
+    app_commands.Choice(name="PST — America/Los_Angeles (GMT-8/-7 DST)",   value="America/Los_Angeles"),
+    app_commands.Choice(name="AKT — America/Anchorage (GMT-9/-8 DST)",     value="America/Anchorage"),
+    app_commands.Choice(name="HST — Pacific/Honolulu (GMT-10)",            value="Pacific/Honolulu"),
+    app_commands.Choice(name="BRT — America/Sao_Paulo (GMT-3/-2 DST)",     value="America/Sao_Paulo"),
+    app_commands.Choice(name="AEST — Australia/Sydney (GMT+10/+11 DST)",   value="Australia/Sydney"),
+    app_commands.Choice(name="NZST — Pacific/Auckland (GMT+12/+13 DST)",   value="Pacific/Auckland"),
+]
+
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
@@ -625,12 +653,11 @@ async def oc_add(
     if log_ch:
         log_embed = discord.Embed(
             title="✨ New OC Logged",
-            description=f"**{name}** has been registered by {interaction.user.mention}.\nWelcome them to the database!",
+            description=f"**{name}** has been registered by {interaction.user.mention}.",
             color=discord.Color.green(),
             timestamp=now_utc(),
         )
         if pic_url: log_embed.set_thumbnail(url=pic_url)
-        log_embed.add_field(name="OC Name", value=name, inline=True)
         log_embed.add_field(name="Registered By", value=interaction.user.mention, inline=True)
         log_embed.add_field(name="OC ID", value=f"`{oc_key_of(name)}`", inline=True)
         await log_ch.send(embed=log_embed)
@@ -1557,15 +1584,7 @@ async def announce(
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(title="Title", content="Body text", fire_at="YYYY-MM-DD HH:MM", channel="Channel", timezone_str="Timezone")
-@app_commands.choices(timezone_str=[
-    app_commands.Choice(name="UTC", value="UTC"),
-    app_commands.Choice(name="JST — Asia/Tokyo (GMT+9)", value="Asia/Tokyo"),
-    app_commands.Choice(name="KST — Asia/Seoul (GMT+9)", value="Asia/Seoul"),
-    app_commands.Choice(name="PST+8 — Asia/Manila (GMT+8)", value="Asia/Manila"),
-    app_commands.Choice(name="EST — America/New_York (GMT-5)", value="America/New_York"),
-    app_commands.Choice(name="PST — America/Los_Angeles (GMT-8)", value="America/Los_Angeles"),
-    app_commands.Choice(name="BST/GMT — Europe/London", value="Europe/London"),
-])
+@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
 async def announce_schedule(
     interaction: discord.Interaction, title: str, content: str, fire_at: str,
     channel: Optional[discord.TextChannel] = None, image_url: Optional[str] = None, timezone_str: Optional[str] = None
@@ -1595,7 +1614,10 @@ async def announce_schedule(
     }
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="announce_schedule"))
-    await interaction.response.send_message(f"✅ Scheduled for {fire_dt.strftime('%Y-%m-%d %H:%M UTC')}.", ephemeral=True)
+    
+    local_display = fire_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    fire_display   = f"{local_display} {tz_str}  ({fire_dt.strftime('%Y-%m-%d %H:%M UTC')})"
+    await interaction.response.send_message(f"✅ Scheduled for **{fire_display}**.", ephemeral=True)
     await audit(interaction.guild, f"Scheduled announcement '{title}' by {interaction.user}")
 
 
@@ -1641,15 +1663,7 @@ async def announce_cancel(interaction: discord.Interaction, sched_id: str):
     fire_at="When to send the reminder — format: YYYY-MM-DD HH:MM",
     timezone_str="Timezone for fire_at (default: UTC)",
 )
-@app_commands.choices(timezone_str=[
-    app_commands.Choice(name="UTC",                            value="UTC"),
-    app_commands.Choice(name="KST — Asia/Tokyo (GMT+9)",       value="Asia/Tokyo"),
-    app_commands.Choice(name="KST — Asia/Seoul (GMT+9)",       value="Asia/Seoul"),
-    app_commands.Choice(name="PST+8 — Asia/Manila (GMT+8)",    value="Asia/Manila"),
-    app_commands.Choice(name="EST — America/New_York (GMT-5)", value="America/New_York"),
-    app_commands.Choice(name="PST — America/Los_Angeles (GMT-8)", value="America/Los_Angeles"),
-    app_commands.Choice(name="BST/GMT — Europe/London",        value="Europe/London"),
-])
+@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
 async def remind_cmd(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1691,7 +1705,8 @@ async def remind_cmd(
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="remind_set"))
 
-    fire_display = fire_dt.strftime("%Y-%m-%d %H:%M UTC")
+    local_display = fire_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    fire_display   = f"{local_display} {tz_str}  ({fire_dt.strftime('%Y-%m-%d %H:%M UTC')})"
     await interaction.response.send_message(
         f"⏰ Reminder set for {user.mention} at **{fire_display}**.", ephemeral=True
     )
@@ -1844,6 +1859,49 @@ async def ig_post(
 #  DEV DM COMMAND (dev only)
 # ══════════════════════════════════════════════════════════════════════════════
 
+class DevDMFileModal(discord.ui.Modal, title="Attach File"):
+    file_url = discord.ui.TextInput(label="File URL (direct link)", style=discord.TextStyle.short, max_length=1024)
+
+    def __init__(self, guild_id: int, dev_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.dev_id = dev_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        url = self.file_url.value.strip()
+        if not valid_url(url):
+            return await interaction.response.send_message("❌ Invalid URL. Must start with http:// or https://.", ephemeral=True)
+            
+        guild = bot.get_guild(self.guild_id)
+        if not guild: return await interaction.response.send_message("❌ Server not found.", ephemeral=True)
+            
+        ch = discord.utils.get(guild.text_channels, name=DEV_RESPONSE_CHANNEL_NAME)
+        if not ch: return await interaction.response.send_message(f"❌ `#{DEV_RESPONSE_CHANNEL_NAME}` not found.", ephemeral=True)
+            
+        embed = discord.Embed(description="[File Attachment]", color=discord.Color.green(), timestamp=now_utc())
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None)
+        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Dev ID: {self.dev_id}  ·  File reply")
+        
+        if valid_image_url(url):
+            embed.set_image(url=url)
+        else:
+            embed.add_field(name="File URL", value=url)
+            
+        await ch.send(embed=embed)
+        await interaction.response.send_message("✅ File attachment sent to developers.", ephemeral=True)
+
+
+class DevDMFileUploadView(discord.ui.View):
+    def __init__(self, guild_id: int, dev_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.dev_id = dev_id
+
+    @discord.ui.button(label="Attach File", style=discord.ButtonStyle.secondary, custom_id="dev_dm_attach_file")
+    async def attach_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DevDMFileModal(self.guild_id, self.dev_id))
+
+
 class DevDMModal(discord.ui.Modal, title="Reply to Dev"):
     response_text = discord.ui.TextInput(label="Your Response", style=discord.TextStyle.paragraph, max_length=2000)
 
@@ -1864,7 +1922,13 @@ class DevDMModal(discord.ui.Modal, title="Reply to Dev"):
         embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Dev ID: {self.dev_id}")
         
         await ch.send(embed=embed)
-        await interaction.response.send_message("✅ Response sent to developers.", ephemeral=True)
+        
+        view = DevDMFileUploadView(self.guild_id, self.dev_id)
+        await interaction.response.send_message(
+            "Your text reply was sent. If you also need to attach a file, use the button below.", 
+            view=view, 
+            ephemeral=True
+        )
 
 
 class DevDMView(discord.ui.View):
@@ -1882,37 +1946,46 @@ class DevDMView(discord.ui.View):
         await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
 
 
-@bot.tree.command(name="dev_dm", description="[Dev] Send a DM to up to 5 users directly.")
+@bot.tree.command(name="dev_dm", description="[Dev] Message users directly (Supports {recipient}, {oc}, {oc_owner}, {group}, {server}, {date}, {channel}).")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
-    user="Primary user to message", message="Message content",
-    user2="Optional additional recipient", user3="Optional additional recipient",
+    message="Message content",
+    user="Primary user to message", user2="Optional additional recipient", user3="Optional additional recipient",
     user4="Optional additional recipient", user5="Optional additional recipient",
     require_response="Whether the user gets a button to reply",
     embed_title="Optional custom title", embed_color="Optional hex color",
     oc_name="Optional OC name for {oc} placeholder context",
     reply_label="Optional custom reply button label", reply_color="Optional reply button color",
     footnote="Optional custom footer text",
-    thumbnail_url="Optional thumbnail image URL", image_url="Optional main image URL"
+    thumbnail_url="Optional thumbnail image URL", image_url="Optional main image URL",
+    group_name="Optional group/company name for {group} placeholder",
+    oc_target="Name of an OC whose owner will be messaged directly (alternative to user)"
 )
 async def dev_dm(
     interaction: discord.Interaction, 
-    user: discord.Member, 
     message: str, 
-    user2: Optional[discord.Member] = None, user3: Optional[discord.Member] = None,
+    user: Optional[discord.Member] = None, user2: Optional[discord.Member] = None, user3: Optional[discord.Member] = None,
     user4: Optional[discord.Member] = None, user5: Optional[discord.Member] = None,
     require_response: bool = False, embed_title: Optional[str] = None, embed_color: Optional[str] = None,
     oc_name: Optional[str] = None, reply_label: Optional[str] = None, reply_color: Optional[str] = None,
     footnote: Optional[str] = None, thumbnail_url: Optional[str] = None, image_url: Optional[str] = None,
+    group_name: Optional[str] = None, oc_target: Optional[str] = None,
 ):
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
     if reply_label and len(reply_label) > 80: return await interaction.response.send_message("❌ reply_label exceeds 80 characters.", ephemeral=True)
     if thumbnail_url and not valid_image_url(thumbnail_url): return await interaction.response.send_message("❌ Invalid thumbnail URL.", ephemeral=True)
     if image_url and not valid_image_url(image_url): return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
 
+    # Resolve oc_target → real Discord member
+    if not user and not oc_target:
+        return await interaction.response.send_message(
+            "❌ You must supply either a `user` or an `oc_target`.", ephemeral=True
+        )
+
     await interaction.response.defer(ephemeral=True)
 
+    data = load_data()
     recipients = []
     seen = set()
     for u in [user, user2, user3, user4, user5]:
@@ -1920,11 +1993,36 @@ async def dev_dm(
             seen.add(u.id)
             recipients.append(u)
 
-    warning_msgs = []
-    data = load_data()
-    
     oc_display = ""
     oc_owner_display = ""
+
+    if oc_target:
+        oc_t_key = oc_key_of(oc_target)
+        if oc_t_key not in data["ocs"]:
+            return await interaction.followup.send(
+                f"❌ No OC named **{oc_target}** found.", ephemeral=True
+            )
+        oc_t_owner_id = data["ocs"][oc_t_key].get("owner_id")
+        if not oc_t_owner_id:
+            return await interaction.followup.send(
+                f"❌ **{oc_target}** has no registered owner.", ephemeral=True
+            )
+        resolved_from_oc = interaction.guild.get_member(oc_t_owner_id)
+        if not resolved_from_oc:
+            return await interaction.followup.send(
+                f"❌ Owner of **{oc_target}** is not in this server.", ephemeral=True
+            )
+        # Inject into recipient list only if not already present
+        if resolved_from_oc.id not in seen:
+            seen.add(resolved_from_oc.id)
+            recipients.insert(0, resolved_from_oc)
+        # Also populate oc_display/oc_owner_display from this OC if oc_name wasn't given
+        if not oc_name:
+            oc_display = data["ocs"][oc_t_key]["name"]
+            owner_member = resolved_from_oc
+            oc_owner_display = owner_member.display_name
+
+    warning_msgs = []
     if oc_name:
         oc_key = oc_key_of(oc_name)
         if oc_key in data["ocs"]:
@@ -1941,7 +2039,10 @@ async def dev_dm(
         try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
         except ValueError: warning_msgs.append("⚠️ Invalid color hex, using default.")
 
-    needs_rebuild = "{recipient}" in (message + (footnote or "") + (embed_title or ""))
+    needs_rebuild = any(
+        ph in (message + (footnote or "") + (embed_title or ""))
+        for ph in ("{recipient}", "{group}", "{channel}")
+    )
     successes = []
     failures = []
 
@@ -1952,6 +2053,7 @@ async def dev_dm(
                 text,
                 server=interaction.guild.name, user=interaction.user.display_name,
                 oc=oc_display, oc_owner=oc_owner_display,
+                group=group_name or "", channel=getattr(interaction.channel, "name", ""),
                 date=now_utc().strftime("%B %d, %Y"), recipient=recipient.display_name
             )
 
@@ -1964,9 +2066,8 @@ async def dev_dm(
         if footnote:
             embed.set_footer(text=_resolve(footnote))
         else:
-            actual_foot = f"From Server: {interaction.guild.name}"
-            if require_response: actual_foot += " · A response is requested."
-            embed.set_footer(text=actual_foot)
+            if require_response: 
+                embed.set_footer(text="A response is requested.")
         return embed
 
     view = DevDMView(
@@ -1987,7 +2088,7 @@ async def dev_dm(
     result_lines = []
     if successes: result_lines.append(f"✅ Sent to: {', '.join(successes)}")
     if failures: result_lines.append(f"❌ Failed (DMs likely off): {', '.join(failures)}")
-    warn_str = "\n".join(warning_msgs)
+    warn_str = "\n".join(dict.fromkeys(warning_msgs))
     if warn_str: result_lines.append(warn_str)
 
     await interaction.followup.send("\n".join(result_lines), ephemeral=True)
@@ -2100,8 +2201,6 @@ async def debut_notify(
         embed.add_field(name="Note", value=_safe_fmt(oc_placeholder, oc=oc_name, group=group_name), inline=False)
     if footnote:
         embed.set_footer(text=_safe_fmt(footnote, oc=oc_name, group=group_name, server=interaction.guild.name))
-    else:
-        embed.set_footer(text=f"From: {interaction.guild.name}")
 
     view = DebutView(
         guild_id=interaction.guild.id, user_id=member.id, oc_name=oc_name, group_name=group_name,
@@ -2171,7 +2270,7 @@ class GCInviteView(discord.ui.View):
         await interaction.response.edit_message(content=f"You declined the group chat invite for **{self.oc_name}** in **{self.group_name}**.", view=None)
 
 
-@bot.tree.command(name="gc_invite", description="[Dev] DM a debuted OC's owner a group-chat invite.")
+@bot.tree.command(name="gc_invite", description="Send a group-chat invite to one or more OC owners.")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
@@ -2180,15 +2279,17 @@ class GCInviteView(discord.ui.View):
     embed_title="Optional custom embed title", embed_color="Optional hex color",
     footnote="Optional footer text", thumbnail_url="Optional thumbnail image URL",
     accept_label="Optional custom accept button label", accept_color="Optional accept button color",
-    decline_label="Optional custom decline button label", decline_color="Optional decline button color"
+    decline_label="Optional custom decline button label", decline_color="Optional decline button color",
+    oc_name2="Optional additional OC to invite", oc_name3="Optional additional OC to invite",
+    oc_name4="Optional additional OC to invite", oc_name5="Optional additional OC to invite"
 )
 async def gc_invite(
     interaction: discord.Interaction, oc_name: str, group_name: str, message: str, target_channel: discord.TextChannel,
     embed_title: Optional[str] = None, embed_color: Optional[str] = None, footnote: Optional[str] = None,
     thumbnail_url: Optional[str] = None, accept_label: Optional[str] = None, accept_color: Optional[str] = None,
     decline_label: Optional[str] = None, decline_color: Optional[str] = None,
+    oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None, oc_name5: Optional[str] = None,
 ):
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can send group chat invites.", ephemeral=True)
     if not target_channel.permissions_for(interaction.guild.me).manage_permissions:
         return await interaction.response.send_message(f"❌ I lack Manage Permissions in {target_channel.mention}.", ephemeral=True)
     if accept_label and len(accept_label) > 80: return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
@@ -2196,24 +2297,9 @@ async def gc_invite(
 
     await interaction.response.defer(ephemeral=True)
 
+    raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4, oc_name5] if n]
     data = load_data()
-    oc_key = oc_key_of(oc_name)
-    if oc_key not in data["ocs"]: return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    oc = data["ocs"][oc_key]
-    owner_id = oc.get("owner_id")
-    if not owner_id: return await interaction.followup.send(f"❌ **{oc_name}** has no registered owner.", ephemeral=True)
-
-    member = interaction.guild.get_member(owner_id)
-    if not member: return await interaction.followup.send(f"❌ Owner not in server.", ephemeral=True)
-
     dev_ids = [m.id for m in interaction.guild.members if (m.guild_permissions.administrator or m.id == interaction.guild.owner_id) and not m.bot]
-
-    _fmt = {
-        "oc": oc["name"], "group": group_name, "server": interaction.guild.name,
-        "owner": member.display_name, "channel": target_channel.name,
-    }
-    def _r(text: Optional[str]) -> Optional[str]: return _safe_fmt(text, **_fmt) if text else None
 
     warning_msgs = []
     resolved_color = discord.Color.purple()
@@ -2221,38 +2307,71 @@ async def gc_invite(
         try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
         except ValueError: warning_msgs.append("⚠️ Invalid embed color, using default purple.")
 
-    actual_title = _r(embed_title) or f"Group Chat Invite  —  {oc['name']}  |  {group_name}"
-    embed = discord.Embed(title=actual_title, description=_r(message), color=resolved_color, timestamp=now_utc())
+    result_lines = []
+    successes = []
+    failures = []
 
-    resolved_thumbnail = None
-    if thumbnail_url:
-        if valid_image_url(thumbnail_url): resolved_thumbnail = thumbnail_url
-        else: warning_msgs.append("⚠️ Invalid thumbnail URL, using OC profile picture.")
-    if not resolved_thumbnail and oc.get("profile_picture"): resolved_thumbnail = oc["profile_picture"]
-    if resolved_thumbnail: embed.set_thumbnail(url=resolved_thumbnail)
+    for oc_n in raw_oc_names:
+        oc_key = oc_key_of(oc_n)
+        if oc_key not in data["ocs"]:
+            warning_msgs.append(f"❌ No OC named **{oc_n}** found.")
+            continue
+            
+        oc = data["ocs"][oc_key]
+        owner_id = oc.get("owner_id")
+        if not owner_id:
+            warning_msgs.append(f"❌ **{oc_n}** has no registered owner.")
+            continue
 
-    embed.add_field(name="OC", value=oc["name"], inline=True)
-    embed.add_field(name="Group Chat", value=group_name, inline=True)
-    embed.add_field(name="Channel", value=target_channel.mention, inline=True)
+        member = interaction.guild.get_member(owner_id)
+        if not member:
+            warning_msgs.append(f"❌ Owner of **{oc_n}** not in server.")
+            continue
 
-    if _r(footnote): embed.set_footer(text=_r(footnote))
-    else: embed.set_footer(text=f"From: {interaction.guild.name}")
+        _fmt = {
+            "oc": oc["name"], "group": group_name, "server": interaction.guild.name,
+            "owner": member.display_name, "channel": target_channel.name,
+        }
+        def _r(text: Optional[str]) -> Optional[str]: return _safe_fmt(text, **_fmt) if text else None
 
-    view = GCInviteView(
-        guild_id=interaction.guild.id, invitee_user_id=member.id, oc_key=oc_key, oc_name=oc["name"],
-        group_name=group_name, target_channel_id=target_channel.id, dev_ids=dev_ids,
-        accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-        decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
+        actual_title = _r(embed_title) or f"Group Chat Invite  —  {oc['name']}  |  {group_name}"
+        embed = discord.Embed(title=actual_title, description=_r(message), color=resolved_color, timestamp=now_utc())
+
+        resolved_thumbnail = None
+        if thumbnail_url:
+            if valid_image_url(thumbnail_url): resolved_thumbnail = thumbnail_url
+            else: warning_msgs.append("⚠️ Invalid thumbnail URL, using OC profile picture.")
+        if not resolved_thumbnail and oc.get("profile_picture"): resolved_thumbnail = oc["profile_picture"]
+        if resolved_thumbnail: embed.set_thumbnail(url=resolved_thumbnail)
+
+        embed.add_field(name="OC", value=oc["name"], inline=True)
+        embed.add_field(name="Group Chat", value=group_name, inline=True)
+        embed.add_field(name="Channel", value=target_channel.mention, inline=True)
+
+        if _r(footnote): embed.set_footer(text=_r(footnote))
+
+        view = GCInviteView(
+            guild_id=interaction.guild.id, invitee_user_id=member.id, oc_key=oc_key, oc_name=oc["name"],
+            group_name=group_name, target_channel_id=target_channel.id, dev_ids=dev_ids,
+            accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
+            decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
+        )
+
+        try:
+            await member.send(content=f"You have been invited to add your OC **{oc['name']}** to the group chat **{group_name}**. Accept or decline below.", embed=embed, view=view)
+            successes.append(f"{member.mention} ({oc['name']})")
+            await audit(interaction.guild, f"GC invite sent to {member} for OC '{oc['name']}' group '{group_name}' target_channel=#{target_channel.name} by {interaction.user}")
+        except discord.Forbidden:
+            failures.append(f"{member.mention} ({oc['name']})")
+
+    if successes: result_lines.append(f"✅ Sent to: {', '.join(successes)}")
+    if failures: result_lines.append(f"❌ Failed (DMs likely off): {', '.join(failures)}")
+    warn_str = "\n".join(dict.fromkeys(warning_msgs))
+    if warn_str: result_lines.append(warn_str)
+
+    await interaction.followup.send(
+        "\n".join(result_lines) or "✅ All invites sent.", ephemeral=True
     )
-
-    try:
-        await member.send(content=f"You have been invited to add your OC **{oc['name']}** to the group chat **{group_name}**. Accept or decline below.", embed=embed, view=view)
-        warn_str = "\n".join(warning_msgs)
-        if warn_str: warn_str = "\n" + warn_str
-        await interaction.followup.send(f"✅ GC invite sent to {member.mention} for OC **{oc['name']}**.{warn_str}", ephemeral=True)
-        await audit(interaction.guild, f"GC invite sent to {member} for OC '{oc['name']}' group '{group_name}' target_channel=#{target_channel.name} by {interaction.user}")
-    except discord.Forbidden:
-        await interaction.followup.send(f"❌ Could not DM {member.mention} — they may have DMs disabled.", ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2452,6 +2571,30 @@ async def oc_groupchat_add(
 #  HELP
 # ══════════════════════════════════════════════════════════════════════════════
 
+class HelpPaginatorView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed]):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.current = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.current == 0)
+        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="help_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="help_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+
 @bot.tree.command(name="help", description="Show available bot commands.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -2482,6 +2625,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
             "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
+            "`/gc_invite` — Send a group chat invite to up to 5 OC owners\n"
         ))
         embed1.add_field(name="Utility", inline=False, value=(
             "`/ping` — Check the bot's WebSocket latency\n"
@@ -2503,8 +2647,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/announce_schedule` — Schedule a future announcement\n"
             "`/announce_cancel` — Cancel a scheduled announcement\n"
             "`/debut_notify` — Send a debut contract DM\n"
-            "`/gc_invite` — Invite an OC's owner to a group chat\n"
-            "`/dev_dm` — Message up to 5 users directly\n"
+            "`/dev_dm` — Message up to 5 users directly (Supports placeholders: {recipient}, {oc}, {oc_owner}, {group}, {server}, {date}, {channel})\n"
             "`/remind` — Set a timed reminder for a user\n"
             "`/startup` — Re-sync commands and restart task loops\n"
         ))
@@ -2521,10 +2664,12 @@ async def help_cmd(interaction: discord.Interaction):
             f"Scheduled time format: YYYY-MM-DD HH:MM (specify timezone; default UTC)\n"
             f"Up to {MAX_PHOTOS} photos per Instagram post\n"
         ))
+        
+        embed1.set_footer(text="Use ◀ ▶ to navigate pages.")
         embed2.set_footer(text="You are seeing this view because you have Administrator permissions.")
 
-        await interaction.response.send_message(embed=embed1, ephemeral=True)
-        await interaction.followup.send(embed=embed2, ephemeral=True)
+        view = HelpPaginatorView(pages=[embed1, embed2])
+        await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
 
     else:
         embed1 = discord.Embed(title="OC Bot — Command Reference [1/2]", color=discord.Color.gold())
@@ -2547,6 +2692,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/oc_dm` — Private DM channel between two OCs\n"
             "`/oc_groupchat` — Group chat for multiple OCs\n"
             "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
+            "`/gc_invite` — Send a group chat invite to up to 5 OC owners\n"
         ))
 
         embed2 = discord.Embed(title="OC Bot — Command Reference [2/2]", color=discord.Color.gold())
