@@ -887,6 +887,59 @@ async def oc_delete(interaction: discord.Interaction, oc_name: str):
     await audit(guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
 
 
+@bot.tree.command(name="oc_fix_image", description="Re-upload a broken OC profile picture with a new attachment.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name="Name of the OC whose image is broken",
+    new_image="New profile picture file to upload (image files only)"
+)
+async def oc_fix_image(interaction: discord.Interaction, oc_name: str, new_image: discord.Attachment):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
+    data = load_data()
+    key = oc_key_of(oc_name)
+    if key not in data["ocs"]:
+        return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
+
+    oc = data["ocs"][key]
+    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
+        return await interaction.response.send_message("❌ You can only fix images for your own OCs.", ephemeral=True)
+
+    if not new_image.content_type or not new_image.content_type.startswith("image/"):
+        return await interaction.response.send_message("❌ Attached file must be an image.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    result = await persist_image_attachment(new_image, store_msg_id=True)
+    if result is None:
+        return await interaction.followup.send("❌ Failed to persist the image. Ensure #bot-assets exists and the bot has Attach Files + Manage Messages.", ephemeral=True)
+
+    cdn_url, msg_id = result
+    oc["profile_picture"] = cdn_url
+    if msg_id:
+        oc["profile_picture_msg_id"] = msg_id
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_fix_image"))
+
+    embed = discord.Embed(
+        title="🖼️ Profile Picture Updated",
+        color=discord.Color.green(),
+        timestamp=now_utc()
+    )
+    embed.set_thumbnail(url=cdn_url)
+    embed.add_field(name="OC", value=oc["name"], inline=False)
+    
+    display_url = cdn_url if len(cdn_url) <= 100 else cdn_url[:97] + "..."
+    embed.add_field(name="New URL", value=display_url, inline=False)
+    embed.set_footer(text=f"Fixed by {interaction.user}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await audit(guild, f"[OC_FIX_IMAGE] '{oc['name']}' image replaced by {interaction.user} ({interaction.user.id})  new_url={cdn_url}")
+
+
 class OCPaginatorView(discord.ui.View):
     def __init__(self, ocs: list, filters_text: str = ""):
         super().__init__(timeout=300)
@@ -1873,6 +1926,84 @@ async def remind_cmd(
     await audit(
         guild,
         f"[REMIND] Reminder set for {user} ({user.id}) at {fire_display} by {interaction.user}"
+    )
+
+
+@bot.tree.command(name="remind_timer", description="[Dev] Set a duration-based reminder DM (e.g. 'in 2 hours 30 minutes').")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    user="The server member to remind",
+    message="Reminder message (supports {user} placeholder for their display name)",
+    days="Days from now (0–30)",
+    hours="Hours from now (0–168)",
+    minutes="Minutes from now (0–59)"
+)
+async def remind_timer(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    message: str,
+    days: Optional[int] = None,
+    hours: Optional[int] = None,
+    minutes: Optional[int] = None
+):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
+
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ Only devs can set reminders.", ephemeral=True)
+
+    d = days or 0
+    h = hours or 0
+    m = minutes or 0
+
+    if d == 0 and h == 0 and m == 0:
+        return await interaction.response.send_message("❌ Provide at least one of: days, hours, minutes.", ephemeral=True)
+
+    total_seconds = d * 86400 + h * 3600 + m * 60
+
+    if total_seconds < 60:
+        return await interaction.response.send_message("❌ Minimum reminder duration is 1 minute.", ephemeral=True)
+
+    if total_seconds > 30 * 86400:
+        return await interaction.response.send_message("❌ Maximum reminder duration is 30 days.", ephemeral=True)
+
+    if len(message) > 2000:
+        return await interaction.response.send_message("❌ Message must be 2000 characters or fewer.", ephemeral=True)
+
+    fire_dt = now_utc() + timedelta(seconds=total_seconds)
+    resolved_message = message.replace("{user}", user.display_name)
+    data = load_data()
+    rid = f"remindtimer_{int(fire_dt.timestamp())}_{user.id}"
+    
+    data["reminders"][rid] = {
+        "user_id": user.id,
+        "message": resolved_message,
+        "fire_at": fire_dt.isoformat(),
+        "created_by": interaction.user.id,
+        "fired": False,
+        "timer_mode": True,
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="remind_timer_set"))
+
+    parts = []
+    if d: parts.append(f"{d} day(s)")
+    if h: parts.append(f"{h} hour(s)")
+    if m: parts.append(f"{m} minute(s)")
+    duration_str = ", ".join(parts)
+
+    fire_display = fire_dt.strftime("%Y-%m-%d %H:%M UTC")
+    
+    await interaction.response.send_message(
+        f"⏰ Reminder set for {user.mention} in **{duration_str}** (fires at **{fire_display}**).",
+        ephemeral=True
+    )
+    
+    await audit(
+        guild,
+        f"[REMIND_TIMER] Reminder set for {user} ({user.id}) in {duration_str} "
+        f"(fire_at={fire_display}) by {interaction.user}"
     )
 
 
@@ -3057,6 +3188,7 @@ async def help_cmd(interaction: discord.Interaction):
         embed1.add_field(name="OC Management", inline=False, value=(
             "`/oc_add` — Register a new OC\n"
             "`/oc_edit` — Edit OC fields\n"
+            "`/oc_fix_image` — Re-upload a broken OC profile picture\n"
             "`/oc_delete` — Delete your OC\n"
             "`/oc_list` — Browse/filter OCs with paginator\n"
             "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
@@ -3099,6 +3231,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/announce_cancel` — Cancel a scheduled announcement\n"
             "`/dev_notify` — Send a typed notification DM (Selection, Q&A, or Custom) to one or more OCs/users\n"
             "`/remind` — Set a timed reminder for a user\n"
+            "`/remind_timer` — Set a duration-based reminder (e.g. in 2 hours 30 min)\n"
             "`/startup` — Re-sync commands and restart task loops\n"
             "`/refresh_assets` — Re-upload any expired CDN attachment URLs (OC pictures, IG posts)\n"
         ))
@@ -3129,6 +3262,7 @@ async def help_cmd(interaction: discord.Interaction):
         embed1.add_field(name="OC Management", inline=False, value=(
             "`/oc_add` — Register a new OC\n"
             "`/oc_edit` — Edit OC fields\n"
+            "`/oc_fix_image` — Re-upload a broken OC profile picture\n"
             "`/oc_delete` — Delete your OC entirely\n"
             "`/oc_list` — Browse/filter OCs with interactive paginator\n"
             "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
