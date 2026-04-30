@@ -308,6 +308,10 @@ def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
             # Convert positional list → synthetic dict keyed by index so the
             # rest of the validation loop still works without changes.
             params = {str(i): p for i, p in enumerate(params_raw)}
+            try:
+                cmd._params = params
+            except AttributeError:
+                pass
         elif isinstance(params_raw, dict):
             params = params_raw
         else:
@@ -3864,18 +3868,32 @@ async def startup_cmd(interaction: discord.Interaction):
     if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
 
-    try:
-        synced = await bot.tree.sync()
-        sync_status = f"✅ Command tree re-synced ({len(synced)} command(s))."
-    except discord.app_commands.errors.CommandSyncFailure as e:
-        sync_status = f"❌ CommandSyncFailure. Detail: {e}"
-        log.critical("CommandSyncFailure during /startup: %s", e)
-    except discord.HTTPException as e:
-        sync_status = f"⚠️ HTTPException during sync (status={e.status}, code={e.code}): {e.text}"
-        log.error("HTTPException during /startup sync: %s", e)
-    except Exception as e:
-        sync_status = f"⚠️ Sync failed: {type(e).__name__}: {e}"
-        log.error("Unexpected error during /startup sync: %s", e)
+    sync_status = "⚠️ Sync did not run."
+
+    schema_violations = _validate_command_tree_schema(bot.tree)
+    if schema_violations:
+        log.critical(
+            "Pre-sync schema validation found %d violation(s) in /startup:\n%s",
+            len(schema_violations),
+            "\n".join(f"  • {v}" for v in schema_violations)
+        )
+        sync_status = (
+            f"❌ Sync aborted — {len(schema_violations)} schema violation(s) detected.\n"
+            + "\n".join(f"• {v}" for v in schema_violations[:5])
+        )
+    else:
+        try:
+            synced = await bot.tree.sync()
+            sync_status = f"✅ Command tree re-synced ({len(synced)} command(s))."
+        except discord.app_commands.errors.CommandSyncFailure as e:
+            sync_status = f"❌ CommandSyncFailure. Detail: {e}"
+            log.critical("CommandSyncFailure during /startup: %s", e)
+        except discord.HTTPException as e:
+            sync_status = f"⚠️ HTTPException during sync (status={e.status}, code={e.code}): {e.text}"
+            log.error("HTTPException during /startup sync: %s", e)
+        except Exception as e:
+            sync_status = f"⚠️ Sync failed: {type(e).__name__}: {e}"
+            log.error("Unexpected error during /startup sync: %s", e)
 
     task_lines = []
     for task_obj, label in [
