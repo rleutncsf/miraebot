@@ -8,7 +8,9 @@ import re
 import threading
 import signal
 import sys
+import uuid
 import webserver
+import random
 from datetime import datetime, date, timezone, timedelta
 import datetime as _dt
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,6 +45,9 @@ DEV_RESPONSE_CHANNEL_NAME = "dev-responses"   # Dev DM responses
 DB_BACKUP_CHANNEL_NAME    = "bot-db-backup"   # Automatic DB persistence channel
 ASSET_CHANNEL_NAME        = "bot-assets"      # Persistent bot image uploads
 INSTAGRAM_CHANNEL_NAME    = "instagram"
+TWITTER_CHANNEL_NAME      = "twitter"
+WEVERSE_CHANNEL_NAME      = "weverse"
+WEVERSE_DM_CHANNEL_PREFIX = "weverse-dm"
 BIRTHDAY_FORMAT           = "%Y/%m/%d"
 BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [1, 2, 3, 4]
@@ -63,9 +68,26 @@ BUTTON_COLOR_MAP = {
     "blue":    discord.ButtonStyle.primary,
 }
 
+PURCHASABLE_TYPES = {"album", "misc"}
+
+WEVERSE_PLANS = {
+    "monthly":  {"label": "Monthly",    "won": 8_000,  "days": 30},
+    "biannual": {"label": "6 Months",   "won": 40_000, "days": 183},
+    "annual":   {"label": "Annual",     "won": 80_000, "days": 365},
+}
+
+COLORS = {
+    "system": discord.Color.blurple(),
+    "success": discord.Color.green(),
+    "error": discord.Color.red(),
+    "neutral": discord.Color.light_grey()
+}
+
 # State Flags for DB Persistence
 DB_LOADED  = False
 DATA_DIRTY = False
+_VIEWS_REGISTERED = False
+_EVAL_SKIP_FIRST_TICK = False
 
 _http_session: Optional[aiohttp.ClientSession] = None
 
@@ -98,14 +120,410 @@ TIMEZONE_CHOICES = [
 ]
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_tz():
+    return KST
+
+def now():
+    return now_utc()
+
+def find_oc(oc_name: str, data: dict):
+    key = oc_key_of(oc_name)
+    oc = data["ocs"].get(key)
+    if oc:
+        oc["id"] = key
+    return oc
+
+def get_embed(title: str, description: str, color_key: str = "system", reveal_color_override: int = None) -> discord.Embed:
+    if reveal_color_override is not None:
+        color = discord.Color(reveal_color_override)
+    else:
+        color = COLORS.get(color_key, COLORS["system"])
+    return discord.Embed(title=title, description=description, color=color)
+
+class ConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=30)
+        self.confirmed = False
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for child in self.children: child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children: child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+async def wait_for_confirm(interaction: discord.Interaction, embed: discord.Embed) -> bool:
+    view = ConfirmView()
+    if interaction.response.is_done():
+        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await view.wait()
+    return view.confirmed
+
+class RankingPaginationView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed]):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.current = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.current == 0)
+        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="rank_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="rank_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+def _gen_item_id(shop: dict, used_ids: list) -> str:
+    existing = set(shop.keys()) | set(used_ids)
+    while True:
+        candidate = "id_" + "".join([str(random.randint(0, 9)) for _ in range(7)])
+        if candidate not in existing:
+            return candidate
+
+def _gen_inclusion_id(all_inclusions_globally: set, used_inc_ids: list) -> str:
+    existing = all_inclusions_globally | set(used_inc_ids)
+    while True:
+        candidate = "inc_" + "".join([str(random.randint(0, 9)) for _ in range(7)])
+        if candidate not in existing:
+            return candidate
+
+def _migrate_schema(d: dict) -> dict:
+    for k in ("ocs", "floors", "dorms", "instagram", "twitter", "dms",
+              "groupchats", "scheduled", "reminders", "shop", "inventories",
+              "albums", "album_purchases", "weverse_artists", "weverse_posts",
+              "weverse_won", "weverse_groups"):
+        d.setdefault(k, {})
+    if isinstance(d.get("weverse_posts"), dict):
+        d["weverse_posts"] = []
+    d.setdefault("weverse_posts", [])
+    d.setdefault("shop_categories", [])
+    d.setdefault("used_item_ids", [])
+    d.setdefault("used_inclusion_ids", [])
+    d.setdefault("evaluation_config", {
+        "running": False,
+        "last_run": None,
+        "legend": {
+            "bad":         [10_000,  79_999],
+            "fair":        [80_000, 129_999],
+            "good":       [130_000, 169_999],
+            "great":      [170_000, 199_999],
+            "excellent":  [200_000, 224_999],
+            "outstanding":[225_000, 250_000],
+        }
+    })
+    if "legend" not in d.get("evaluation_config", {}):
+        d["evaluation_config"]["legend"] = {
+            "bad":         [10_000,  79_999],
+            "fair":        [80_000, 129_999],
+            "good":       [130_000, 169_999],
+            "great":      [170_000, 199_999],
+            "Excellent":  [200_000, 224_999],
+            "outstanding":[225_000, 250_000],
+        }
+    d.setdefault("config", {})
+    for key, default in [
+        ("weverse_channel_id", None),
+        ("weverse_dm_category_id", None),
+        ("weverse_group_category_id", None),
+        ("guild_id", None),
+    ]:
+        d["config"].setdefault(key, default)
+
+    for oc in d.get("ocs", {}).values():
+        oc.setdefault("balance", 500000)
+        
+    for item in d.get("shop", {}).values():
+        for inc in item.get("inclusions", []):
+            if isinstance(inc, dict):
+                inc.pop("weight", None)
+            
+    for item_id, item in d.get("shop", {}).items():
+        if item.get("type") != "album":
+            item.pop("inclusions", None)
+            
+    for oc_inv in d.get("inventories", {}).values():
+        for item_instances in oc_inv.values():
+            for inst in item_instances:
+                inst.setdefault("pulled_inclusions", [])
+                seen = set()
+                deduped = []
+                for p in inst.get("pulled_inclusions", []):
+                    if p["inclusion_id"] not in seen:
+                        deduped.append(p)
+                        seen.add(p["inclusion_id"])
+                inst["pulled_inclusions"] = deduped
+
+    for post in d.get("instagram", {}).values():
+        if "media" not in post and "photos" in post:
+            post["media"] = [{"url": u, "type": "image"} for u in post["photos"]]
+            
+    for artist_id, artist_record in d.get("weverse_artists", {}).items():
+        subs = artist_record.get("dm_subscribers", {})
+        migrated = {}
+        for k, v in subs.items():
+            if k.isdigit() and len(k) >= 17:
+                new_key = v.get("oc_id") or f"legacy_user_{k}"
+                migrated[new_key] = v
+            else:
+                migrated[k] = v
+        artist_record["dm_subscribers"] = migrated
+
+    for gid, grp in d.get("weverse_groups", {}).items():
+        if "member_discord_ids" in grp and "member_oc_ids" not in grp:
+            grp["member_oc_ids"] = [f"legacy_user_{uid}" for uid in grp.pop("member_discord_ids")]
+
+    d.setdefault("config", {})
+    d["config"].pop("voting_scheduler", None)
+                
+    return d
+
+def ensure_shop_keys(data: dict) -> None:
+    data.setdefault("shop", {})
+    data.setdefault("shop_categories", [])
+    data.setdefault("inventories", {})
+
+def _resolve_item_id(raw_input: str, shop: dict) -> Optional[str]:
+    stripped = raw_input.strip()
+    if stripped in shop:
+        return stripped
+    prefixed = f"id_{stripped}" if not stripped.startswith("id_") else stripped
+    if prefixed in shop:
+        return prefixed
+    for key in shop:
+        if key.endswith(stripped):
+            return key
+    return None
+
+def _resolve_album(raw_input: str, data: dict) -> Optional[dict]:
+    albums = data.get("albums", {})
+
+    if raw_input in albums and albums[raw_input].get("active"):
+        a = dict(albums[raw_input])
+        a["album_id"] = raw_input
+        return a
+
+    needle = raw_input.strip().lower()
+    exact, starts, contains = [], [], []
+    for a_id, a in albums.items():
+        if not a.get("active"):
+            continue
+        t = a.get("title", "").lower()
+        if t == needle:
+            exact.append((a_id, a))
+        elif t.startswith(needle):
+            starts.append((a_id, a))
+        elif needle in t:
+            contains.append((a_id, a))
+
+    candidates = exact or starts or contains
+    if len(candidates) == 1:
+        a_id, a = candidates[0]
+        result = dict(a)
+        result["album_id"] = a_id
+        return result
+
+    return None
+
+def _resolve_tradeable(raw_id: str, oc_key: str, inventories: dict, shop: dict) -> Optional[tuple[str, str, int]]:
+    stripped = raw_id.strip()
+    oc_inv = inventories.get(oc_key, {})
+    if stripped.startswith("inc_"):
+        if stripped in oc_inv:
+            return (stripped, "inclusion", len(oc_inv[stripped]))
+        return None
+    resolved = _resolve_item_id(stripped, shop)
+    if resolved and resolved in oc_inv:
+        return (resolved, "item", len(oc_inv[resolved]))
+    return None
+
+def _extract_inclusion_location(synthetic_key: str) -> Optional[tuple[str, str, int]]:
+    if "@" not in synthetic_key:
+        return None
+    inc_id, rest = synthetic_key.split("@", 1)
+    if ":" not in rest:
+        return None
+    album_id, idx_str = rest.rsplit(":", 1)
+    try:
+        return (inc_id, album_id, int(idx_str))
+    except ValueError:
+        return None
+
+def _rarity_label(rarity_int: int) -> str:
+    if rarity_int == 1:   return "✦ common"
+    if rarity_int == 2:   return "✦✦ uncommon"
+    if rarity_int == 3:   return "✦✦✦ rare"
+    if rarity_int == 4:   return "✦✦✦✦ epic"
+    if rarity_int >= 5:   return "✦✦✦✦✦ legendary"
+    return f"rarity {rarity_int}"
+
+def _rarity_label_proportional(rarity_int: int, all_rarities: list) -> str:
+    _TIER_LABELS = [
+        "✦ common",
+        "✦✦ uncommon",
+        "✦✦✦ rare",
+        "✦✦✦✦ epic",
+        "✦✦✦✦✦ legendary",
+    ]
+    if not all_rarities:
+        return _TIER_LABELS[0]
+    min_r = min(all_rarities)
+    max_r = max(all_rarities)
+    if max_r == min_r:
+        return _TIER_LABELS[0]
+    bucket = int((rarity_int - min_r) / ((max_r - min_r) / 5))
+    bucket = max(0, min(4, bucket))
+    return _TIER_LABELS[bucket]
+
+def _build_album_totals(data: dict) -> dict[str, dict[str, int]]:
+    log_totals: dict[str, dict[str, int]] = {}
+    for p in data.get("album_purchases", {}).values():
+        oc_id = p.get("oc_id")
+        a_id  = p.get("album_id")
+        qty   = p.get("quantity", 0)
+        if not oc_id or not a_id:
+            continue
+        log_totals.setdefault(oc_id, {})
+        log_totals[oc_id][a_id] = log_totals[oc_id].get(a_id, 0) + qty
+
+    title_to_album_id: dict[str, str] = {
+        a.get("title", "").lower(): a_id
+        for a_id, a in data.get("albums", {}).items()
+        if a.get("active")
+    }
+    title_to_album_id_all: dict[str, str] = {
+        a.get("title", "").lower(): a_id
+        for a_id, a in data.get("albums", {}).items()
+    }
+
+    inv_totals: dict[str, dict[str, int]] = {}
+    shop = data.get("shop", {})
+    inventories = data.get("inventories", {})
+
+    for oc_key, oc_inv in inventories.items():
+        for item_id, instances in oc_inv.items():
+            shop_item = shop.get(item_id)
+            if not shop_item or shop_item.get("type") != "album":
+                continue
+            item_name_lower = shop_item.get("name", "").lower()
+            album_id = (
+                title_to_album_id.get(item_name_lower)
+                or title_to_album_id_all.get(item_name_lower)
+                or f"shop:{item_id}"
+            )
+            qty = len(instances)
+            inv_totals.setdefault(oc_key, {})
+            inv_totals[oc_key][album_id] = inv_totals[oc_key].get(album_id, 0) + qty
+
+    merged: dict[str, dict[str, int]] = {}
+    all_oc_keys = set(log_totals) | set(inv_totals)
+    for oc_key in all_oc_keys:
+        log_row = log_totals.get(oc_key, {})
+        inv_row = inv_totals.get(oc_key, {})
+        all_album_keys = set(log_row) | set(inv_row)
+        merged[oc_key] = {
+            a_key: max(log_row.get(a_key, 0), inv_row.get(a_key, 0))
+            for a_key in all_album_keys
+        }
+    return merged
+
+def _resolve_weverse_channel(guild: discord.Guild, data: dict) -> Optional[discord.TextChannel]:
+    channel_id = data["config"].get("weverse_channel_id")
+    if channel_id:
+        ch = guild.get_channel(int(channel_id))
+        if ch:
+            return ch
+    return discord.utils.get(guild.text_channels, name=WEVERSE_CHANNEL_NAME)
+
+def _inclusion_sort_key(inc):
+    return (inc.get("rarity", 0), inc["name"].lower())
+
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"ocs": {}, "floors": {}, "dorms": {}, "instagram": {}, "dms": {},
-                "groupchats": {}, "scheduled": {}, "reminders": {}}
+        d = {
+            "ocs": {}, "floors": {}, "dorms": {}, "instagram": {}, "twitter": {}, "dms": {},
+            "groupchats": {}, "scheduled": {}, "reminders": {},
+            "shop": {}, "inventories": {},
+            "shop_categories": [],
+            "used_item_ids": [],
+            "used_inclusion_ids": [],
+            "evaluation_config": {
+                "running": False,
+                "last_run": None,
+                "legend": {
+                    "bad":         [10_000,  79_999],
+                    "fair":        [80_000, 129_999],
+                    "good":       [130_000, 169_999],
+                    "great":      [170_000, 199_999],
+                    "Excellent":  [200_000, 224_999],
+                    "outstanding":[225_000, 250_000],
+                }
+            },
+        }
+        _migrate_schema(d)
+        save_data(d)
+        return d
+
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
-        d.setdefault(k, {})
+
+    # Schema Migration Guards
+    modified = False
+    if "albums" not in d:
+        d["albums"] = {}
+        modified = True
+    if "album_purchases" not in d:
+        d["album_purchases"] = {}
+        modified = True
+    if "weverse_artists" not in d:
+        d["weverse_artists"] = {}
+        modified = True
+    if "weverse_posts" not in d:
+        d["weverse_posts"] = []
+        modified = True
+    if "weverse_won" not in d:
+        d["weverse_won"] = {}
+        modified = True
+    if "weverse_groups" not in d:
+        d["weverse_groups"] = {}
+        modified = True
+        
+    d.setdefault("config", {})
+    for key, default in [
+        ("weverse_channel_id", None),
+        ("weverse_dm_category_id", None),
+        ("weverse_group_category_id", None),
+        ("guild_id", None)
+    ]:
+        if key not in d["config"]:
+            d["config"][key] = default
+            modified = True
+
+    before = json.dumps(d, sort_keys=True)
+    _migrate_schema(d)
+    after = json.dumps(d, sort_keys=True)
+
+    if before != after or modified:
+        save_data(d)
+        log.info("load_data: schema migration applied and persisted to disk.")
+
     return d
 
 def save_data(data: dict) -> None:
@@ -152,15 +570,52 @@ async def save_and_backup(data: dict, reason: str = "mutation") -> None:
     save_data(data)
     await push_backup_to_discord(data, reason=reason)
 
+def valid_media_url(url: str) -> tuple[bool, str]:
+    img = bool(re.match(r"^https?://\S+\.(png|jpg|jpeg|gif|webp)(\?.*)?$", url, re.I))
+    vid = bool(re.match(r"^https?://\S+\.(mp4|mov|webm)(\?.*)?$", url, re.I))
+    if img: return (True, "image")
+    if vid: return (True, "video")
+    return (False, "")
+
+async def persist_media_attachment(
+    attachment: discord.Attachment,
+    store_msg_id: bool = False
+) -> Optional[tuple[str, Optional[int], str]]:
+    if not attachment.content_type:
+        return None
+    is_image = attachment.content_type.startswith("image/")
+    is_video = attachment.content_type.startswith("video/")
+    if not (is_image or is_video):
+        return None
+        
+    try:
+        media_bytes = await attachment.read()
+        file_obj = discord.File(
+            io.BytesIO(media_bytes),
+            filename=attachment.filename,
+            description=f"persisted asset. original: {attachment.id}"
+        )
+        for guild in bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+            if ch:
+                msg = await ch.send(file=file_obj)
+                if is_image:
+                    try:
+                        await msg.pin()
+                    except Exception:
+                        pass
+                
+                if msg.attachments:
+                    clean_url = msg.attachments[0].url.split("?")[0]
+                    return (clean_url, msg.id if store_msg_id else None, "image" if is_image else "video")
+    except Exception as e:
+        log.error("persist_media_attachment failed: %s", e)
+    return None
+
 async def persist_image_attachment(
     attachment: discord.Attachment,
     store_msg_id: bool = False
 ) -> Optional[tuple[str, Optional[int]]]:
-    """
-    Re-uploads a Discord CDN attachment to the bot-assets channel, pins the
-    message for URL permanence, and returns (cdn_url, message_id).
-    If store_msg_id is False, returns (cdn_url, None) for backward compatibility.
-    """
     if not attachment.content_type or not attachment.content_type.startswith("image/"):
         return None
     try:
@@ -201,6 +656,11 @@ def _validate_backup(parsed: dict) -> bool:
         for v in parsed["dorms"].values():
             if not isinstance(v, dict):
                 return False
+    for k in ("shop", "inventories", "evaluation_config"):
+        if k in parsed and not isinstance(parsed[k], dict): return False
+    if "shop_categories" in parsed and not isinstance(parsed["shop_categories"], list): return False
+    if "used_item_ids" in parsed and not isinstance(parsed["used_item_ids"], list): return False
+    if "used_inclusion_ids" in parsed and not isinstance(parsed["used_inclusion_ids"], list): return False
     return True
 
 def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
@@ -286,6 +746,14 @@ def is_dev(interaction: discord.Interaction) -> bool:
         return False
     return (guild.owner_id == member.id or member.guild_permissions.administrator)
 
+def is_dev_dec():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not is_dev(interaction):
+            await interaction.response.send_message("❌ denied.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
 def resolve_button_style(value: Optional[str], default: discord.ButtonStyle) -> discord.ButtonStyle:
     if value:
         return BUTTON_COLOR_MAP.get(value.lower().strip(), default)
@@ -342,6 +810,8 @@ def build_oc_embed(oc: dict, key: str) -> discord.Embed:
     embed.add_field(name="Main Skill",  value=oc["main_skill"],             inline=True)
     embed.add_field(name="Ethnicity",   value=oc["ethnicity"],              inline=True)
     embed.add_field(name="Nationality", value=oc["nationality"],            inline=True)
+    balance = oc.get("balance", 500_000)
+    embed.add_field(name="Balance",     value=f"₩{balance:,}",                     inline=True)
     if oc.get("form_link"):
         embed.add_field(name="Form", value=f"[Click here]({oc['form_link']})", inline=True)
     embed.set_footer(text=f"OC ID: {key}")
@@ -378,12 +848,6 @@ intents         = discord.Intents.default()
 intents.members = True
 intents.guilds  = True
 
-# DEPLOYMENT NOTE (DM support):
-# In the Discord Developer Portal → OAuth2 → Installation:
-#   - Under "Install Link" → "Discord Provided Link", ensure scope includes: bot, applications.commands
-#   - Under "Default Install Settings" → "User Install": add scope "applications.commands"
-# This allows the bot to be added to a user's account, enabling /command usage in DMs.
-# Set PRIMARY_GUILD_ID in your environment to your server's numeric ID.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 class _Health(BaseHTTPRequestHandler):
@@ -424,29 +888,214 @@ async def ping_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ─── Evaluation Paginator View (for persistence) ───────────────────────────────
+class EvaluationPaginatorView(discord.ui.View):
+    def __init__(self, pages: list = None, timeout=None):
+        super().__init__(timeout=timeout)
+        self.pages = pages or []
+        self.current = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.current == 0)
+        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="eval_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="eval_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+class PurchaseRevealViewPersistent(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="reveal_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="⚠️ this reveal session expired. please purchase again to reveal your inclusions.",
+            embed=None,
+            view=self,
+        )
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="reveal_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="⚠️ this reveal session expired. please purchase again to reveal your inclusions.",
+            embed=None,
+            view=self,
+        )
+
+class WeversePostView(discord.ui.View):
+    def __init__(self, post_id: str):
+        super().__init__(timeout=None)
+        self.post_id = post_id
+        for child in self.children:
+            if child.custom_id == "weverse_reply:placeholder":
+                child.custom_id = f"weverse_reply:{post_id}"
+
+    @discord.ui.button(label="💜 Artist Reply", style=discord.ButtonStyle.primary, custom_id="weverse_reply:placeholder")
+    async def artist_reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        owned_artist_ocs = [
+            data["ocs"][oc_id]
+            for oc_id in data["weverse_artists"]
+            if oc_id in data["ocs"] and data["ocs"][oc_id].get("owner_id") == interaction.user.id
+        ]
+        is_dev_user = is_dev(interaction)
+        if is_dev_user:
+            owned_artist_ocs = [data["ocs"][oc_id] for oc_id in data["weverse_artists"] if oc_id in data["ocs"]]
+        if not owned_artist_ocs:
+            return await interaction.response.send_message(
+                embed=get_embed("Not an Artist", "Only registered Weverse artists can reply via this button. Use `/weverse reply` directly.", "error"),
+                ephemeral=True
+            )
+        await interaction.response.send_modal(WeverseReplyModal(self.post_id, owned_artist_ocs[0]["name"]))
+
+class WeverseReplyModal(discord.ui.Modal, title="Weverse Artist Reply"):
+    reply_content = discord.ui.TextInput(
+        label="Reply",
+        style=discord.TextStyle.paragraph,
+        placeholder="Write your reply here…",
+        min_length=1,
+        max_length=500
+    )
+    artist_oc_name_input = discord.ui.TextInput(
+        label="Your Artist OC Name",
+        placeholder="e.g. Soyeon",
+        min_length=1,
+        max_length=50
+    )
+
+    def __init__(self, post_id: str, default_artist_name: str):
+        super().__init__()
+        self.post_id = post_id
+        self.artist_oc_name_input.default = default_artist_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        content = self.reply_content.value
+        artist_oc_name = self.artist_oc_name_input.value
+        data = load_data()
+        post = next((p for p in data.get("weverse_posts", []) if p["post_id"] == self.post_id), None)
+        if not post:
+            return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
+        oc = find_oc(artist_oc_name, data)
+        if not oc:
+            return await interaction.response.send_message(f"❌ Artist OC **{artist_oc_name}** not found.", ephemeral=True)
+        if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message("❌ You do not own this OC.", ephemeral=True)
+        if oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(f"❌ **{artist_oc_name}** is not registered as a Weverse artist.", ephemeral=True)
+
+        guild = resolve_guild(interaction)
+        weverse_channel = _resolve_weverse_channel(guild, data)
+        if not weverse_channel:
+            return await interaction.response.send_message(
+                embed=get_embed("Error",
+                    f"Weverse channel not found. Create a channel named `{WEVERSE_CHANNEL_NAME}` "
+                    f"or use `/weverse config setchannel` to configure it.", "error"),
+                ephemeral=True
+            )
+
+        try:
+            original_msg = await weverse_channel.fetch_message(int(post["message_id"]))
+        except Exception:
+            return await interaction.response.send_message("❌ Original message not found.", ephemeral=True)
+
+        try:
+            thread = original_msg.thread
+            if not thread:
+                poster_name = post["author_display_name"]
+                thread = await original_msg.create_thread(name=f"💬 {poster_name} · Artist Reply", auto_archive_duration=10080)
+            
+            reply_embed = discord.Embed(title=f"💜 {oc['name']} replied", description=content, color=COLORS["system"], timestamp=now())
+            if oc.get("profile_picture"):
+                reply_embed.set_thumbnail(url=oc["profile_picture"])
+            reply_embed.set_footer(text="Weverse Artist")
+            
+            await thread.send(embed=reply_embed)
+            
+            reply_record = {
+                "reply_id": str(uuid.uuid4()),
+                "artist_oc_id": oc["id"],
+                "artist_name": oc["name"],
+                "content": content,
+                "replied_at": now().isoformat(),
+                "message_id": str(original_msg.id)
+            }
+            post.setdefault("replies", []).append(reply_record)
+            save_data(data)
+            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_reply"))
+            
+            await interaction.response.send_message("✅ Reply posted successfully.", ephemeral=True)
+        except Exception as e:
+            log.error(f"Weverse reply failed: {e}")
+            await interaction.response.send_message("❌ Failed to create reply.", ephemeral=True)
+
+
+# ─── Cogs Setup ───────────────────────────────────────────────────────────────
+async def setup_hook():
+    await bot.add_cog(AlbumCog(bot))
+    await bot.add_cog(WeverseCog(bot))
+        
+    data = load_data()
+    for post in data.get("weverse_posts", []):
+        bot.add_view(WeversePostView(post["post_id"]))
+
+bot.setup_hook = setup_hook
+
 # ─── on_ready ──────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     global DB_LOADED
     global _http_session
+    global _VIEWS_REGISTERED
 
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
 
-    bot.add_view(DebutView(guild_id=0, user_id=0, oc_name="", group_name="", transport_channel_id=0))
-    bot.add_view(DevDMView(guild_id=0, dev_id=0))
-    bot.add_view(CombinedNotifyView(
-        guild_id=0, user_id=0, dev_id=0,
-        oc_name="", group_name="", transport_channel_id=0,
-        custom_channel_message=None,
-        accept_label=None, accept_style=discord.ButtonStyle.success,
-        decline_label=None, decline_style=discord.ButtonStyle.danger,
-        reply_label=None, reply_style=discord.ButtonStyle.primary,
-    ))
-    bot.add_view(GCInviteView(
-        guild_id=0, invitee_user_id=0, oc_key="", oc_name="",
-        group_name="", target_channel_id=0, dev_ids=[],
-    ))
+    if not _VIEWS_REGISTERED:
+        _persistent_views = [
+            lambda: DebutView(guild_id=0, user_id=0, oc_name="", group_name="", transport_channel_id=0),
+            lambda: DevDMView(guild_id=0, dev_id=0),
+            lambda: CombinedNotifyView(
+                guild_id=0, user_id=0, dev_id=0,
+                oc_name="", group_name="", transport_channel_id=0,
+                custom_channel_message=None,
+                accept_label=None, accept_style=discord.ButtonStyle.success,
+                decline_label=None, decline_style=discord.ButtonStyle.danger,
+                reply_label=None, reply_style=discord.ButtonStyle.primary,
+            ),
+            lambda: GCInviteView(
+                guild_id=0, invitee_user_id=0, oc_key="", oc_name="",
+                group_name="", target_channel_id=0, dev_ids=[],
+            ),
+            lambda: EvaluationPaginatorView([]),
+            lambda: PurchaseRevealViewPersistent(),
+            lambda: UnifiedTradeConfirmView(0, 0, "", "", [], []),
+            lambda: MultiTradeConfirmView(0, 0, "", "", [], []),
+            lambda: InclusionsBrowserView([], "", None, 0),
+            lambda: TwitterPostView(tweet_id="", likes=0, retweets=0),
+        ]
+
+        for view_factory in _persistent_views:
+            try:
+                bot.add_view(view_factory())
+            except Exception as exc:
+                log.error("on_ready: failed to register persistent view %s — %s", view_factory, exc)
+
+        _VIEWS_REGISTERED = True
+        log.info("on_ready: all persistent views registered.")
 
     if not DB_LOADED:
         for guild in bot.guilds:
@@ -486,16 +1135,14 @@ async def on_ready():
                                     if not _validate_backup(parsed):
                                         log.error("Backup file failed schema validation, skipping restore.")
                                         break
-                                    for k in ("ocs", "floors", "dorms", "instagram", "dms", "groupchats", "scheduled", "reminders"):
-                                        parsed.setdefault(k, {})
+                                    _migrate_schema(parsed)
+                                    with open(DATA_FILE, "w", encoding="utf-8") as f:
+                                        json.dump(parsed, f, indent=2, ensure_ascii=False)
+                                    log.info("Restored from backup — message_id=%s guild=%s", message.id, guild.id)
+                                    break
                                 except (json.JSONDecodeError, ValueError) as e:
                                     log.error(f"Backup file is corrupt, skipping restore: {e}")
                                     break
-                                
-                                with open(DATA_FILE, "wb") as f:
-                                    f.write(file_bytes)
-                                log.info("Restored from backup — message_id=%s guild=%s", message.id, guild.id)
-                                break
                 except Exception as e:
                     log.error(f"Error fetching DB backup: {e}")
 
@@ -545,6 +1192,25 @@ async def on_ready():
     if not check_scheduled.is_running(): check_scheduled.start()
     if not check_reminders.is_running(): check_reminders.start()
     if not auto_backup_db.is_running():  auto_backup_db.start()
+    if not run_weekly_evaluations.is_running():
+        data = load_data()
+        if data.get("evaluation_config", {}).get("running"):
+            last_run_str = data["evaluation_config"].get("last_run")
+            skip_first = False
+            if last_run_str:
+                try:
+                    last_run_dt = datetime.fromisoformat(last_run_str)
+                    if last_run_dt.tzinfo is None:
+                        last_run_dt = last_run_dt.replace(tzinfo=timezone.utc)
+                    elapsed_hours = (now_utc() - last_run_dt).total_seconds() / 3600
+                    if elapsed_hours < 168:
+                        skip_first = True
+                except (ValueError, TypeError):
+                    pass
+            global _EVAL_SKIP_FIRST_TICK
+            _EVAL_SKIP_FIRST_TICK = skip_first
+        run_weekly_evaluations.start()
+    if not weverse_billing_loop.is_running(): weverse_billing_loop.start()
 
 
 # ─── Automated Backup loop ─────────────────────────────────────────────────────
@@ -618,9 +1284,11 @@ async def check_scheduled():
         for guild in bot.guilds:
             ch = discord.utils.get(guild.text_channels, name=entry["channel"])
             if not ch: continue
+            entry_type = entry.get("type", "announce")
+            embed_color = discord.Color.red() if entry_type == "news_post" else discord.Color.blurple()
             embed = discord.Embed(
                 title=entry["title"], description=entry["content"],
-                color=discord.Color.blurple(), timestamp=now,
+                color=embed_color, timestamp=now,
             )
             if entry.get("image_url"):
                 embed.set_image(url=entry["image_url"])
@@ -671,2735 +1339,4192 @@ async def check_reminders():
 async def before_check_reminders():
     await bot.wait_until_ready()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  OC MANAGEMENT
-# ══════════════════════════════════════════════════════════════════════════════
+async def _process_weverse_subscriptions():
+    data = load_data()
+    modified = False
+    current_time = now()
 
-@bot.tree.command(name="oc_add", description="Register a new OC to the database (unlimited OCs per user).")
+    for artist_id, artist_record in data.get("weverse_artists", {}).items():
+        dm_channel_id = artist_record.get("dm_channel_id")
+        for sub_key, sub in list(artist_record.get("dm_subscribers", {}).items()):
+            if not sub["active"]:
+                continue
+
+            next_billing_dt = datetime.fromisoformat(sub["next_billing"]).astimezone(get_tz())
+            if current_time < next_billing_dt:
+                continue
+
+            guild_id = data["config"].get("guild_id")
+            guild = bot.get_guild(int(guild_id)) if guild_id else None
+
+            if sub.get("cancelled"):
+                sub["active"] = False
+                modified = True
+                if dm_channel_id and guild:
+                    try:
+                        ch = guild.get_channel(int(dm_channel_id))
+                        owner_discord_id = sub.get("owner_discord_id")
+                        member = guild.get_member(int(owner_discord_id)) if owner_discord_id else None
+                        if ch and isinstance(ch, discord.TextChannel) and member:
+                            await ch.set_permissions(member, overwrite=None)
+                    except Exception:
+                        pass
+            else:
+                plan = sub["plan"]
+                plan_data = WEVERSE_PLANS.get(plan, WEVERSE_PLANS["monthly"])
+                cost = plan_data["won"]
+                
+                sub_oc_rec = data["ocs"].get(sub_key)
+                if sub_oc_rec and sub_oc_rec.get("balance", 0) >= cost:
+                    sub_oc_rec["balance"] -= cost
+                    success = True
+                else:
+                    success = False
+                
+                if success:
+                    sub["next_billing"] = (next_billing_dt + timedelta(days=plan_data["days"])).isoformat()
+                    modified = True
+                else:
+                    sub["active"] = False
+                    sub["cancelled"] = True
+                    sub["cancelled_at"] = current_time.isoformat()
+                    modified = True
+                    
+                    if guild:
+                        try:
+                            owner_discord_id = sub.get("owner_discord_id")
+                            member = guild.get_member(int(owner_discord_id)) if owner_discord_id else None
+                            if member:
+                                artist_oc = data["ocs"].get(artist_id, {})
+                                artist_name = artist_oc.get("name", "the artist")
+                                notify_embed = discord.Embed(
+                                    title="💜 Weverse DM — Subscription Cancelled",
+                                    description=(
+                                        f"Your **{sub['plan']}** subscription to **{artist_name}**'s Weverse DM "
+                                        f"has been cancelled due to insufficient ₩ balance on **{sub.get('oc_name', sub_key)}**.\n\n"
+                                        f"You have been removed from the DM channel. "
+                                        f"Resubscribe via `/weverse dm subscribe` when your balance is topped up."
+                                    ),
+                                    color=discord.Color.red(),
+                                    timestamp=current_time,
+                                )
+                                try:
+                                    await member.send(embed=notify_embed)
+                                except (discord.Forbidden, discord.HTTPException):
+                                    wv_ch = _resolve_weverse_channel(guild, data)
+                                    if wv_ch:
+                                        await wv_ch.send(
+                                            content=f"{member.mention}",
+                                            embed=notify_embed,
+                                            delete_after=86400,
+                                        )
+                        except Exception as _notify_exc:
+                            log.warning("_process_weverse_subscriptions: failed to notify owner of cancellation — %s", _notify_exc)
+
+                    if dm_channel_id and guild:
+                        try:
+                            ch = guild.get_channel(int(dm_channel_id))
+                            owner_discord_id = sub.get("owner_discord_id")
+                            member = guild.get_member(int(owner_discord_id)) if owner_discord_id else None
+                            if ch and isinstance(ch, discord.TextChannel) and member:
+                                await ch.set_permissions(member, overwrite=None)
+                        except Exception:
+                            pass
+
+    if modified:
+        save_data(data)
+
+@tasks.loop(minutes=1)
+async def weverse_billing_loop():
+    await _process_weverse_subscriptions()
+
+@weverse_billing_loop.before_loop
+async def before_weverse_billing_loop():
+    await bot.wait_until_ready()
+
+async def _execute_evaluations():
+    data = load_data()
+    data["evaluation_config"]["last_run"] = now_iso()
+    
+    present_owner_ids = set()
+    for guild in bot.guilds:
+        for member in guild.members:
+            if not member.bot:
+                present_owner_ids.add(member.id)
+                
+    members_ocs = {}
+    for oc_key, oc in data["ocs"].items():
+        owner_id = oc.get("owner_id")
+        if owner_id in present_owner_ids:
+            members_ocs.setdefault(owner_id, []).append((oc_key, oc))
+            
+    results_data = {}
+    for owner_id, ocs in members_ocs.items():
+        user_results = []
+        member_name = f"user {owner_id}"
+        for guild in bot.guilds:
+            m = guild.get_member(owner_id)
+            if m:
+                member_name = m.display_name
+                break
+                
+        for oc_key, oc in ocs:
+            amount = random.randint(100, 2500) * 100
+            amount = max(10_000, min(250_000, amount))
+            
+            if amount <= 80000: rating = "bad"
+            elif amount <= 130000: rating = "fair"
+            elif amount <= 170000: rating = "good"
+            elif amount <= 200000: rating = "great"
+            elif amount <= 225000: rating = "excellent"
+            else: rating = "outstanding"
+            
+            oc["balance"] += amount
+            user_results.append({
+                "oc_name": oc["name"],
+                "rating": rating,
+                "earned": amount,
+                "new_balance": oc["balance"]
+            })
+        results_data[str(owner_id)] = {
+            "member_name": member_name,
+            "ocs": user_results
+        }
+        
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="weekly_evaluation"))
+    
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        if ch and results_data:
+            guild_results = {uid: res for uid, res in results_data.items() if guild.get_member(int(uid)) is not None}
+            if not guild_results: continue
+            pages = []
+            guild_result_items = list(guild_results.items())
+            total_members = len(guild_result_items)
+            for n_idx, (uid, res) in enumerate(guild_result_items, start=1):
+                lines = []
+                for oc_res in res["ocs"]:
+                    lines.append(f"**{oc_res['oc_name']}** had a/an **{oc_res['rating']}** evaluation.")
+                    lines.append(f"they earned ₩{oc_res['earned']:,} — new balance: ₩{oc_res['new_balance']:,}\n")
+                page_embed = discord.Embed(
+                    title=f"📊 evaluation results — {res['member_name']}",
+                    description="\n".join(lines),
+                    color=discord.Color.blurple(),
+                    timestamp=now_utc()
+                )
+                page_embed.set_footer(text=f"member {n_idx} of {total_members}  •  evaluation log — {LOG_CHANNEL_NAME}")
+                pages.append(page_embed)
+            view = EvaluationPaginatorView(pages)
+            summary_embed = discord.Embed(
+                title="📊 weekly evaluations",
+                description="this week's evaluation results have been processed. use ◀ ▶ to browse each member's breakdown.",
+                color=discord.Color.blurple(),
+                timestamp=now_utc()
+            )
+            summary_embed.set_footer(text=f"evaluation log — {LOG_CHANNEL_NAME}")
+            await ch.send(embed=pages[0], view=view)
+
+@tasks.loop(hours=168)
+async def run_weekly_evaluations():
+    global _EVAL_SKIP_FIRST_TICK
+    if _EVAL_SKIP_FIRST_TICK:
+        _EVAL_SKIP_FIRST_TICK = False
+        return
+    data = load_data()
+    if not data.get("evaluation_config", {}).get("running"): return
+    await _execute_evaluations()
+
+@run_weekly_evaluations.before_loop
+async def before_run_weekly_evaluations():
+    await bot.wait_until_ready()
+
+@bot.tree.command(name="evaluation_toggle", description="dev | start or stop automated weekly evaluations.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    name="OC's full name", birthday=f"Birthday in {BIRTHDAY_DISPLAY}", gender="OC's gender",
-    pronouns="Pronouns (e.g. she/her)", face_claim="Face claim", main_skill="Primary skill", 
-    ethnicity="Ethnicity", nationality="Nationality", 
-    profile_picture_url="Direct image URL — required if no file is attached",
-    profile_picture_file="Upload image file — required if no URL is provided",
-    form_link="Link to OC form (optional)"
-)
-async def oc_add(
-    interaction: discord.Interaction, name: str, birthday: str,
-    gender: str, pronouns: str, face_claim: str, main_skill: str, 
-    ethnicity: str, nationality: str,
-    profile_picture_url: Optional[str] = None, profile_picture_file: Optional[discord.Attachment] = None,
-    form_link: Optional[str] = None
-):
+async def evaluation_toggle(interaction: discord.Interaction):
     guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context. Set PRIMARY_GUILD_ID.", ephemeral=True)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-
     try:
-        datetime.strptime(birthday, BIRTHDAY_FORMAT)
-    except ValueError:
-        return await interaction.followup.send(
-            f"❌ Birthday must be in **{BIRTHDAY_DISPLAY}** format (e.g. `2000/06/25`).", ephemeral=True)
+        data = load_data()
+        current = data["evaluation_config"]["running"]
+        new_state = not current
+        data["evaluation_config"]["running"] = new_state
 
-    pic_url = None
-    pic_msg_id = None
-    if profile_picture_file:
-        if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
-            return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
-        persisted = await persist_image_attachment(profile_picture_file, store_msg_id=True)
-        if persisted:
-            pic_url, pic_msg_id = persisted
-        else:
-            pic_url = profile_picture_file.url
-    elif profile_picture_url:
-        if not valid_image_url(profile_picture_url):
-            return await interaction.followup.send("❌ Profile picture must be a direct image URL (.png .jpg .jpeg .gif .webp).", ephemeral=True)
-        pic_url = profile_picture_url
-    else:
-        return await interaction.followup.send("❌ A profile picture is required. Provide either a URL or upload a file.", ephemeral=True)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="eval_toggle"))
 
-    if form_link and not valid_url(form_link):
-        return await interaction.followup.send("❌ Form link must start with http:// or https://.", ephemeral=True)
+        if new_state:
+            if run_weekly_evaluations.is_running():
+                run_weekly_evaluations.cancel()
 
-    data = load_data()
-    key  = oc_key_of(name)
-    if key in data["ocs"]:
-        return await interaction.followup.send(f"❌ An OC named **{name}** already exists. Use /oc_edit to update.", ephemeral=True)
+            last_run_str = data["evaluation_config"].get("last_run")
+            should_run_now = True
+            if last_run_str:
+                try:
+                    last_run_dt = datetime.fromisoformat(last_run_str)
+                    if last_run_dt.tzinfo is None:
+                        last_run_dt = last_run_dt.replace(tzinfo=timezone.utc)
+                    elapsed_hours = (now_utc() - last_run_dt).total_seconds() / 3600
+                    if elapsed_hours < 168:
+                        should_run_now = False
+                except (ValueError, TypeError):
+                    pass
 
-    data["ocs"][key] = {
-        "name": name, "profile_picture": pic_url, "birthday": birthday,
-        "gender": gender, "pronouns": pronouns, "face_claim": face_claim,
-        "main_skill": main_skill, "ethnicity": ethnicity, "nationality": nationality,
-        "form_link": form_link, "owner_id": interaction.user.id,
-        "registered_at": now_iso(),
-    }
-    if pic_msg_id:
-        data["ocs"][key]["profile_picture_msg_id"] = pic_msg_id
-        
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_add"))
-
-    embed = build_oc_embed(data["ocs"][key], key)
-    await interaction.followup.send(f"**{name}** registered successfully.", embed=embed, ephemeral=True)
-
-    log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-    if log_ch:
-        log_embed = discord.Embed(
-            title="✨ New OC Logged",
-            description=f"**{name}** has been registered by {interaction.user.mention}.",
-            color=discord.Color.green(),
-            timestamp=now_utc(),
-        )
-        if pic_url: log_embed.set_thumbnail(url=pic_url)
-        log_embed.add_field(name="Registered By", value=interaction.user.mention, inline=True)
-        log_embed.add_field(name="OC ID", value=f"`{oc_key_of(name)}`", inline=True)
-        await log_ch.send(embed=log_embed)
-
-    await audit(guild, f"OC added: '{name}' by {interaction.user} ({interaction.user.id})")
-
-
-@bot.tree.command(name="oc_edit", description="Edit an existing OC (only filled fields are changed).")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    oc_name="Name of the OC to edit", name="New name", 
-    profile_picture_url="New image URL (optional)", profile_picture_file="Upload new image file (optional)",
-    birthday=f"New birthday in {BIRTHDAY_DISPLAY}", gender="New gender",
-    pronouns="New pronouns", face_claim="New face claim", main_skill="New main skill", 
-    ethnicity="New ethnicity", nationality="New nationality", form_link="New form link"
-)
-async def oc_edit(
-    interaction: discord.Interaction, oc_name: str,
-    name: Optional[str] = None, profile_picture_url: Optional[str] = None, profile_picture_file: Optional[discord.Attachment] = None,
-    birthday: Optional[str] = None, gender: Optional[str] = None, pronouns: Optional[str] = None, face_claim: Optional[str] = None,
-    main_skill: Optional[str] = None, ethnicity: Optional[str] = None, nationality: Optional[str] = None, form_link: Optional[str] = None
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context. Set PRIMARY_GUILD_ID.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    key  = oc_key_of(oc_name)
-    if key not in data["ocs"]:
-        return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    oc = data["ocs"][key]
-    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
-        return await interaction.followup.send("❌ You can only edit your own OCs.", ephemeral=True)
-
-    if birthday:
-        try: datetime.strptime(birthday, BIRTHDAY_FORMAT)
-        except ValueError: return await interaction.followup.send(f"❌ Birthday must be **{BIRTHDAY_DISPLAY}**.", ephemeral=True)
-
-    pic_url = None
-    pic_msg_id = None
-    if profile_picture_file:
-        if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
-            return await interaction.followup.send("❌ Attached file must be an image.", ephemeral=True)
-        persisted = await persist_image_attachment(profile_picture_file, store_msg_id=True)
-        if persisted:
-            pic_url, pic_msg_id = persisted
-        else:
-            pic_url = profile_picture_file.url
-    elif profile_picture_url:
-        if not valid_image_url(profile_picture_url):
-            return await interaction.followup.send("❌ Profile picture must be a direct image URL.", ephemeral=True)
-        pic_url = profile_picture_url
-
-    if form_link and not valid_url(form_link):
-        return await interaction.followup.send("❌ Form link must be a valid URL.", ephemeral=True)
-
-    updates = {
-        "name": name, "birthday": birthday, "gender": gender, "pronouns": pronouns, 
-        "face_claim": face_claim, "main_skill": main_skill, "ethnicity": ethnicity,
-        "nationality": nationality, "form_link": form_link,
-    }
-    if pic_url:
-        updates["profile_picture"] = pic_url
-    if pic_msg_id:
-        updates["profile_picture_msg_id"] = pic_msg_id
-        
-    changes = []
-    for field, val in updates.items():
-        if val is not None:
-            old_val = oc.get(field)
-            if field == "birthday":
-                display_old = format_birthday_long(old_val) if old_val else "None"
-                display_new = format_birthday_long(val)
-                changes.append(f"`birthday`: {display_old} → {display_new}")
+            if should_run_now:
+                await _execute_evaluations()
+                status_desc = "evaluations are now **running**. an evaluation was executed immediately."
             else:
-                changes.append(f"`{field}`: {old_val} → {val}")
-            oc[field] = val
+                status_desc = (
+                    "evaluations are now **running**. "
+                    f"the last evaluation ran {int(elapsed_hours)}h ago — "
+                    "the next one will fire on schedule."
+                )
 
-    if not changes:
-        return await interaction.followup.send("❌ No changes were provided.", ephemeral=True)
+            global _EVAL_SKIP_FIRST_TICK
+            _EVAL_SKIP_FIRST_TICK = not should_run_now
+            run_weekly_evaluations.start()
+        else:
+            status_desc = "evaluations are now **stopped**."
 
-    new_key = oc_key_of(oc["name"])
-    if new_key != key:
-        data["ocs"][new_key] = data["ocs"].pop(key)
-        for floor in data["floors"].values():
-            for room in floor["rooms"].values():
-                if key in room["occupants"]:
-                    room["occupants"].remove(key)
-                    room["occupants"].append(new_key)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_edit"))
-    
-    embed = build_oc_embed(oc, new_key)
-    await interaction.followup.send(f"**{oc['name']}** updated.\n\n**Changes:**\n" + "\n".join(changes), embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="oc_delete", description="Delete an OC entirely.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(oc_name="Name of the OC to delete")
-async def oc_delete(interaction: discord.Interaction, oc_name: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data = load_data()
-    key  = oc_key_of(oc_name)
-    if key not in data["ocs"]:
-        return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-            
-    oc = data["ocs"][key]
-    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
-        return await interaction.response.send_message("❌ You do not have permission to delete this OC.", ephemeral=True)
-            
-    del data["ocs"][key]
-    for floor in data["floors"].values():
-        for room in floor.get("rooms", {}).values():
-            if key in room.get("occupants", []): room["occupants"].remove(key)
-    for gc in data["groupchats"].values():
-        if key in gc.get("participants", []): gc["participants"].remove(key)
-    for dm in data["dms"].values():
-        if key in dm.get("participants", []): dm["participants"].remove(key)
-            
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_delete"))
-    
-    await interaction.response.send_message(f"✅ **{oc['name']}** has been deleted.", ephemeral=True)
-    await audit(guild, f"OC deleted: '{oc['name']}' by {interaction.user} ({interaction.user.id})")
-
-
-@bot.tree.command(name="oc_fix_image", description="Re-upload a broken OC profile picture with a new attachment.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    oc_name="Name of the OC whose image is broken",
-    new_image="New profile picture file to upload (image files only)"
-)
-async def oc_fix_image(interaction: discord.Interaction, oc_name: str, new_image: discord.Attachment):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data = load_data()
-    key = oc_key_of(oc_name)
-    if key not in data["ocs"]:
-        return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    oc = data["ocs"][key]
-    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"):
-        return await interaction.response.send_message("❌ You can only fix images for your own OCs.", ephemeral=True)
-
-    if not new_image.content_type or not new_image.content_type.startswith("image/"):
-        return await interaction.response.send_message("❌ Attached file must be an image.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    result = await persist_image_attachment(new_image, store_msg_id=True)
-    if result is None:
-        return await interaction.followup.send("❌ Failed to persist the image. Ensure #bot-assets exists and the bot has Attach Files + Manage Messages.", ephemeral=True)
-
-    cdn_url, msg_id = result
-    oc["profile_picture"] = cdn_url
-    if msg_id:
-        oc["profile_picture_msg_id"] = msg_id
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_fix_image"))
-
-    embed = discord.Embed(
-        title="🖼️ Profile Picture Updated",
-        color=discord.Color.green(),
-        timestamp=now_utc()
-    )
-    embed.set_thumbnail(url=cdn_url)
-    embed.add_field(name="OC", value=oc["name"], inline=False)
-    
-    display_url = cdn_url if len(cdn_url) <= 100 else cdn_url[:97] + "..."
-    embed.add_field(name="New URL", value=display_url, inline=False)
-    embed.set_footer(text=f"Fixed by {interaction.user}")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
-    await audit(guild, f"[OC_FIX_IMAGE] '{oc['name']}' image replaced by {interaction.user} ({interaction.user.id})  new_url={cdn_url}")
-
-
-class OCPaginatorView(discord.ui.View):
-    def __init__(self, ocs: list, filters_text: str = ""):
-        super().__init__(timeout=300)
-        self.ocs = ocs
-        self.filters_text = filters_text
-        self.current_index = 0
-        self._update_buttons()
-
-    def _update_buttons(self):
-        self.prev_btn.disabled = self.current_index == 0
-        self.next_btn.disabled = self.current_index == len(self.ocs) - 1
-
-    def get_embed(self):
-        key, oc = self.ocs[self.current_index]
-        embed = build_oc_embed(oc, key)
-        footer_text = f"OC ID: {key}  ·  Result {self.current_index + 1} of {len(self.ocs)}"
-        if self.filters_text: footer_text += f"  ·  Filters: {self.filters_text}"
-        embed.set_footer(text=footer_text)
-        return embed
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="prev_oc")
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index -= 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="next_oc")
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index += 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-
-class BirthdayPaginatorView(discord.ui.View):
-    PAGE_SIZE = 7
-
-    def __init__(self, ocs_sorted: list, today_kst):
-        super().__init__(timeout=300)
-        self.ocs_sorted = ocs_sorted
-        self.today_kst  = today_kst
-        self.page       = 0
-        self.total_pages = max(1, math.ceil(len(ocs_sorted) / self.PAGE_SIZE))
-        self._update_buttons()
-
-    def _update_buttons(self):
-        self.prev_btn.disabled = (self.page == 0)
-        self.next_btn.disabled = (self.page >= self.total_pages - 1)
-
-    def _get_page_ocs(self):
-        start = self.page * self.PAGE_SIZE
-        return self.ocs_sorted[start : start + self.PAGE_SIZE]
-
-    def get_embed(self):
-        page_ocs = self._get_page_ocs()
-        base_index = self.page * self.PAGE_SIZE
-        lines = []
-        for i, oc in enumerate(page_ocs, start=base_index + 1):
-            days = days_until_birthday(oc["birthday"], self.today_kst)
-            bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
-            bday_display = bday.strftime("%B %d")
-
-            if days == 0:
-                status = "🎉 Today!"
-            elif days < 365:
-                status = f"📅 in {days} day(s)"
-            else:
-                pass_date = date(self.today_kst.year, bday.month, bday.day)
-                status = f"✅ Turned {self.today_kst.year - bday.year} on {pass_date.strftime('%B %d')}"
-
-            lines.append(f"**{i}.** **{oc['name']}** — {bday_display} ({status})")
+        data = load_data()
+        last_run = data["evaluation_config"].get("last_run") or "never"
 
         embed = discord.Embed(
-            title="🎂 Upcoming Birthdays",
-            description="\n".join(lines),
-            color=discord.Color.from_rgb(255, 182, 193),
-            timestamp=datetime.now(KST),
+            title="evaluation config updated",
+            description=status_desc,
+            color=discord.Color.green()
         )
-        embed.set_footer(
-            text=(
-                f"Page {self.page + 1}/{self.total_pages}  ·  "
-                f"Showing {len(page_ocs)} of {len(self.ocs_sorted)} OCs  ·  "
-                f"Sorted by proximity to today (KST)"
-            )
-        )
-        return embed
+        embed.add_field(name="running", value=str(new_state), inline=True)
+        embed.add_field(name="last run", value=last_run, inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await audit(guild, f"evaluations toggled to {new_state} by {interaction.user}")
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="bday_prev")
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page -= 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    except Exception as e:
+        log.error(f"evaluation_toggle error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="bday_next")
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page += 1
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-
-@bot.tree.command(name="oc_list", description="Browse all OCs with optional filter.")
+@bot.tree.command(name="evaluation_run", description="dev | manually trigger the weekly evaluation right now.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    filter_by="Field to filter by", filter_value="Value to match (case-insensitive)", search_name="Filter by OC name (partial match)"
-)
-@app_commands.choices(filter_by=[app_commands.Choice(name=f, value=f) for f in FILTERABLE_FIELDS])
-async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = None, filter_value: Optional[str] = None, search_name: Optional[str] = None):
-    data = load_data()
-    ocs  = dict(data["ocs"])
-
-    if not ocs: return await interaction.response.send_message("❌ No OCs registered yet.", ephemeral=True)
-    if search_name:
-        ocs = {k: v for k, v in ocs.items() if search_name.lower() in v["name"].lower()}
-    if filter_by and filter_value:
-        ocs = {k: v for k, v in ocs.items() if str(v.get(filter_by, "")).lower() == filter_value.lower()}
-    if not ocs: return await interaction.response.send_message("❌ No OCs match the given filters.", ephemeral=True)
-
-    filters_active = []
-    if search_name: filters_active.append(f"name contains '{search_name}'")
-    if filter_by: filters_active.append(f"{filter_by} = {filter_value}")
-    filters_text = ", ".join(filters_active)
-
-    items = list(ocs.items())
-    view = OCPaginatorView(items, filters_text)
-    await interaction.response.send_message(embed=view.get_embed(), view=view)
-
-
-@bot.tree.command(name="birthday_list", description="View the next 7 upcoming OC birthdays in a single list.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def birthday_list(interaction: discord.Interaction):
-    data = load_data()
-    ocs = list(data["ocs"].values())
-    if not ocs:
-        return await interaction.response.send_message("❌ No OCs registered yet.", ephemeral=True)
-
-    today_kst = datetime.now(KST).date()
-    ocs_sorted = sorted(ocs, key=lambda o: days_until_birthday(o["birthday"], today_kst))
-
-    view = BirthdayPaginatorView(ocs_sorted, today_kst)
-    await interaction.response.send_message(embed=view.get_embed(), view=view)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FLOOR & DORM MANAGEMENT
-# ══════════════════════════════════════════════════════════════════════════════
-
-@bot.tree.command(name="floor_create", description="[Dev] Create a new floor category.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(floor_name="Display name for the floor (e.g. 1st Floor)")
-async def floor_create(interaction: discord.Interaction, floor_name: str):
+async def evaluation_run_cmd(interaction: discord.Interaction):
     guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can create floors.", ephemeral=True)
-    data = load_data()
-    key  = dorm_key_of(floor_name)
-    if key in data["floors"]: return await interaction.response.send_message(f"❌ A floor named **{floor_name}** already exists.", ephemeral=True)
-
-    data["floors"][key] = {"name": floor_name, "rooms": {}}
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_create"))
-
-    category = discord.utils.get(guild.categories, name=floor_name)
-    if category is None: await guild.create_category(floor_name)
-
-    await interaction.response.send_message(f"🏢 Floor **{floor_name}** created.\nUse `/dorm_create` to add rooms.", ephemeral=True)
-    await audit(guild, f"Floor created: '{floor_name}' by {interaction.user} ({interaction.user.id})")
-
-
-@bot.tree.command(name="floor_rename", description="[Dev] Rename a floor without affecting room assignments.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(old_name="Current floor name", new_name="New floor name")
-async def floor_rename(interaction: discord.Interaction, old_name: str, new_name: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can rename floors.", ephemeral=True)
-
-    old_key = dorm_key_of(old_name)
-    new_key = dorm_key_of(new_name)
-    data    = load_data()
-
-    if old_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{old_name}** found.", ephemeral=True)
-    if new_key == old_key: return await interaction.response.send_message("❌ New name resolves to the same key.", ephemeral=True)
-    if new_key in data["floors"]: return await interaction.response.send_message("❌ Floor with this key already exists.", ephemeral=True)
-
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    
     await interaction.response.defer(ephemeral=True)
-    floor_data = data["floors"].pop(old_key)
-    floor_data["name"] = new_name
-    data["floors"][new_key] = floor_data
-
-    category = discord.utils.get(guild.categories, name=old_name)
-    if category:
-        try: await category.edit(name=new_name)
-        except discord.Forbidden: await interaction.followup.send("⚠️ Lacking permissions to rename Discord category.", ephemeral=True)
-        except discord.HTTPException as e: await interaction.followup.send(f"⚠️ Discord category rename failed: {e}", ephemeral=True)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_rename"))
-    await interaction.followup.send(f"✅ Floor **{old_name}** renamed to **{new_name}**.", ephemeral=True)
-    await audit(guild, f"Floor renamed: '{old_name}' → '{new_name}' by {interaction.user} ({interaction.user.id})")
-
-
-@bot.tree.command(name="floor_delete", description="[Dev] Permanently delete a floor and all its dorm rooms.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(floor_name="Floor to delete", confirm="Type the floor name exactly to confirm")
-async def floor_delete(interaction: discord.Interaction, floor_name: str, confirm: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can delete floors.", ephemeral=True)
-    f_key = dorm_key_of(floor_name)
-    data = load_data()
-    
-    if f_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
-    if confirm != floor_name: return await interaction.response.send_message(f"❌ Confirmation text does not match.", ephemeral=True)
-            
-    await interaction.response.defer(ephemeral=True)
-    floor_data = data["floors"].pop(f_key)
-    
-    displaced: dict[str, list[str]] = {}
-    for r_key, room_data in floor_data["rooms"].items():
-        for oc_key in room_data.get("occupants", []):
-            displaced.setdefault(oc_key, []).append(room_data["name"])
-            
-    category = discord.utils.get(guild.categories, name=floor_data["name"])
-    if category:
-        for ch in list(category.channels):
-            try: await ch.delete(reason=f"Floor '{floor_data['name']}' deleted by dev")
-            except (discord.Forbidden, discord.HTTPException) as e: log.warning("floor_delete: %s", e)
-        try: await category.delete(reason=f"Floor '{floor_data['name']}' deleted by dev")
-        except (discord.Forbidden, discord.HTTPException) as e: log.warning("floor_delete: %s", e)
-            
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_delete"))
-    
-    available_rooms_text = _build_available_rooms_text(data)
-    failed_dms = []
-    owners_dict = {}
-    oc_count = 0
-    for oc_key, room_names in displaced.items():
-        if oc_key not in data["ocs"]: continue
-        owner_id = data["ocs"][oc_key].get("owner_id")
-        if not owner_id: continue
-        oc_name = data["ocs"][oc_key]["name"]
-        oc_count += 1
-        
-        if owner_id not in owners_dict: owners_dict[owner_id] = {"oc_names": [], "evicted_lines": [], "mentions": []}
-        owners_dict[owner_id]["oc_names"].append(oc_name)
-        for r_name in room_names: owners_dict[owner_id]["evicted_lines"].append(f"{r_name} on {floor_data['name']}")
-            
-    displaced_bullets = []
-    for owner_id, o_data in owners_dict.items():
-        for o_n in o_data["oc_names"]: displaced_bullets.append(f"• {o_n} (<@{owner_id}>)")
-        try: owner = await guild.fetch_member(owner_id)
-        except (discord.NotFound, discord.HTTPException):
-            failed_dms.append(f"<@{owner_id}>")
-            continue
-            
-        dm_embed = _build_displaced_dm_embed(", ".join(o_data["oc_names"]), o_data["evicted_lines"], available_rooms_text)
-        try: await owner.send(embed=dm_embed)
-        except (discord.Forbidden, discord.HTTPException): failed_dms.append(owner.mention)
-            
-    dev_embed = discord.Embed(title="🗑️ Floor Deleted", color=discord.Color.red(), timestamp=now_utc())
-    dev_embed.add_field(name="Floor", value=floor_data["name"], inline=True)
-    dev_embed.add_field(name="Rooms Deleted", value=f"{len(floor_data['rooms'])}", inline=True)
-    if displaced_bullets: dev_embed.add_field(name="OCs Displaced", value=f"{oc_count}\n" + "\n".join(displaced_bullets), inline=False)
-    else: dev_embed.add_field(name="OCs Displaced", value="0", inline=False)
-        
-    dm_status = "✅ All owners notified." if not failed_dms and owners_dict else "None required."
-    if failed_dms: dm_status = f"⚠️ Could not DM: {', '.join(failed_dms)}"
-    dev_embed.add_field(name="DM Status", value=dm_status, inline=False)
-    
-    await interaction.followup.send(embed=dev_embed, ephemeral=True)
-    await audit(guild, f"Floor deleted: '{floor_data['name']}' — {len(displaced)} OCs displaced by {interaction.user}")
-
-
-@bot.tree.command(name="dorm_create", description="[Dev] Create a dorm room inside a floor.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(floor_name="Floor this room belongs to", room_name="Name for the room", capacity="Capacity (1, 2, 3, or 4)")
-async def dorm_create(interaction: discord.Interaction, floor_name: str, room_name: str, capacity: int):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can create dorms.", ephemeral=True)
-    if capacity not in DORM_SIZES: return await interaction.response.send_message(f"❌ Capacity must be one of: {', '.join(str(s) for s in DORM_SIZES)}.", ephemeral=True)
-
-    data = load_data()
-    f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
-
-    if f_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
-    floor = data["floors"][f_key]
-    if r_key in floor["rooms"]: return await interaction.response.send_message(f"❌ Room **{room_name}** already exists.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    floor["rooms"][r_key] = {"name": room_name, "capacity": capacity, "occupants": []}
-    
-    category = discord.utils.get(guild.categories, name=floor["name"])
-    if category is None: category = await guild.create_category(floor["name"])
-
-    if not discord.utils.get(guild.text_channels, name=r_key, category=category):
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me:           discord.PermissionOverwrite(view_channel=True),
-        }
-        if guild.owner: overwrites[guild.owner] = discord.PermissionOverwrite(view_channel=True)
-        await guild.create_text_channel(r_key, category=category, overwrites=overwrites)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_create"))
-    await interaction.followup.send(f"🚪 Room **{room_name}** (capacity: {capacity}) created on **{floor['name']}**.")
-    await audit(guild, f"Room created: '{room_name}' on '{floor['name']}' by {interaction.user}")
-
-
-@bot.tree.command(name="dorm_edit", description="[Dev] Rename and/or change the capacity of a dorm room while keeping all current occupants.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    floor_name="Floor this room belongs to",
-    room_name="Current name of the room to edit",
-    new_room_name="New display name for the room (optional — leave blank to keep current)",
-    new_capacity="New capacity: 1, 2, 3, or 4 (optional — leave blank to keep current)",
-)
-async def dorm_edit(
-    interaction: discord.Interaction,
-    floor_name: str,
-    room_name: str,
-    new_room_name: Optional[str] = None,
-    new_capacity: Optional[int] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction):
-        return await interaction.response.send_message("❌ Only devs can edit dorm rooms.", ephemeral=True)
-
-    if new_room_name is None and new_capacity is None:
-        return await interaction.response.send_message(
-            "❌ Provide at least one of: `new_room_name` or `new_capacity`.", ephemeral=True
-        )
-
-    if new_capacity is not None and new_capacity not in DORM_SIZES:
-        return await interaction.response.send_message(
-            f"❌ Capacity must be one of: {', '.join(str(s) for s in DORM_SIZES)}.", ephemeral=True
-        )
-
-    f_key    = dorm_key_of(floor_name)
-    old_rkey = room_key_of(room_name)
-    data     = load_data()
-
-    if f_key not in data["floors"]:
-        return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
-
-    floor = data["floors"][f_key]
-
-    if old_rkey not in floor["rooms"]:
-        return await interaction.response.send_message(f"❌ No room named **{room_name}** found on **{floor_name}**.", ephemeral=True)
-
-    room_data = floor["rooms"][old_rkey]
-    current_occupant_count = len(room_data.get("occupants", []))
-    changes = []
-
-    if new_capacity is not None:
-        old_cap = room_data["capacity"]
-        if new_capacity == old_cap:
-            return await interaction.response.send_message(
-                f"❌ The room already has a capacity of {old_cap}.", ephemeral=True
-            )
-        if new_capacity < current_occupant_count:
-            return await interaction.response.send_message(
-                f"❌ Cannot reduce capacity to {new_capacity} — room currently has "
-                f"{current_occupant_count} occupant(s). Remove occupants first with `/dorm_kick` or `/dorm_unassign`.",
-                ephemeral=True
-            )
-        room_data["capacity"] = new_capacity
-        changes.append(f"`capacity`: {old_cap} → {new_capacity}")
-
-    if new_room_name is not None:
-        new_rkey = room_key_of(new_room_name)
-
-        if new_rkey == old_rkey:
-            return await interaction.response.send_message("❌ New name resolves to the same key as current name.", ephemeral=True)
-        if new_rkey in floor["rooms"]:
-            return await interaction.response.send_message("❌ A room with that key already exists on this floor.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True)
-
-        floor["rooms"][new_rkey] = floor["rooms"].pop(old_rkey)
-        floor["rooms"][new_rkey]["name"] = new_room_name
-        changes.append(f"`name`: {room_name} → {new_room_name}")
-
-        category = discord.utils.get(guild.categories, name=floor["name"])
-        if category:
-            channel = discord.utils.get(guild.text_channels, name=old_rkey, category=category)
-            if channel:
-                try:
-                    await channel.edit(name=new_rkey)
-                except discord.Forbidden:
-                    await interaction.followup.send("⚠️ Lacking permissions to rename the Discord channel.", ephemeral=True)
-                except discord.HTTPException as e:
-                    await interaction.followup.send(f"⚠️ Discord channel rename failed: {e}", ephemeral=True)
-    else:
-        await interaction.response.defer(ephemeral=True)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_edit"))
-
-    change_summary = "\n".join(f"• {c}" for c in changes)
-    final_name = new_room_name or room_name
-    await interaction.followup.send(
-        f"✅ Dorm **{final_name}** on **{floor_name}** updated:\n{change_summary}\n"
-        f"({current_occupant_count} occupant(s) retained)",
-        ephemeral=True
-    )
-    await audit(
-        guild,
-        f"Dorm edited: '{room_name}' on '{floor_name}' — {'; '.join(changes)} — by {interaction.user} ({interaction.user.id})"
-    )
-
-
-@bot.tree.command(name="dorm_relocate", description="[Dev] Move a dorm room from one floor to another.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(room_name="Room to move", source_floor="Current floor", target_floor="Destination floor")
-async def dorm_relocate(interaction: discord.Interaction, room_name: str, source_floor: str, target_floor: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can relocate dorm rooms.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    src_fkey, tgt_fkey, r_key = dorm_key_of(source_floor), dorm_key_of(target_floor), room_key_of(room_name)
-
-    if src_fkey not in data["floors"]: return await interaction.followup.send(f"❌ Source floor not found.", ephemeral=True)
-    if tgt_fkey not in data["floors"]: return await interaction.followup.send(f"❌ Target floor not found.", ephemeral=True)
-    if src_fkey == tgt_fkey: return await interaction.followup.send("❌ Source and target floor are the same.", ephemeral=True)
-    if r_key not in data["floors"][src_fkey]["rooms"]: return await interaction.followup.send(f"❌ Room not found.", ephemeral=True)
-    if r_key in data["floors"][tgt_fkey]["rooms"]: return await interaction.followup.send(f"❌ Room already exists on target.", ephemeral=True)
-
-    room_data = data["floors"][src_fkey]["rooms"].pop(r_key)
-    data["floors"][tgt_fkey]["rooms"][r_key] = room_data
-
-    src_category = discord.utils.get(guild.categories, name=data["floors"][src_fkey]["name"])
-    tgt_category = discord.utils.get(guild.categories, name=data["floors"][tgt_fkey]["name"])
-    
-    if not tgt_category:
-        try: tgt_category = await guild.create_category(data["floors"][tgt_fkey]["name"])
-        except (discord.Forbidden, discord.HTTPException) as e: tgt_category = None
-
-    if src_category and tgt_category:
-        channel = discord.utils.get(guild.text_channels, name=r_key, category=src_category)
-        if channel:
-            try: await channel.edit(category=tgt_category)
-            except discord.HTTPException: pass
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_relocate"))
-
-    occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"]) or "None"
-    embed = discord.Embed(title="Dorm Relocated", color=discord.Color.green(), timestamp=now_utc())
-    embed.add_field(name="Room", value=room_data["name"], inline=True)
-    embed.add_field(name="Moved From", value=data["floors"][src_fkey]["name"], inline=True)
-    embed.add_field(name="Moved To", value=data["floors"][tgt_fkey]["name"], inline=True)
-    await interaction.followup.send(embed=embed, ephemeral=True)
-    await audit(guild, f"Room relocated: '{room_data['name']}' to '{data['floors'][tgt_fkey]['name']}' by {interaction.user}")
-
-
-@bot.tree.command(name="dorm_delete", description="[Dev] Permanently delete a single dorm room from a floor.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(floor_name="Floor the room belongs to", room_name="Room to delete", confirm="Type the room name exactly to confirm")
-async def dorm_delete(interaction: discord.Interaction, floor_name: str, room_name: str, confirm: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can delete dorm rooms.", ephemeral=True)
-            
-    f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
-    data = load_data()
-    
-    if f_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
-    floor = data["floors"][f_key]
-    if r_key not in floor["rooms"]: return await interaction.response.send_message(f"❌ No room named **{room_name}** found.", ephemeral=True)
-    if confirm != room_name: return await interaction.response.send_message(f"❌ Confirmation text does not match.", ephemeral=True)
-            
-    await interaction.response.defer(ephemeral=True)
-    room_data = floor["rooms"].pop(r_key)
-    displaced_oc_keys = list(room_data.get("occupants", []))
-    
-    category = discord.utils.get(guild.categories, name=floor["name"])
-    if category:
-        ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
-        if ch:
-            try: await ch.delete()
-            except (discord.Forbidden, discord.HTTPException): pass
-                
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_delete"))
-    
-    dev_embed = discord.Embed(title="🗑️ Dorm Deleted", color=discord.Color.red(), timestamp=now_utc())
-    dev_embed.add_field(name="Room", value=room_data["name"], inline=True)
-    await interaction.followup.send(embed=dev_embed, ephemeral=True)
-    await audit(guild, f"Dorm deleted: '{room_data['name']}' on '{floor['name']}' by {interaction.user}")
-
-
-@bot.tree.command(name="dorm_assign", description="Assign an OC to a dorm room.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(oc_name="OC name", floor_name="Floor name", room_name="Room name")
-async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name: str, room_name: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data   = load_data()
-    oc_key, f_key, r_key = oc_key_of(oc_name), dorm_key_of(floor_name), room_key_of(room_name)
-
-    if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-    if f_key not in data["floors"]: return await interaction.response.send_message(f"❌ No floor named **{floor_name}** found.", ephemeral=True)
-
-    floor = data["floors"][f_key]
-    if r_key not in floor["rooms"]: return await interaction.response.send_message(f"❌ Room **{room_name}** does not exist.", ephemeral=True)
-
-    for f_k, f_v in data["floors"].items():
-        for r_k, r_v in f_v["rooms"].items():
-            if oc_key in r_v["occupants"]: return await interaction.response.send_message(f"❌ **{oc_name}** is already assigned to a room.", ephemeral=True)
-
-    room_data = floor["rooms"][r_key]
-    if len(room_data["occupants"]) >= room_data["capacity"]:
-        return await interaction.response.send_message(f"❌ **{room_name}** is full.", ephemeral=True)
-
-    room_data["occupants"].append(oc_key)
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_assign"))
-
-    category = discord.utils.get(guild.categories, name=floor["name"])
-    channel = discord.utils.get(guild.text_channels, name=r_key, category=category)
-    if channel: await channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
-
-    occupants_display = ", ".join(data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"])
-    await interaction.response.send_message(f"🛏️ **{oc_name}** assigned to **{room_name}** on **{floor_name}**.\n👥 Occupants: {occupants_display}", ephemeral=True)
-    await audit(guild, f"OC '{oc_name}' assigned to '{room_name}' by {interaction.user}")
-
-    if len(room_data["occupants"]) == room_data["capacity"]:
-        log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-        if log_ch:
-            occupants_names = [
-                data["ocs"][o]["name"] for o in room_data["occupants"] if o in data["ocs"]
-            ]
-            full_embed = discord.Embed(
-                title="🏠 Dorm Room Now Full",
-                description=(
-                    f"**{room_data['name']}** on **{floor['name']}** is now at full capacity "
-                    f"({room_data['capacity']}/{room_data['capacity']})."
-                ),
-                color=discord.Color.red(),
-                timestamp=now_utc(),
-            )
-            full_embed.add_field(
-                name="Occupants",
-                value="\n".join(f"• {name}" for name in occupants_names),
-                inline=False,
-            )
-            full_embed.set_footer(text=f"Assignment triggered by {interaction.user.display_name}")
-            await log_ch.send(embed=full_embed)
-
-
-@bot.tree.command(name="dorm_unassign", description="Remove an OC from their room.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(oc_name="Name of the OC to unassign")
-async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data   = load_data()
-    oc_key = oc_key_of(oc_name)
-    if oc_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    for f_key, floor in data["floors"].items():
-        for r_key, room_data in floor["rooms"].items():
-            if oc_key in room_data["occupants"]:
-                room_data["occupants"].remove(oc_key)
-                save_data(data)
-                asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_unassign"))
-                
-                category = discord.utils.get(guild.categories, name=floor["name"])
-                ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
-                if ch: await ch.set_permissions(interaction.user, overwrite=None)
-                    
-                await interaction.response.send_message(f"🚶 **{oc_name}** removed from **{room_data['name']}** on **{floor['name']}**.", ephemeral=True)
-                await audit(guild, f"OC '{oc_name}' unassigned by {interaction.user}")
-                return
-
-    await interaction.response.send_message(f"❌ **{oc_name}** is not assigned to any dorm room.", ephemeral=True)
-
-
-@bot.tree.command(name="dorm_kick", description="[Dev] Force-remove a user's OC(s) from all dorm assignments.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(user="User whose OC(s) should be removed", oc_name="Optional specific OC to remove")
-async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_name: Optional[str] = None):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can force-remove.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    if oc_name:
-        candidate_keys = [oc_key_of(oc_name)]
-        if candidate_keys[0] not in data["ocs"]: return await interaction.followup.send(f"❌ OC not found.", ephemeral=True)
-    else:
-        candidate_keys = [k for k, v in data["ocs"].items() if v.get("owner_id") == user.id]
-
-    removed = []
-    for f_key, floor in data["floors"].items():
-        for r_key, room_data in floor["rooms"].items():
-            for oc_k in candidate_keys:
-                if oc_k in room_data["occupants"]:
-                    room_data["occupants"].remove(oc_k)
-                    removed.append((data["ocs"][oc_k]["name"], floor["name"], room_data["name"]))
-
-                    category = discord.utils.get(guild.categories, name=floor["name"])
-                    ch = discord.utils.get(guild.text_channels, name=r_key, category=category)
-                    if ch:
-                        try: await ch.set_permissions(user, overwrite=None)
-                        except discord.Forbidden: pass
-
-    if not removed: return await interaction.followup.send(f"❌ No OCs were in dorms.", ephemeral=True)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_kick"))
-
-    lines = "\n".join(f"• **{name}** removed from **{room}**" for name, floor, room in removed)
-    await interaction.followup.send(f"🚷 Dorm kick complete for {user.mention}:\n{lines}", ephemeral=True)
-    await audit(guild, f"Dorm kick: {user} by {interaction.user}")
-
-
-class DormPaginatorView(discord.ui.View):
-    def __init__(self, floors_items: list, ocs: dict):
-        super().__init__(timeout=300)
-        self.floors = floors_items
-        self.ocs = ocs
-        self.current_index = 0
-
-        options = [
-            discord.SelectOption(
-                label=floor["name"][:100],
-                value=str(i),
-                description=f"{len(floor['rooms'])} room(s)",
-                default=(i == 0),
-            )
-            for i, (_, floor) in enumerate(floors_items[:25])
-        ]
-        if len(floors_items) > 25:
-            log.warning("dorm_view: more than 25 floors; dropdown truncated to 25.")
-
-        self.floor_select = discord.ui.Select(
-            placeholder="Select a floor…",
-            options=options,
-            min_values=1,
-            max_values=1,
-            custom_id="dorm_floor_select",
-        )
-        self.floor_select.callback = self._floor_select_callback
-        self.add_item(self.floor_select)
-
-    async def _floor_select_callback(self, interaction: discord.Interaction):
-        selected_index = int(self.floor_select.values[0])
-        self.current_index = selected_index
-        for opt in self.floor_select.options:
-            opt.default = (opt.value == str(selected_index))
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    def get_embed(self):
-        if not self.floors:
-            return discord.Embed(title="No Floors", description="No floors have been created yet.")
-            
-        f_key, floor = self.floors[self.current_index]
-        embed = discord.Embed(title=f"Floor: {floor['name']}", color=discord.Color.green())
-        
-        if not floor["rooms"]:
-            embed.description = "🪑 No rooms added yet. Use `/dorm_create` to add some."
-            
-        for r_key, room_data in floor["rooms"].items():
-            occupants = [self.ocs[o]["name"] for o in room_data["occupants"] if o in self.ocs]
-            is_full   = len(room_data["occupants"]) >= room_data["capacity"]
-            status    = "🔴 Full" if is_full else "🟢 Available"
-            occ_str   = ("🏠 " + ", ".join(occupants)) if occupants else "🪑 Empty"
-            
-            embed.add_field(
-                name=f"🚪 {room_data['name']}  [{len(room_data['occupants'])}/{room_data['capacity']}]  {status}",
-                value=occ_str, inline=False)
-                
-        embed.set_footer(text=f"Floor {self.current_index + 1} of {len(self.floors)}")
-        return embed
-
-@bot.tree.command(name="dorm_view", description="View floors and dorm occupancy.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def dorm_view(interaction: discord.Interaction):
-    data = load_data()
-    if not data["floors"]: return await interaction.response.send_message("❌ No floors have been created yet.", ephemeral=True)
-
-    items = list(data["floors"].items())
-    view = DormPaginatorView(items, data["ocs"])
-    await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  NEWS & ANNOUNCEMENTS (dev only)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@bot.tree.command(name="news_post", description="[Dev] Post a news article embed.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(title="Article headline", content="Article body", image_url="Optional image URL")
-async def news_post(interaction: discord.Interaction, title: str, content: str, image_url: Optional[str] = None):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can post news.", ephemeral=True)
-    if image_url and not valid_image_url(image_url): return await interaction.response.send_message("❌ Invalid image URL.", ephemeral=True)
-
-    news_ch = discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
-    if not news_ch: return await interaction.response.send_message(f"❌ Channel `#{NEWS_CHANNEL_NAME}` not found.", ephemeral=True)
-
-    embed = discord.Embed(title=title, description=content, color=discord.Color.red(), timestamp=now_utc())
-    if image_url: embed.set_image(url=image_url)
-    embed.set_footer(text=f"Posted by {interaction.user.display_name}")
-
-    await news_ch.send(embed=embed)
-    await interaction.response.send_message(f"Article **{title}** posted.", ephemeral=True)
-    await audit(guild, f"News posted: '{title}' by {interaction.user}")
-
-
-@bot.tree.command(name="send_embed", description="[Dev] Post a custom embed to any channel as a custom identity.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    channel="Target text channel", title="Embed title (1-256 chars)", content="Embed description (1-4096 chars)",
-    custom_username="Optional custom sender name", avatar_url="Optional custom sender avatar URL",
-    color="Optional hex color", image_url="Optional image URL", footer_text="Optional footer text"
-)
-async def send_embed(
-    interaction: discord.Interaction, channel: discord.TextChannel, title: str, content: str,
-    custom_username: Optional[str] = None, avatar_url: Optional[str] = None, color: Optional[str] = None,
-    image_url: Optional[str] = None, footer_text: Optional[str] = None
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can send custom embeds.", ephemeral=True)
-    if len(title) < 1 or len(title) > 256: return await interaction.response.send_message("❌ Title must be 1-256 characters.", ephemeral=True)
-    if len(content) < 1 or len(content) > 4096: return await interaction.response.send_message("❌ Content must be 1-4096 characters.", ephemeral=True)
-
-    warning_msg = ""
-    resolved_color = discord.Color.blurple()
-    if color:
-        try: resolved_color = discord.Color(int(color.lstrip('#'), 16))
-        except ValueError: warning_msg = "\n⚠️ Invalid color hex, using default."
-
-    embed = discord.Embed(title=title, description=content, color=resolved_color, timestamp=now_utc())
-    embed.set_author(name=custom_username or interaction.user.display_name, icon_url=avatar_url or interaction.user.display_avatar.url)
-    if image_url: embed.set_image(url=image_url)
-    if footer_text: embed.set_footer(text=footer_text)
-
-    await channel.send(embed=embed)
-    await interaction.response.send_message(f"✅ Embed sent to {channel.mention}.{warning_msg}", ephemeral=True)
-    await audit(guild, f"[SEND_EMBED] '{title}' to #{channel.name} by {interaction.user}")
-
-
-class AnnounceView(discord.ui.View):
-    def __init__(self, b1_label=None, b1_style=None, b1_url=None, b2_label=None, b2_style=None, b2_url=None):
-        super().__init__(timeout=None)
-        if b1_label:
-            self.add_item(discord.ui.Button(label=b1_label, url=b1_url, style=discord.ButtonStyle.link if b1_url else b1_style or discord.ButtonStyle.primary, custom_id=None if b1_url else "announce_btn1"))
-        if b2_label:
-            self.add_item(discord.ui.Button(label=b2_label, url=b2_url, style=discord.ButtonStyle.link if b2_url else b2_style or discord.ButtonStyle.secondary, custom_id=None if b2_url else "announce_btn2"))
-
-
-@bot.tree.command(name="announce", description="[Dev] Post a styled announcement embed to any channel immediately.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(channel="Target channel", title="Announcement title", content="Announcement body")
-async def announce(
-    interaction: discord.Interaction, channel: discord.TextChannel, title: str, content: str,
-    embed_color: Optional[str] = None, image_url: Optional[str] = None, thumbnail_url: Optional[str] = None,
-    footnote: Optional[str] = None, oc_note: Optional[str] = None, oc_name: Optional[str] = None,
-    button1_label: Optional[str] = None, button1_color: Optional[str] = None, button1_url: Optional[str] = None,
-    button2_label: Optional[str] = None, button2_color: Optional[str] = None, button2_url: Optional[str] = None,
-    ping_role: Optional[discord.Role] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can post announcements.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-
-    warning_msgs = []
-    data = load_data()
-    oc_display = ""
-    if oc_name:
-        oc_key = oc_key_of(oc_name)
-        if oc_key in data["ocs"]: oc_display = data["ocs"][oc_key]["name"]
-        else:
-            oc_display = oc_name
-            warning_msgs.append(f"⚠️ OC '{oc_name}' not found; using raw string.")
-
-    def _resolve(text: Optional[str]) -> Optional[str]:
-        if text is not None: return _safe_fmt(text, server=guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_display)
-        return None
-
-    resolved_color = discord.Color.blurple()
-    if embed_color:
-        try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
-        except ValueError: warning_msgs.append("⚠️ Invalid embed color hex; using default blurple.")
-
-    embed = discord.Embed(title=_resolve(title), description=_resolve(content), color=resolved_color, timestamp=now_utc())
-    if thumbnail_url: embed.set_thumbnail(url=thumbnail_url)
-    if image_url: embed.set_image(url=image_url)
-    if oc_note: embed.add_field(name="Note", value=_resolve(oc_note), inline=False)
-    if footnote: embed.set_footer(text=_resolve(footnote))
-
-    view = None
-    if button1_label or button2_label:
-        view = AnnounceView(
-            b1_label=button1_label, b1_style=resolve_button_style(button1_color, discord.ButtonStyle.primary), b1_url=button1_url,
-            b2_label=button2_label, b2_style=resolve_button_style(button2_color, discord.ButtonStyle.secondary), b2_url=button2_url
-        )
-
-    await channel.send(content=ping_role.mention if ping_role else None, embed=embed, view=view)
-    warn_str = "\n".join(warning_msgs)
-    if warn_str: warn_str = "\n" + warn_str
-    await interaction.followup.send(f"✅ Announcement posted to {channel.mention}.{warn_str}", ephemeral=True)
-    await audit(guild, f"[ANNOUNCE] '{title}' to #{channel.name} by {interaction.user}")
-
-
-@bot.tree.command(name="announce_schedule", description="[Dev] Schedule an announcement for a future time.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(title="Title", content="Body text", fire_at="YYYY-MM-DD HH:MM", channel="Channel", timezone_str="Timezone")
-@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
-async def announce_schedule(
-    interaction: discord.Interaction, title: str, content: str, fire_at: str,
-    channel: Optional[discord.TextChannel] = None, image_url: Optional[str] = None, timezone_str: Optional[str] = None
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can schedule announcements.", ephemeral=True)
-    tz_str = timezone_str or "UTC"
-    try: tz = ZoneInfo(tz_str)
-    except Exception: return await interaction.response.send_message("❌ Unknown timezone.", ephemeral=True)
-
     try:
-        naive_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M")
-        local_dt = naive_dt.replace(tzinfo=tz)
-        fire_dt  = local_dt.astimezone(timezone.utc)
-    except ValueError: return await interaction.response.send_message("❌ Format must be YYYY-MM-DD HH:MM.", ephemeral=True)
-
-    if fire_dt <= now_utc(): return await interaction.response.send_message("❌ Time must be in the future.", ephemeral=True)
-
-    resolved_ch = channel or discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
-    if not resolved_ch: return await interaction.response.send_message("❌ Target channel not found.", ephemeral=True)
-
-    data = load_data()
-    sched_id = f"sched_{int(fire_dt.timestamp())}_{interaction.user.id}"
-    data["scheduled"][sched_id] = {
-        "title": title, "content": content, "fire_at": fire_dt.isoformat(),
-        "channel": resolved_ch.name, "image_url": image_url,
-        "created_by": interaction.user.id, "fired": False,
-    }
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_schedule"))
-    
-    local_display = fire_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-    fire_display   = f"{local_display} {tz_str}  ({fire_dt.strftime('%Y-%m-%d %H:%M UTC')})"
-    await interaction.response.send_message(f"✅ Scheduled for **{fire_display}**.", ephemeral=True)
-    await audit(guild, f"Scheduled announcement '{title}' by {interaction.user}")
-
-
-@bot.tree.command(name="announce_list", description="[Dev] List all pending scheduled announcements.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def announce_list(interaction: discord.Interaction):
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can view scheduled announcements.", ephemeral=True)
-    data = load_data()
-    pending = {k: v for k, v in data["scheduled"].items() if not v.get("fired")}
-    if not pending: return await interaction.response.send_message("No pending scheduled announcements.", ephemeral=True)
-
-    embed = discord.Embed(title="Scheduled Announcements", color=discord.Color.blurple())
-    for k, v in sorted(pending.items(), key=lambda x: x[1]["fire_at"]):
-        fire_utc = datetime.fromisoformat(v["fire_at"])
-        embed.add_field(name=v["title"], value=f"Posts at: {fire_utc.strftime('%Y-%m-%d %H:%M UTC')}\nChannel: #{v['channel']}\nID: `{k}`", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="announce_cancel", description="[Dev] Cancel a scheduled announcement by ID.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(sched_id="Announcement ID")
-async def announce_cancel(interaction: discord.Interaction, sched_id: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can cancel announcements.", ephemeral=True)
-    data = load_data()
-    if sched_id not in data["scheduled"]: return await interaction.response.send_message(f"❌ No scheduled announcement with ID `{sched_id}`.", ephemeral=True)
-
-    title = data["scheduled"][sched_id]["title"]
-    del data["scheduled"][sched_id]
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
-    await interaction.response.send_message(f"Scheduled announcement **{title}** cancelled.", ephemeral=True)
-    await audit(guild, f"Announcement cancelled: '{title}' by {interaction.user}")
-
-
-@bot.tree.command(name="remind", description="[Dev] Send a timed reminder DM to a user.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    user="The server member to remind",
-    message="Reminder message body (supports {user} placeholder for their display name)",
-    fire_at="When to send the reminder — format: YYYY-MM-DD HH:MM",
-    timezone_str="Timezone for fire_at (default: UTC)",
-)
-@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
-async def remind_cmd(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    message: str,
-    fire_at: str,
-    timezone_str: Optional[str] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction):
-        return await interaction.response.send_message("❌ Only devs can set reminders.", ephemeral=True)
-
-    tz_str = timezone_str or "UTC"
-    try:
-        tz = ZoneInfo(tz_str)
-    except Exception:
-        return await interaction.response.send_message("❌ Unknown timezone.", ephemeral=True)
-
-    try:
-        naive_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M")
-        local_dt = naive_dt.replace(tzinfo=tz)
-        fire_dt  = local_dt.astimezone(timezone.utc)
-    except ValueError:
-        return await interaction.response.send_message("❌ Format must be YYYY-MM-DD HH:MM.", ephemeral=True)
-
-    if fire_dt <= now_utc():
-        return await interaction.response.send_message("❌ Reminder time must be in the future.", ephemeral=True)
-
-    if len(message) > 2000:
-        return await interaction.response.send_message("❌ Message must be 2000 characters or fewer.", ephemeral=True)
-
-    data = load_data()
-    rid = f"remind_{int(fire_dt.timestamp())}_{user.id}"
-    data["reminders"][rid] = {
-        "user_id": user.id,
-        "message": message,
-        "fire_at": fire_dt.isoformat(),
-        "created_by": interaction.user.id,
-        "fired": False,
-    }
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="remind_set"))
-
-    local_display = fire_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-    fire_display   = f"{local_display} {tz_str}  ({fire_dt.strftime('%Y-%m-%d %H:%M UTC')})"
-    await interaction.response.send_message(
-        f"⏰ Reminder set for {user.mention} at **{fire_display}**.", ephemeral=True
-    )
-    await audit(
-        guild,
-        f"[REMIND] Reminder set for {user} ({user.id}) at {fire_display} by {interaction.user}"
-    )
-
-
-@bot.tree.command(name="remind_timer", description="[Dev] Set a duration-based reminder DM (e.g. 'in 2 hours 30 minutes').")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    user="The server member to remind",
-    message="Reminder message (supports {user} placeholder for their display name)",
-    days="Days from now (0–30)",
-    hours="Hours from now (0–168)",
-    minutes="Minutes from now (0–59)"
-)
-async def remind_timer(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    message: str,
-    days: Optional[int] = None,
-    hours: Optional[int] = None,
-    minutes: Optional[int] = None
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction):
-        return await interaction.response.send_message("❌ Only devs can set reminders.", ephemeral=True)
-
-    d = days or 0
-    h = hours or 0
-    m = minutes or 0
-
-    if d == 0 and h == 0 and m == 0:
-        return await interaction.response.send_message("❌ Provide at least one of: days, hours, minutes.", ephemeral=True)
-
-    total_seconds = d * 86400 + h * 3600 + m * 60
-
-    if total_seconds < 60:
-        return await interaction.response.send_message("❌ Minimum reminder duration is 1 minute.", ephemeral=True)
-
-    if total_seconds > 30 * 86400:
-        return await interaction.response.send_message("❌ Maximum reminder duration is 30 days.", ephemeral=True)
-
-    if len(message) > 2000:
-        return await interaction.response.send_message("❌ Message must be 2000 characters or fewer.", ephemeral=True)
-
-    fire_dt = now_utc() + timedelta(seconds=total_seconds)
-    resolved_message = message.replace("{user}", user.display_name)
-    data = load_data()
-    rid = f"remindtimer_{int(fire_dt.timestamp())}_{user.id}"
-    
-    data["reminders"][rid] = {
-        "user_id": user.id,
-        "message": resolved_message,
-        "fire_at": fire_dt.isoformat(),
-        "created_by": interaction.user.id,
-        "fired": False,
-        "timer_mode": True,
-    }
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="remind_timer_set"))
-
-    parts = []
-    if d: parts.append(f"{d} day(s)")
-    if h: parts.append(f"{h} hour(s)")
-    if m: parts.append(f"{m} minute(s)")
-    duration_str = ", ".join(parts)
-
-    fire_display = fire_dt.strftime("%Y-%m-%d %H:%M UTC")
-    
-    await interaction.response.send_message(
-        f"⏰ Reminder set for {user.mention} in **{duration_str}** (fires at **{fire_display}**).",
-        ephemeral=True
-    )
-    
-    await audit(
-        guild,
-        f"[REMIND_TIMER] Reminder set for {user} ({user.id}) in {duration_str} "
-        f"(fire_at={fire_display}) by {interaction.user}"
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  INSTAGRAM-STYLE POSTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-class IGPostView(discord.ui.View):
-    def __init__(self, post_id: str, likes: int = 0):
-        super().__init__(timeout=None)
-        self.post_id = post_id
-        self.likes   = likes
-        self._update_like_label()
-
-    def _update_like_label(self):
-        for child in self.children:
-            if getattr(child, "custom_id", "").startswith("ig_like_"):
-                child.label = f"🤍 Like  {self.likes}" if self.likes else "🤍 Like"
-
-    @discord.ui.button(label="🤍 Like", style=discord.ButtonStyle.secondary, custom_id="ig_like_btn")
-    async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        if self.post_id not in data["instagram"]: return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
-
-        post = data["instagram"][self.post_id]
-        post["likes"] = post.get("likes", 0) + 1
-        self.likes = post["likes"]
-        self._update_like_label()
-        save_data(data)
-        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_like_btn"))
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="💬 Comment", style=discord.ButtonStyle.primary, custom_id="ig_comment_btn")
-    async def comment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = resolve_guild(interaction)
-        if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-        data = load_data()
-        if self.post_id not in data["instagram"]: return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
-
-        post = data["instagram"][self.post_id]
-        if post.get("thread_id"):
-            thread = guild.get_thread(post["thread_id"])
-            if thread: return await interaction.response.send_message(f"💬 Thread is already open: {thread.mention}", ephemeral=True)
-
-        ch = guild.get_channel(post.get("channel_id"))
-        if not ch: return await interaction.response.send_message("❌ Original channel not found.", ephemeral=True)
-
-        try: msg = await ch.fetch_message(post["message_id"])
-        except discord.NotFound: return await interaction.response.send_message("❌ Original message not found.", ephemeral=True)
-
-        thread = await msg.create_thread(name=f"Comments — {post['username']}", auto_archive_duration=10080)
-        post["thread_id"] = thread.id
-        save_data(data)
-        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_comment_btn"))
-        await interaction.response.send_message(f"💬 Comment thread created: {thread.mention}", ephemeral=True)
-
-
-@bot.tree.command(name="ig_post", description="Post an Instagram-style photo post as your OC.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(oc_name="Your OC's name", username="Instagram username (no @)", caption="Post caption")
-async def ig_post(
-    interaction: discord.Interaction, oc_name: str, username: str, caption: str,
-    photo1_url: Optional[str] = None, photo1_file: Optional[discord.Attachment] = None,
-    photo2_url: Optional[str] = None, photo2_file: Optional[discord.Attachment] = None,
-    photo3_url: Optional[str] = None, photo3_file: Optional[discord.Attachment] = None,
-    photo4_url: Optional[str] = None, photo4_file: Optional[discord.Attachment] = None,
-    photo5_url: Optional[str] = None, photo5_file: Optional[discord.Attachment] = None,
-    photo6_url: Optional[str] = None, photo6_file: Optional[discord.Attachment] = None,
-    photo7_url: Optional[str] = None, photo7_file: Optional[discord.Attachment] = None,
-    photo8_url: Optional[str] = None, photo8_file: Optional[discord.Attachment] = None,
-    photo9_url: Optional[str] = None, photo9_file: Optional[discord.Attachment] = None,
-    photo10_url: Optional[str] = None, photo10_file: Optional[discord.Attachment] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    oc_key = oc_key_of(oc_name)
-    if oc_key not in data["ocs"]: return await interaction.followup.send(f"❌ No OC named **{oc_name}** found.", ephemeral=True)
-
-    pairs = [
-        (photo1_url, photo1_file), (photo2_url, photo2_file), (photo3_url, photo3_file), (photo4_url, photo4_file),
-        (photo5_url, photo5_file), (photo6_url, photo6_file), (photo7_url, photo7_file), (photo8_url, photo8_file),
-        (photo9_url, photo9_file), (photo10_url, photo10_file),
-    ]
-
-    photos = []
-    for url, file in pairs:
-        if file:
-            if not file.content_type or not file.content_type.startswith("image/"): return await interaction.followup.send("❌ Files must be images.", ephemeral=True)
-            persistent = await persist_image_attachment(file)
-            if persistent:
-                p_url, _ = persistent
-                photos.append(p_url)
-            else:
-                photos.append(file.url)
-        elif url:
-            if not valid_image_url(url): return await interaction.followup.send(f"❌ Invalid image URL: `{url}`", ephemeral=True)
-            photos.append(url)
-
-    if not photos: return await interaction.followup.send("❌ At least one photo is required.", ephemeral=True)
-
-    oc = data["ocs"][oc_key]
-    handle = username if username.startswith("@") else f"@{username}"
-    post_id = f"{oc_key}_{int(now_utc().timestamp())}"
-    
-    data["instagram"][post_id] = {
-        "oc_key": oc_key, "username": handle, "caption": caption, "photos": photos,
-        "likes": 0, "posted_by": interaction.user.id, "posted_at": now_iso(),
-        "channel_id": None, "message_id": None, "last_message_id": None, "thread_id": None,
-    }
-    save_data(data)
-
-    ig_ch = discord.utils.get(guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
-    if not ig_ch: return await interaction.followup.send(f"❌ Channel `#{INSTAGRAM_CHANNEL_NAME}` not found.", ephemeral=True)
-
-    await interaction.followup.send(f"📸 Posting to {ig_ch.mention}…", ephemeral=True)
-
-    view = IGPostView(post_id, likes=0)
-    embed = discord.Embed(description=f"**{handle}**  {caption}", color=discord.Color.from_rgb(225, 48, 108), timestamp=now_utc())
-    embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
-    embed.set_image(url=photos[0])
-
-    if len(photos) == 1:
-        embed.set_footer(text="📸 1 photo")
-        last_msg = await ig_ch.send(embed=embed, view=view)
-        data["instagram"][post_id]["message_id"] = last_msg.id
-        data["instagram"][post_id]["last_message_id"] = last_msg.id
-    else:
-        embed.set_footer(text=f"📸 {len(photos)} photo(s)")
-        first_msg = await ig_ch.send(embed=embed)
-        data["instagram"][post_id]["message_id"] = first_msg.id
-
-        for i, photo in enumerate(photos[1:-1], start=2):
-            mid_embed = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
-            mid_embed.set_image(url=photo)
-            mid_embed.set_footer(text=f"Photo {i}/{len(photos)}")
-            await ig_ch.send(embed=mid_embed)
-
-        last_embed = discord.Embed(color=discord.Color.from_rgb(225, 48, 108))
-        last_embed.set_image(url=photos[-1])
-        last_embed.set_footer(text=f"📸 Photo {len(photos)}/{len(photos)}")
-        last_msg = await ig_ch.send(embed=last_embed, view=view)
-        data["instagram"][post_id]["last_message_id"] = last_msg.id
-
-    data["instagram"][post_id]["channel_id"] = ig_ch.id
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post_final"))
-    await audit(guild, f"IG post by OC '{oc_name}' by {interaction.user}  post_id={post_id}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DEV NOTIFY COMMAND (dev only)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class DevDMFileModal(discord.ui.Modal, title="Attach File"):
-    file_url = discord.ui.TextInput(label="File URL (direct link)", style=discord.TextStyle.short, max_length=1024)
-
-    def __init__(self, guild_id: int, dev_id: int):
-        super().__init__()
-        self.guild_id = guild_id
-        self.dev_id = dev_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        url = self.file_url.value.strip()
-        if not valid_url(url):
-            return await interaction.response.send_message("❌ Invalid URL. Must start with http:// or https://.", ephemeral=True)
-            
-        guild = bot.get_guild(self.guild_id)
-        if not guild: return await interaction.response.send_message("❌ Server not found.", ephemeral=True)
-            
-        ch = discord.utils.get(guild.text_channels, name=DEV_RESPONSE_CHANNEL_NAME)
-        if not ch: return await interaction.response.send_message(f"❌ `#{DEV_RESPONSE_CHANNEL_NAME}` not found.", ephemeral=True)
-            
-        embed = discord.Embed(description="[File Attachment]", color=discord.Color.green(), timestamp=now_utc())
-        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None)
-        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Dev ID: {self.dev_id}  ·  File reply")
-        
-        if valid_image_url(url):
-            embed.set_image(url=url)
-        else:
-            embed.add_field(name="File URL", value=url)
-            
-        await ch.send(embed=embed)
-        await interaction.response.send_message("✅ File attachment sent to developers.", ephemeral=True)
-
-
-class DevDMFileUploadView(discord.ui.View):
-    def __init__(self, guild_id: int, dev_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.dev_id = dev_id
-
-    @discord.ui.button(label="Attach File", style=discord.ButtonStyle.secondary, custom_id="dev_dm_attach_file")
-    async def attach_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DevDMFileModal(self.guild_id, self.dev_id))
-
-
-class DevDMModal(discord.ui.Modal, title="Reply to Dev"):
-    response_text = discord.ui.TextInput(label="Your Response", style=discord.TextStyle.paragraph, max_length=2000)
-
-    def __init__(self, guild_id: int, dev_id: int):
-        super().__init__()
-        self.guild_id = guild_id
-        self.dev_id = dev_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = bot.get_guild(self.guild_id)
-        if not guild: return await interaction.response.send_message("❌ Server not found.", ephemeral=True)
-            
-        ch = discord.utils.get(guild.text_channels, name=DEV_RESPONSE_CHANNEL_NAME)
-        if not ch: return await interaction.response.send_message(f"❌ `#{DEV_RESPONSE_CHANNEL_NAME}` not found.", ephemeral=True)
-            
-        embed = discord.Embed(title="Response to Dev Message", description=self.response_text.value, color=discord.Color.green(), timestamp=now_utc())
-        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None)
-        embed.set_footer(text=f"User ID: {interaction.user.id}  ·  Replying to Dev ID: {self.dev_id}")
-        
-        await ch.send(embed=embed)
-        
-        view = DevDMFileUploadView(self.guild_id, self.dev_id)
-        await interaction.response.send_message(
-            "Your text reply was sent. If you also need to attach a file, use the button below.", 
-            view=view, 
-            ephemeral=True
-        )
-
-
-class DevDMView(discord.ui.View):
-    def __init__(self, guild_id: int, dev_id: int, reply_label: str = "Reply to Dev", reply_style: discord.ButtonStyle = discord.ButtonStyle.primary):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.dev_id = dev_id
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and getattr(child, "custom_id", "") == "dev_dm_reply":
-                child.label = reply_label
-                child.style = reply_style
-
-    @discord.ui.button(label="Reply to Dev", style=discord.ButtonStyle.primary, custom_id="dev_dm_reply")
-    async def reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
-
-
-class DebutView(discord.ui.View):
-    def __init__(self, guild_id: int, user_id: int, oc_name: str, group_name: str, transport_channel_id: int, custom_channel_message: Optional[str] = None, accept_label: Optional[str] = None, accept_style: Optional[discord.ButtonStyle] = None, decline_label: Optional[str] = None, decline_style: Optional[discord.ButtonStyle] = None):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.oc_name = oc_name
-        self.group_name = group_name
-        self.transport_channel_id = transport_channel_id
-        self.custom_channel_message = custom_channel_message
-
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                if child.custom_id == "debut_accept":
-                    child.label = accept_label or "Accept"
-                    child.style = accept_style or discord.ButtonStyle.success
-                elif child.custom_id == "debut_decline":
-                    child.label = decline_label or "Decline"
-                    child.style = decline_style or discord.ButtonStyle.danger
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="debut_accept")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild   = bot.get_guild(self.guild_id)
-        member  = guild.get_member(self.user_id) if guild else None
-        channel = guild.get_channel(self.transport_channel_id) if guild else None
-        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
-
-        if member and channel:
-            await channel.set_permissions(member, view_channel=True, send_messages=True)
-            if self.custom_channel_message:
-                await channel.send(_safe_fmt(
-                    self.custom_channel_message,
-                    member=member.mention,
-                    oc=self.oc_name,
-                    group=self.group_name,
-                    user=member.display_name,
-                    server=guild.name if guild else "",
-                    channel=channel.mention
-                ))
-
-            if debut_log_ch:
-                notif = discord.Embed(
-                    title="✅ Debut Contract Accepted",
-                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**.",
-                    color=discord.Color.green(),
-                    timestamp=now_utc()
-                )
-                notif.add_field(name="OC", value=self.oc_name, inline=True)
-                notif.add_field(name="Group", value=self.group_name, inline=True)
-                notif.add_field(name="Channel Granted", value=channel.mention, inline=True)
-                await debut_log_ch.send(embed=notif)
-
-            await interaction.response.edit_message(
-                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to {channel.mention}.",
-                view=None
-            )
-        elif member:
-            if debut_log_ch:
-                notif = discord.Embed(
-                    title="⚠️ Debut Contract Accepted (Channel Missing)",
-                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned channel was not found.",
-                    color=discord.Color.orange(),
-                    timestamp=now_utc()
-                )
-                notif.add_field(name="OC", value=self.oc_name, inline=True)
-                notif.add_field(name="Group", value=self.group_name, inline=True)
-                await debut_log_ch.send(embed=notif)
-
-            await interaction.response.edit_message(
-                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned target channel could not be found.",
-                view=None
-            )
-        else:
-            await interaction.response.edit_message(content="❌ Could not complete the debut — server or channel not found.", view=None)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="debut_decline")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild  = bot.get_guild(self.guild_id)
-        member = guild.get_member(self.user_id) if guild else None
-        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
-
-        if debut_log_ch:
-            notif = discord.Embed(
-                title="❌ Debut Contract Declined",
-                description=f"{member.mention if member else f'User {self.user_id}'} declined the debut contract for **{self.oc_name}** in **{self.group_name}**.",
-                color=discord.Color.red(),
-                timestamp=now_utc()
-            )
-            notif.add_field(name="OC", value=self.oc_name, inline=True)
-            notif.add_field(name="Group", value=self.group_name, inline=True)
-            await debut_log_ch.send(embed=notif)
-
-        await interaction.response.edit_message(content=f"You declined the debut contract for **{self.oc_name}** in **{self.group_name}**.", view=None)
-
-
-class CombinedNotifyView(discord.ui.View):
-    """
-    Used exclusively by /dev_notify type=custom when both accept/decline (debut-style)
-    and reply (Q&A-style) buttons are needed in the same DM.
-    Combines the logic of DebutView and DevDMView without duplication.
-    """
-    def __init__(
-        self,
-        guild_id: int, user_id: int, dev_id: int,
-        oc_name: str, group_name: str, transport_channel_id: int,
-        custom_channel_message: Optional[str] = None,
-        accept_label: Optional[str] = None, accept_style: discord.ButtonStyle = discord.ButtonStyle.success,
-        decline_label: Optional[str] = None, decline_style: discord.ButtonStyle = discord.ButtonStyle.danger,
-        reply_label: Optional[str] = None, reply_style: discord.ButtonStyle = discord.ButtonStyle.primary,
-        show_reply: bool = True,
-        show_debut: bool = True,
-    ):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.dev_id = dev_id
-        self.oc_name = oc_name
-        self.group_name = group_name
-        self.transport_channel_id = transport_channel_id
-        self.custom_channel_message = custom_channel_message
-        self.show_reply = show_reply
-        self.show_debut = show_debut
-
-        for child in list(self.children):
-            cid = getattr(child, "custom_id", "")
-            if cid == "combined_accept":
-                if not show_debut:
-                    self.remove_item(child)
-                else:
-                    child.label = accept_label or "Accept"
-                    child.style = accept_style
-            elif cid == "combined_decline":
-                if not show_debut:
-                    self.remove_item(child)
-                else:
-                    child.label = decline_label or "Decline"
-                    child.style = decline_style
-            elif cid == "combined_reply":
-                if not show_reply:
-                    self.remove_item(child)
-                else:
-                    child.label = reply_label or "Reply to Dev"
-                    child.style = reply_style
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="combined_accept")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild   = bot.get_guild(self.guild_id)
-        member  = guild.get_member(self.user_id) if guild else None
-        channel = guild.get_channel(self.transport_channel_id) if guild else None
-        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
-
-        if member and channel:
-            await channel.set_permissions(member, view_channel=True, send_messages=True)
-            if self.custom_channel_message:
-                await channel.send(_safe_fmt(
-                    self.custom_channel_message,
-                    member=member.mention,
-                    oc=self.oc_name,
-                    group=self.group_name,
-                    user=member.display_name,
-                    server=guild.name if guild else "",
-                    channel=channel.mention
-                ))
-
-            if debut_log_ch:
-                notif = discord.Embed(
-                    title="✅ Debut Contract Accepted",
-                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**.",
-                    color=discord.Color.green(),
-                    timestamp=now_utc()
-                )
-                notif.add_field(name="OC", value=self.oc_name, inline=True)
-                notif.add_field(name="Group", value=self.group_name, inline=True)
-                notif.add_field(name="Channel Granted", value=channel.mention, inline=True)
-                await debut_log_ch.send(embed=notif)
-
-            await interaction.response.edit_message(
-                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**. You now have access to {channel.mention}.",
-                view=None
-            )
-        elif member:
-            if debut_log_ch:
-                notif = discord.Embed(
-                    title="⚠️ Debut Contract Accepted (Channel Missing)",
-                    description=f"{member.mention} accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned channel was not found.",
-                    color=discord.Color.orange(),
-                    timestamp=now_utc()
-                )
-                notif.add_field(name="OC", value=self.oc_name, inline=True)
-                notif.add_field(name="Group", value=self.group_name, inline=True)
-                await debut_log_ch.send(embed=notif)
-
-            await interaction.response.edit_message(
-                content=f"✅ You accepted the debut contract for **{self.oc_name}** in **{self.group_name}**, but the assigned target channel could not be found.",
-                view=None
-            )
-        else:
-            await interaction.response.edit_message(content="❌ Could not complete the debut — server or channel not found.", view=None)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="combined_decline")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild  = bot.get_guild(self.guild_id)
-        member = guild.get_member(self.user_id) if guild else None
-        debut_log_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME) if guild else None
-
-        if debut_log_ch:
-            notif = discord.Embed(
-                title="❌ Debut Contract Declined",
-                description=f"{member.mention if member else f'User {self.user_id}'} declined the debut contract for **{self.oc_name}** in **{self.group_name}**.",
-                color=discord.Color.red(),
-                timestamp=now_utc()
-            )
-            notif.add_field(name="OC", value=self.oc_name, inline=True)
-            notif.add_field(name="Group", value=self.group_name, inline=True)
-            await debut_log_ch.send(embed=notif)
-
-        await interaction.response.edit_message(content=f"You declined the debut contract for **{self.oc_name}** in **{self.group_name}**.", view=None)
-
-    @discord.ui.button(label="Reply to Dev", style=discord.ButtonStyle.primary, custom_id="combined_reply")
-    async def reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(DevDMModal(self.guild_id, self.dev_id))
-
+        await _execute_evaluations()
+        embed = discord.Embed(title="✅ manual evaluation triggered", description="evaluations have been generated and posted.", color=discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await audit(guild, f"manual evaluation triggered by {interaction.user}")
+    except Exception as e:
+        log.error(f"evaluation_run error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
 
 @bot.tree.command(
-    name="dev_notify",
-    description="[Dev] Send a DM to one or more OCs or users. Choose from three types."
+    name="balance_edit",
+    description="dev | adjust or overwrite an oc's balance."
 )
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.choices(type=[
-    app_commands.Choice(name="Selection — Debut contract with automated congratulations", value="selection"),
-    app_commands.Choice(name="Q&A — Dev message with optional reply prompt", value="qa"),
-    app_commands.Choice(name="Custom — Full control over all Selection and Q&A elements", value="custom"),
-])
 @app_commands.describe(
-    type="Notification type: 'selection' (debut contract), 'qa' (message requiring a reply), or 'custom' (full control)",
-    oc_name="Primary OC to notify (looks up owner automatically)",
-    oc_name2="Optional additional OC to notify",
-    oc_name3="Optional additional OC to notify",
-    oc_name4="Optional additional OC to notify",
-    user="Optional direct user recipient (used when no OC is specified or as extra recipient)",
-    user2="Optional additional direct user recipient",
-    user3="Optional additional direct user recipient",
-    group_name="Group or company name used in {group} placeholder and default titles",
-    embed_title="Custom embed title (supports {oc}, {group}, {recipient} placeholders)",
-    embed_color="Hex color code for embed border (e.g. #FFD700)",
-    footnote="Footer text (supports {oc}, {group}, {server} placeholders)",
-    thumbnail_url="Optional thumbnail image URL for the embed",
-    target_channel="(Selection/Custom) Channel to grant access to upon accepting; defaults to #debuts",
-    channel_message="(Selection/Custom) Message posted in the transport channel after acceptance",
-    oc_placeholder="(Selection/Custom) Note field in embed body (supports {oc}, {group})",
-    accept_label="(Selection/Custom) Custom accept button label (max 80 chars)",
-    accept_color="(Selection/Custom) Accept button color: green, red, grey, blurple, blue",
-    decline_label="(Selection/Custom) Custom decline button label (max 80 chars)",
-    decline_color="(Selection/Custom) Decline button color",
-    message="(Q&A/Custom) Main message body (supports {oc}, {group}, {recipient}, {server}, {date} placeholders)",
-    require_response="(Q&A/Custom) Adds a reply button so the recipient can respond to devs",
-    reply_label="(Q&A/Custom) Custom reply button label (max 80 chars)",
-    reply_color="(Q&A/Custom) Reply button color",
-    selection_message_override="(Custom only) Override the automated congratulations message in Selection mode",
+    oc_name  = "name of the oc whose balance to modify",
+    mode     = "adjust: add/subtract a delta  |  set: overwrite to an exact value",
+    amount   = "the won value — positive or negative for adjust; must be ≥ 0 for set",
+    reason   = "optional audit note"
 )
-async def dev_notify(
+@app_commands.choices(mode=[
+    app_commands.Choice(name="adjust — add or subtract a relative amount", value="adjust"),
+    app_commands.Choice(name="set — overwrite to an exact absolute value",  value="set"),
+])
+async def balance_edit_cmd(
     interaction: discord.Interaction,
-    type: str,  # "selection" | "qa" | "custom"
-    oc_name: Optional[str] = None,
-    oc_name2: Optional[str] = None,
-    oc_name3: Optional[str] = None,
-    oc_name4: Optional[str] = None,
-    user: Optional[discord.Member] = None,
-    user2: Optional[discord.Member] = None,
-    user3: Optional[discord.Member] = None,
-    group_name: Optional[str] = None,
-    embed_title: Optional[str] = None,
-    embed_color: Optional[str] = None,
-    footnote: Optional[str] = None,
-    thumbnail_url: Optional[str] = None,
-    target_channel: Optional[discord.TextChannel] = None,
-    channel_message: Optional[str] = None,
-    oc_placeholder: Optional[str] = None,
-    accept_label: Optional[str] = None,
-    accept_color: Optional[str] = None,
-    decline_label: Optional[str] = None,
-    decline_color: Optional[str] = None,
-    message: Optional[str] = None,
-    require_response: bool = False,
-    reply_label: Optional[str] = None,
-    reply_color: Optional[str] = None,
-    selection_message_override: Optional[str] = None,
+    oc_name: str,
+    mode: str,
+    amount: int,
+    reason: Optional[str] = None,
 ):
     guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not is_dev(interaction): return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
-    if accept_label and len(accept_label) > 80: return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
-    if decline_label and len(decline_label) > 80: return await interaction.response.send_message("❌ decline_label exceeds 80 characters.", ephemeral=True)
-    if reply_label and len(reply_label) > 80: return await interaction.response.send_message("❌ reply_label exceeds 80 characters.", ephemeral=True)
-
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if mode == "set" and amount < 0:
+        return await interaction.response.send_message("❌ amount must be 0 or greater for set mode.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
-    warning_msgs = []
+    try:
+        data = load_data()
+        oc = data["ocs"].get(oc_key_of(oc_name))
+        if not oc:
+            return await interaction.followup.send("❌ oc not found.", ephemeral=True)
 
-    def _resolve_recipients() -> tuple[list[tuple[discord.Member, Optional[dict], Optional[str]]], list[str]]:
-        res_list = []
-        warns = []
-        seen_ids = set()
+        if mode == "adjust":
+            old_balance = oc.get("balance", 0)
+            oc["balance"] = max(0, old_balance + amount)
+            sign = "+" if amount >= 0 else ""
+            description_line = (
+                f"**{oc['name']}**\n"
+                f"adjustment: {sign}₩{amount:,}\n"
+                f"old balance: ₩{old_balance:,}\n"
+                f"new balance: **₩{oc['balance']:,}**"
+            )
+            embed_title = "balance adjusted"
+            audit_line = (
+                f"balance adjustment for '{oc['name']}' ({sign}{amount:,}) "
+                f"by {interaction.user}. reason: {reason or 'none'}"
+            )
+            backup_reason = "balance_edit_adjust"
+        else:  # set
+            old_balance = oc.get("balance", 0)
+            oc["balance"] = amount
+            description_line = (
+                f"**{oc['name']}**\n"
+                f"₩{old_balance:,} → **₩{oc['balance']:,}**"
+            )
+            embed_title = "balance set"
+            audit_line = (
+                f"balance set for '{oc['name']}' (₩{old_balance:,} → ₩{oc['balance']:,}) "
+                f"by {interaction.user}. reason: {reason or 'none'}"
+            )
+            backup_reason = "balance_edit_set"
 
-        raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4] if n]
-        for oc_n in raw_oc_names:
-            oc_k = oc_key_of(oc_n)
-            if oc_k not in data["ocs"]:
-                warns.append(f"❌ No OC named **{oc_n}** found.")
-                continue
-            oc_data = data["ocs"][oc_k]
-            owner_id = oc_data.get("owner_id")
-            if not owner_id:
-                warns.append(f"❌ **{oc_n}** has no registered owner.")
-                continue
-            member = guild.get_member(owner_id)
-            if not member:
-                warns.append(f"❌ Owner of **{oc_n}** is not in this server.")
-                continue
-            if member.id not in seen_ids:
-                seen_ids.add(member.id)
-                res_list.append((member, oc_data, oc_data["name"]))
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason=backup_reason))
+        embed = discord.Embed(title=embed_title, description=description_line, color=discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await audit(guild, audit_line)
+    except Exception as e:
+        log.error(f"balance_edit error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
 
-        raw_users = [u for u in [user, user2, user3] if u]
-        for u in raw_users:
-            if u.id not in seen_ids:
-                seen_ids.add(u.id)
-                res_list.append((u, None, None))
+@bot.tree.command(
+    name="balance_setall",
+    description="dev | set every oc's balance to the same exact value at once."
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    amount = "the exact won value to assign to every oc (must be ≥ 0)",
+    reason = "optional audit note"
+)
+async def balance_setall_cmd(
+    interaction: discord.Interaction,
+    amount: int,
+    reason: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if amount < 0:
+        return await interaction.response.send_message("❌ amount must be 0 or greater.", ephemeral=True)
+
+    confirm_embed = discord.Embed(
+        title="⚠️ Set All Balances",
+        description=(
+            f"This will overwrite the balance of **every registered OC** to ₩{amount:,}.\n"
+            f"This action cannot be undone. Are you sure?"
+        ),
+        color=discord.Color.orange()
+    )
+    confirmed = await wait_for_confirm(interaction, confirm_embed)
+    if not confirmed:
+        await interaction.followup.send(
+            embed=discord.Embed(description="Cancelled. No balances were changed.", color=discord.Color.light_grey()),
+            ephemeral=True
+        )
+        return
+
+    try:
+        data = load_data()
+        ocs = data.get("ocs", {})
+        count = 0
+        for oc in ocs.values():
+            oc["balance"] = amount
+            count += 1
+
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="balance_setall"))
+
+        embed = discord.Embed(
+            title="✅ all balances set",
+            description=f"**{count}** OC balance(s) have been set to ₩{amount:,}.",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await audit(guild, f"balance_setall: set {count} oc(s) to ₩{amount:,} by {interaction.user}. reason: {reason or 'none'}")
+    except Exception as e:
+        log.error(f"balance_setall error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+@bot.tree.command(name="balance", description="view an oc's current balance.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name to check")
+async def balance_cmd(interaction: discord.Interaction, oc_name: str):
+    try:
+        data = load_data()
+        oc = data["ocs"].get(oc_key_of(oc_name))
+        if not oc: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
         
-        return res_list, warns
+        balance = oc.get("balance", 0)
+        embed = discord.Embed(title=f"{oc['name']}'s balance", description=f"**₩{balance:,}**", color=discord.Color.green())
+        if oc.get("profile_picture"):
+            embed.set_thumbnail(url=oc["profile_picture"])
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        log.error(f"balance error: {e}")
+        await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
 
-    resolved_recipients, resolves_warns = _resolve_recipients()
-    warning_msgs.extend(resolves_warns)
+class SayModal(discord.ui.Modal, title="send message as bot"):
+    content = discord.ui.TextInput(
+        label="message",
+        style=discord.TextStyle.paragraph,
+        placeholder="what should the bot say?",
+        max_length=2000,
+        required=True,
+    )
 
-    if not resolved_recipients:
-        warn_str = "\n".join(warning_msgs)
-        return await interaction.followup.send(f"❌ No valid recipients resolved.\n{warn_str}", ephemeral=True)
+    def __init__(self, target_channel: discord.TextChannel, reply_to_id: Optional[int] = None):
+        super().__init__()
+        self.target_channel = target_channel
+        self.reply_to_id: Optional[int] = reply_to_id
 
-    resolved_color = discord.Color.brand_red()
-    if embed_color:
-        try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
-        except ValueError: warning_msgs.append("⚠️ Invalid color hex, using default.")
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.content.value.strip()
+        if not text:
+            return await interaction.response.send_message("❌ message cannot be empty.", ephemeral=True)
+        try:
+            reference: Optional[discord.MessageReference] = None
+            if self.reply_to_id:
+                try:
+                    ref_msg = await self.target_channel.fetch_message(self.reply_to_id)
+                    reference = ref_msg.to_reference(fail_if_not_exists=False)
+                except discord.NotFound:
+                    return await interaction.response.send_message(
+                        f"❌ message `{self.reply_to_id}` not found in {self.target_channel.mention}.",
+                        ephemeral=True,
+                    )
+            await self.target_channel.send(content=text, reference=reference)
+            await interaction.response.send_message(
+                f"✅ sent to {self.target_channel.mention}.", ephemeral=True
+            )
+            guild = resolve_guild(interaction)
+            if guild:
+                await audit(
+                    guild,
+                    f"say: {interaction.user} sent message to #{self.target_channel.name}"
+                    + (f" (reply to {self.reply_to_id})" if self.reply_to_id else ""),
+                )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ bot lacks permission to send messages in {self.target_channel.mention}.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            log.error(f"say modal error: {e}")
+            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
 
-    # Shared transport logic
-    debut_ch = discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME)
-    if not debut_ch:
-        cat = discord.utils.get(guild.categories, name="Special")
-        if not cat: cat = await guild.create_category("Special")
-        debut_ch = await guild.create_text_channel(
-            DEBUT_CHANNEL_NAME, category=cat,
-            overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                guild.me: discord.PermissionOverwrite(view_channel=True),
-            })
-    transport_ch = target_channel if target_channel else debut_ch
+@bot.tree.command(name="say", description="dev | send a plain-text message as the bot to any channel.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    channel="the channel to send the message to",
+    reply_to="(optional) message ID to reply to in that channel",
+)
+async def say_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    reply_to: Optional[str] = None,
+) -> None:
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    reply_to_id: Optional[int] = None
+    if reply_to is not None:
+        reply_to = reply_to.strip()
+        if not reply_to.isdigit():
+            return await interaction.response.send_message(
+                "❌ `reply_to` must be a numeric message ID.", ephemeral=True
+            )
+        reply_to_id = int(reply_to)
+    modal = SayModal(target_channel=channel, reply_to_id=reply_to_id)
+    await interaction.response.send_modal(modal)
 
-    # Validation
-    if type == "selection":
-        if not group_name:
-            return await interaction.followup.send("❌ 'group_name' is required for the Selection type.", ephemeral=True)
-        if message:
-            warning_msgs.append("⚠️ 'message' is ignored in Selection mode. Use 'selection_message_override' in Custom type to override the congratulations text.")
-        if require_response or reply_label or reply_color:
-            warning_msgs.append("⚠️ Q&A response parameters ignored in Selection mode.")
-        if not any(oc_n for (m, o_d, oc_n) in resolved_recipients if oc_n):
-            return await interaction.followup.send("❌ At least one valid OC name is required for Selection mode.", ephemeral=True)
-            
-    elif type == "qa":
-        if not message:
-            return await interaction.followup.send("❌ 'message' is required for the Q&A type.", ephemeral=True)
-        if target_channel or channel_message or oc_placeholder or accept_label or accept_color or decline_label or decline_color:
-            warning_msgs.append("⚠️ Debut/Selection specific parameters are ignored in Q&A mode.")
-            
-    elif type == "custom":
-        if not message and not group_name:
-            return await interaction.followup.send("❌ Custom type requires at least 'message' or 'group_name'.", ephemeral=True)
-        if selection_message_override and "{group}" in selection_message_override and not group_name:
-            warning_msgs.append("⚠️ 'selection_message_override' uses {group} but no group_name was provided — placeholder will be empty.")
+class TwitterPostView(discord.ui.View):
+    def __init__(self, tweet_id: str, likes: int = 0, retweets: int = 0):
+        super().__init__(timeout=None)
+        self.tweet_id  = tweet_id
+        self.likes     = likes
+        self.retweets  = retweets
+        self._sync_labels()
 
-    def _safe_res(text: Optional[str], member: discord.Member, oc_data: Optional[dict], oc_n: Optional[str]) -> str:
-        if not text: return ""
-        oc_disp = oc_n or ""
-        oc_own_disp = member.display_name
-        return _safe_fmt(
-            text,
-            server=guild.name, user=interaction.user.display_name,
-            oc=oc_disp, oc_owner=oc_own_disp,
-            group=group_name or "", channel=getattr(interaction.channel, "name", ""),
-            date=now_utc().strftime("%B %d, %Y"), recipient=member.display_name
+    def _sync_labels(self):
+        for child in self.children:
+            cid = getattr(child, "custom_id", "")
+            if cid == "tw_like_btn":
+                child.label = f"🤍 {self.likes}" if self.likes else "🤍"
+            elif cid == "tw_rt_btn":
+                child.label = f"🔁 {self.retweets}" if self.retweets else "🔁"
+
+    @discord.ui.button(label="🤍", style=discord.ButtonStyle.secondary, custom_id="tw_like_btn")
+    async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        tweet = data.get("twitter", {}).get(self.tweet_id)
+        if not tweet:
+            return await interaction.response.send_message("❌ tweet not found.", ephemeral=True)
+        tweet["likes"] = tweet.get("likes", 0) + 1
+        self.likes = tweet["likes"]
+        self._sync_labels()
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="tw_like"))
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="🔁", style=discord.ButtonStyle.secondary, custom_id="tw_rt_btn")
+    async def retweet_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        tweet = data.get("twitter", {}).get(self.tweet_id)
+        if not tweet:
+            return await interaction.response.send_message("❌ tweet not found.", ephemeral=True)
+        tweet["retweets"] = tweet.get("retweets", 0) + 1
+        self.retweets = tweet["retweets"]
+        self._sync_labels()
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="tw_retweet"))
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="💬 reply", style=discord.ButtonStyle.primary, custom_id="tw_reply_btn")
+    async def reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = resolve_guild(interaction)
+        data  = load_data()
+        tweet = data.get("twitter", {}).get(self.tweet_id)
+        if not tweet:
+            return await interaction.response.send_message("❌ tweet not found.", ephemeral=True)
+
+        if tweet.get("thread_id") and guild:
+            existing = guild.get_thread(tweet["thread_id"])
+            if existing:
+                return await interaction.response.send_message(
+                    f"💬 thread already open: {existing.mention}", ephemeral=True
+                )
+
+        ch = guild.get_channel(tweet.get("channel_id")) if guild else None
+        if not ch:
+            return await interaction.response.send_message("❌ tweet channel not found.", ephemeral=True)
+        try:
+            msg = await ch.fetch_message(tweet["message_id"])
+        except Exception:
+            return await interaction.response.send_message("❌ original tweet message missing.", ephemeral=True)
+
+        thread = await msg.create_thread(
+            name=f"replies — {tweet['handle']}", auto_archive_duration=10080
+        )
+        tweet["thread_id"] = thread.id
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="tw_reply_thread"))
+        await interaction.response.send_message(f"💬 reply thread: {thread.mention}", ephemeral=True)
+
+@bot.tree.command(name="twitter_post", description="post a tweet (up to 4 photos/videos) as your oc.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name="oc name",
+    handle="twitter/x handle (without @)",
+    body="tweet text (max 280 chars)",
+    media1_url="url for media 1 (image or video)",
+    media1_file="upload for media 1 (image or video file)",
+    media2_url="url for media 2",
+    media2_file="upload for media 2",
+    media3_url="url for media 3",
+    media3_file="upload for media 3",
+    media4_url="url for media 4",
+    media4_file="upload for media 4",
+)
+async def twitter_post_cmd(
+    interaction: discord.Interaction,
+    oc_name: str,
+    handle: str,
+    body: str,
+    media1_url: Optional[str] = None, media1_file: Optional[discord.Attachment] = None,
+    media2_url: Optional[str] = None, media2_file: Optional[discord.Attachment] = None,
+    media3_url: Optional[str] = None, media3_file: Optional[discord.Attachment] = None,
+    media4_url: Optional[str] = None, media4_file: Optional[discord.Attachment] = None,
+):
+    guild = resolve_guild(interaction)
+    await interaction.response.defer(ephemeral=True)
+
+    if len(body) > 280:
+        return await interaction.followup.send("❌ tweet body exceeds 280 characters.", ephemeral=True)
+
+    data = load_data()
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]:
+        return await interaction.followup.send("❌ oc not found.", ephemeral=True)
+    if not is_dev(interaction) and data["ocs"][oc_key].get("owner_id") != interaction.user.id:
+        return await interaction.followup.send("❌ you do not own this oc.", ephemeral=True)
+
+    oc = data["ocs"][oc_key]
+    handle_fmt = f"@{handle}" if not handle.startswith("@") else handle
+
+    raw_pairs = [
+        (media1_url, media1_file), (media2_url, media2_file),
+        (media3_url, media3_file), (media4_url, media4_file),
+    ]
+    media = []
+    for url, file in raw_pairs:
+        if file:
+            if not file.content_type or not (
+                file.content_type.startswith("image/") or
+                file.content_type.startswith("video/")
+            ):
+                return await interaction.followup.send(
+                    "❌ media files must be images or videos.", ephemeral=True
+                )
+            result = await persist_media_attachment(file)
+            if result:
+                clean_url, _, media_tag = result
+                media.append({"url": clean_url, "type": media_tag})
+            else:
+                media.append({
+                    "url": file.url,
+                    "type": "video" if file.content_type.startswith("video/") else "image",
+                })
+        elif url:
+            ok, tag = valid_media_url(url)
+            if not ok:
+                return await interaction.followup.send(
+                    "❌ invalid media url. accepted: .png .jpg .jpeg .gif .webp .mp4 .mov .webm",
+                    ephemeral=True,
+                )
+            media.append({"url": url, "type": tag})
+
+    tweet_id = f"tw_{oc_key}_{int(now_utc().timestamp())}"
+    data.setdefault("twitter", {})[tweet_id] = {
+        "oc_key":     oc_key,
+        "handle":     handle_fmt,
+        "body":       body,
+        "media":      media,
+        "likes":      0,
+        "retweets":   0,
+        "posted_by":  interaction.user.id,
+        "posted_at":  now_iso(),
+    }
+    save_data(data)
+
+    tw_ch = discord.utils.get(guild.text_channels, name=TWITTER_CHANNEL_NAME)
+    if not tw_ch:
+        return await interaction.followup.send(
+            f"❌ twitter channel `{TWITTER_CHANNEL_NAME}` not found.", ephemeral=True
         )
 
-    def _build_embed_for_type(member: discord.Member, oc_data: Optional[dict], oc_n: Optional[str]) -> discord.Embed:
-        actual_title = embed_title
-        if type == "selection":
-            if not actual_title: actual_title = f"Debut Contract  —  {oc_n}  |  {group_name}"
-            desc = f"Congratulations, {oc_n}! 🎉 You have been selected to join {group_name}. Please review your debut contract below and accept or decline at your earliest convenience."
-            embed = discord.Embed(title=_safe_res(actual_title, member, oc_data, oc_n), description=desc, color=resolved_color, timestamp=now_utc())
-        elif type == "qa":
-            if not actual_title: actual_title = "Message from Server Dev"
-            embed = discord.Embed(title=_safe_res(actual_title, member, oc_data, oc_n), description=_safe_res(message, member, oc_data, oc_n), color=resolved_color, timestamp=now_utc())
-        elif type == "custom":
-            if message and group_name:
-                if not actual_title: actual_title = "Message from Server Dev"
-                desc = _safe_res(message, member, oc_data, oc_n)
-            elif group_name: 
-                if not actual_title: actual_title = f"Debut Contract  —  {oc_n}  |  {group_name}"
-                if selection_message_override:
-                    desc = _safe_res(selection_message_override, member, oc_data, oc_n)
+    await interaction.followup.send("🐦 posting...", ephemeral=True)
+
+    view = TwitterPostView(tweet_id, likes=0, retweets=0)
+    color = discord.Color.from_rgb(29, 161, 242)
+
+    header_embed = discord.Embed(description=body, color=color, timestamp=now_utc())
+    header_embed.set_author(
+        name=f"{oc['name']}  ({handle_fmt})",
+        icon_url=oc.get("profile_picture"),
+    )
+    if oc.get("profile_picture"):
+        header_embed.set_thumbnail(url=oc["profile_picture"])
+
+    if not media:
+        first_msg = await tw_ch.send(embed=header_embed, view=view)
+    elif media[0]["type"] == "image":
+        header_embed.set_image(url=media[0]["url"])
+        if len(media) == 1:
+            first_msg = await tw_ch.send(embed=header_embed, view=view)
+        else:
+            first_msg = await tw_ch.send(embed=header_embed)
+            for m in media[1:-1]:
+                if m["type"] == "image":
+                    e = discord.Embed(color=color)
+                    e.set_image(url=m["url"])
+                    await tw_ch.send(embed=e)
                 else:
-                    desc = f"Congratulations, {oc_n}! 🎉 You have been selected to join {group_name}. Please review your debut contract below and accept or decline at your earliest convenience."
-            else: 
-                if not actual_title: actual_title = "Message from Server Dev"
-                desc = _safe_res(message, member, oc_data, oc_n)
-            
-            embed = discord.Embed(title=_safe_res(actual_title, member, oc_data, oc_n), description=desc, color=resolved_color, timestamp=now_utc())
+                    await tw_ch.send(content=m["url"])
+            last_m = media[-1]
+            if last_m["type"] == "image":
+                e = discord.Embed(color=color)
+                e.set_image(url=last_m["url"])
+                await tw_ch.send(embed=e, view=view)
+            else:
+                await tw_ch.send(content=last_m["url"], view=view)
+    else:
+        first_msg = await tw_ch.send(embed=header_embed)
+        await tw_ch.send(content=media[0]["url"])
+        for m in media[1:-1]:
+            if m["type"] == "image":
+                e = discord.Embed(color=color)
+                e.set_image(url=m["url"])
+                await tw_ch.send(embed=e)
+            else:
+                await tw_ch.send(content=m["url"])
+        if len(media) > 1:
+            last_m = media[-1]
+            if last_m["type"] == "image":
+                e = discord.Embed(color=color)
+                e.set_image(url=last_m["url"])
+                await tw_ch.send(embed=e, view=view)
+            else:
+                await tw_ch.send(content=last_m["url"], view=view)
+        else:
+            await first_msg.edit(view=view)
 
-        resolved_thumb = thumbnail_url
-        if not resolved_thumb and oc_data and oc_data.get("profile_picture"):
-            resolved_thumb = oc_data["profile_picture"]
-            
-        if resolved_thumb: embed.set_thumbnail(url=resolved_thumb)
+    data["twitter"][tweet_id]["message_id"]  = first_msg.id
+    data["twitter"][tweet_id]["channel_id"]  = tw_ch.id
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="twitter_post"))
 
-        is_debut_like = (type == "selection") or (type == "custom" and group_name)
-        if is_debut_like and oc_n:
-            embed.add_field(name="OC", value=oc_n, inline=True)
-            embed.add_field(name="Group", value=group_name or "Unknown", inline=True)
-        if is_debut_like and oc_placeholder:
-            embed.add_field(name="Note", value=_safe_res(oc_placeholder, member, oc_data, oc_n), inline=False)
+
+@bot.tree.command(name="shop_add_category", description="dev | add a new shop category.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(name="category name")
+async def shop_add_category(interaction: discord.Interaction, name: str):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    name = name.strip()
+    if not name or len(name) > 50: return await interaction.response.send_message("❌ invalid name length.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        if any(c.lower() == name.lower() for c in data["shop_categories"]):
+            return await interaction.followup.send("❌ category exists.")
+        data["shop_categories"].append(name)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="add_cat"))
+        
+        embed = discord.Embed(title="category added", description=f"**{name}**\n\nall categories:\n" + "\n".join(f"• {c}" for c in data["shop_categories"]), color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+        await audit(guild, f"shop category added: '{name}' by {interaction.user}")
+    except Exception as e:
+        log.error(f"shop_add_cat error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_remove_category", description="dev | remove a shop category.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(name="category name")
+async def shop_remove_category(interaction: discord.Interaction, name: str):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        matched = next((c for c in data["shop_categories"] if c.lower() == name.strip().lower()), None)
+        if not matched: return await interaction.followup.send("❌ category not found.")
+        
+        data["shop_categories"].remove(matched)
+        affected = 0
+        for item in data["shop"].values():
+            if item.get("category", "").lower() == matched.lower():
+                item["category"] = None
+                affected += 1
+                
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="rm_cat"))
+        embed = discord.Embed(title="category removed", description=f"**{matched}** removed. {affected} items orphaned.", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+        await audit(guild, f"shop category removed: '{matched}' by {interaction.user}")
+    except Exception as e:
+        log.error(f"shop_rm_cat error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_add_album", description="dev | add a new album to the shop.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(name="album name", group="group", price="cost in won", inclusion_count="number of pulls", category="category name", image="album cover")
+async def shop_add_album(interaction: discord.Interaction, name: str, group: str, price: int, inclusion_count: int, category: Optional[str] = None, image: Optional[discord.Attachment] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if price < 0 or inclusion_count < 1: return await interaction.response.send_message("❌ invalid numerical value.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        cat_match = None
+        if category:
+            cat_match = next((c for c in data["shop_categories"] if c.lower() == category.strip().lower()), None)
+            if not cat_match: return await interaction.followup.send(f"❌ category not found. available: {', '.join(data['shop_categories'])}")
             
-        if footnote:
-            embed.set_footer(text=_safe_res(footnote, member, oc_data, oc_n))
-        elif (type == "qa" or type == "custom") and require_response:
-            embed.set_footer(text="A response is requested.")
+        pic_url, pic_id = None, None
+        if image:
+            if not image.content_type or not image.content_type.startswith("image/"): return await interaction.followup.send("❌ attachment must be image.")
+            p = await persist_image_attachment(image, store_msg_id=True)
+            if p: pic_url, pic_id = p
             
+        item_id = _gen_item_id(data["shop"], data.get("used_item_ids", []))
+        data.setdefault("used_item_ids", []).append(item_id)
+            
+        data["shop"][item_id] = {
+            "id": item_id, "type": "album", "name": name, "group": group, "price": price,
+            "inclusion_count": inclusion_count, "category": cat_match, "inclusions": [],
+            "image_url": pic_url, "image_msg_id": pic_id, "created_at": now_iso()
+        }
+        
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="add_album"))
+        
+        embed = discord.Embed(title="album added", description=f"id: `{item_id}`\nname: {name}\ngroup: {group}\nprice: ₩{price:,}", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"shop_add_album error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_add_misc", description="dev | add a miscellaneous item to the shop.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(name="item name", price="cost in won", category="category name", image="item image")
+async def shop_add_misc(interaction: discord.Interaction, name: str, price: int, category: Optional[str] = None, image: Optional[discord.Attachment] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if price < 0: return await interaction.response.send_message("❌ invalid price.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        cat_match = None
+        if category:
+            cat_match = next((c for c in data["shop_categories"] if c.lower() == category.strip().lower()), None)
+            if not cat_match: return await interaction.followup.send(f"❌ category not found. available: {', '.join(data['shop_categories'])}")
+            
+        pic_url, pic_id = None, None
+        if image:
+            if not image.content_type or not image.content_type.startswith("image/"): return await interaction.followup.send("❌ attachment must be image.")
+            p = await persist_image_attachment(image, store_msg_id=True)
+            if p: pic_url, pic_id = p
+            
+        item_id = _gen_item_id(data["shop"], data.get("used_item_ids", []))
+        data.setdefault("used_item_ids", []).append(item_id)
+            
+        data["shop"][item_id] = {
+            "id": item_id, "type": "misc", "name": name, "price": price,
+            "category": cat_match, "image_url": pic_url, "image_msg_id": pic_id, "created_at": now_iso()
+        }
+        
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="add_misc"))
+        embed = discord.Embed(title="misc item added", description=f"id: `{item_id}`\nname: {name}\nprice: ₩{price:,}", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"shop_add_misc error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_add_inclusion", description="dev | add an inclusion to an existing album.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(item_id="7-digit item number (e.g. 1234567)", inclusion_name="name", rarity="positive int (higher = rarer)", image="image file")
+async def shop_add_inclusion(interaction: discord.Interaction, item_id: str, inclusion_name: str, rarity: int, image: Optional[discord.Attachment] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if rarity < 1: return await interaction.response.send_message("❌ rarity must be >= 1.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        normalized_id = _resolve_item_id(item_id, data["shop"])
+        if not normalized_id:
+            return await interaction.followup.send("❌ item not found.")
+        item = data["shop"][normalized_id]
+        if item.get("type") != "album": 
+            return await interaction.followup.send(
+                "❌ inclusions can only be added to album items. "
+                f"`{normalized_id}` is a `{item.get('type', 'unknown')}` item."
+            )
+        
+        pic_url, pic_id = None, None
+        if image:
+            if not image.content_type or not image.content_type.startswith("image/"): return await interaction.followup.send("❌ attachment must be image.")
+            p = await persist_image_attachment(image, store_msg_id=True)
+            if p: pic_url, pic_id = p
+            
+        all_used_inc = {
+            inc["inclusion_id"]
+            for shop_item in data["shop"].values()
+            for inc in shop_item.get("inclusions", [])
+        }
+        inc_id = _gen_inclusion_id(all_used_inc, data.get("used_inclusion_ids", []))
+        data.setdefault("used_inclusion_ids", []).append(inc_id)
+            
+        item["inclusions"].append({
+            "inclusion_id": inc_id, "name": inclusion_name, "rarity": rarity,
+            "image_url": pic_url, "image_msg_id": pic_id
+        })
+        
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="add_inc"))
+        embed = discord.Embed(title="inclusion added", description=f"album: {item['name']}\ninc: {inclusion_name}\nrarity: {rarity}", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"shop_add_inc error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_remove_inclusion", description="dev | permanently delete an inclusion from an album.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    item_id="7-digit album item number (e.g. 1234567)",
+    inclusion_id="inclusion ID without 'inc_' prefix (e.g. 7654321)",
+)
+async def shop_remove_inclusion_cmd(
+    interaction: discord.Interaction,
+    item_id: str,
+    inclusion_id: str,
+) -> None:
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        normalized_item_id = _resolve_item_id(item_id, data["shop"])
+        if not normalized_item_id:
+            return await interaction.followup.send("❌ album item not found.", ephemeral=True)
+        item = data["shop"][normalized_item_id]
+        if item.get("type") != "album":
+            return await interaction.followup.send(
+                f"❌ `{normalized_item_id}` is a `{item.get('type', 'unknown')}` — only albums have inclusions.",
+                ephemeral=True,
+            )
+        inc_id_norm = (
+            f"inc_{inclusion_id.strip()}"
+            if not inclusion_id.strip().startswith("inc_")
+            else inclusion_id.strip()
+        )
+        inc = next(
+            (i for i in item.get("inclusions", []) if i["inclusion_id"] == inc_id_norm),
+            None,
+        )
+        if not inc:
+            return await interaction.followup.send(
+                f"❌ inclusion `{inc_id_norm}` not found on **{item['name']}**.", ephemeral=True
+            )
+        confirm_view = ConfirmView()
+        confirm_embed = discord.Embed(
+            title="⚠️ confirm deletion",
+            description=(
+                f"**album:** {item['name']} (`{normalized_item_id}`)\n"
+                f"**inclusion:** {inc['name']} (`{inc_id_norm}`)\n"
+                f"**rarity:** {inc.get('rarity', '?')}\n\n"
+                "this is **permanent** and cannot be undone. "
+                "the inclusion ID will be retired and never reused."
+            ),
+            color=discord.Color.red(),
+        )
+        msg = await interaction.followup.send(embed=confirm_embed, view=confirm_view, ephemeral=True)
+        await confirm_view.wait()
+        if not confirm_view.confirmed:
+            for child in confirm_view.children:
+                child.disabled = True
+            await msg.edit(view=confirm_view)
+            return await interaction.followup.send("❌ deletion cancelled.", ephemeral=True)
+        data = load_data()
+        ensure_shop_keys(data)
+        item = data["shop"][normalized_item_id]
+        before_count = len(item.get("inclusions", []))
+        item["inclusions"] = [
+            i for i in item.get("inclusions", []) if i["inclusion_id"] != inc_id_norm
+        ]
+        after_count = len(item["inclusions"])
+        if before_count == after_count:
+            return await interaction.followup.send(
+                f"❌ inclusion `{inc_id_norm}` was already removed.", ephemeral=True
+            )
+        data.setdefault("used_inclusion_ids", [])
+        if inc_id_norm not in data["used_inclusion_ids"]:
+            data["used_inclusion_ids"].append(inc_id_norm)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="rm_inclusion"))
+        result_embed = discord.Embed(
+            title="✅ inclusion deleted",
+            description=(
+                f"**album:** {item['name']} (`{normalized_item_id}`)\n"
+                f"**removed:** {inc['name']} (`{inc_id_norm}`)\n"
+                f"inclusions remaining: {after_count}"
+            ),
+            color=discord.Color.green(),
+        )
+        await interaction.followup.send(embed=result_embed, ephemeral=True)
+        guild = resolve_guild(interaction)
+        if guild:
+            await audit(
+                guild,
+                f"rm_inclusion: {interaction.user} deleted {inc['name']} ({inc_id_norm}) "
+                f"from {item['name']} ({normalized_item_id})",
+            )
+    except Exception as e:
+        log.error(f"shop_remove_inclusion error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+@bot.tree.command(name="shop_edit_item", description="dev | edit an existing shop item.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    item_id="7-digit item number (e.g. 1234567)", name="new name", price="new price", group="new group", 
+    inclusion_count="new count", category="new cat (empty string to clear)",
+    inclusion_id="7-digit inclusion number (e.g. 1234567, without 'inc_' prefix)", inclusion_name="new inclusion name", inclusion_rarity="new inclusion rarity", inclusion_image="new inclusion image"
+)
+async def shop_edit_item(
+    interaction: discord.Interaction, item_id: str,
+    name: Optional[str] = None, price: Optional[int] = None, group: Optional[str] = None, 
+    inclusion_count: Optional[int] = None, category: Optional[str] = None, image: Optional[discord.Attachment] = None,
+    inclusion_id: Optional[str] = None, inclusion_name: Optional[str] = None, inclusion_rarity: Optional[int] = None, inclusion_image: Optional[discord.Attachment] = None
+):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        normalized_id = _resolve_item_id(item_id, data["shop"])
+        if not normalized_id:
+            return await interaction.followup.send("❌ item not found.")
+        item = data["shop"][normalized_id]
+        
+        changes = []
+        if name: item["name"] = name; changes.append("name")
+        if price is not None and price >= 0: item["price"] = price; changes.append("price")
+        if group and item.get("type") == "album": item["group"] = group; changes.append("group")
+        if inclusion_count is not None and inclusion_count >= 1 and item.get("type") == "album": item["inclusion_count"] = inclusion_count; changes.append("inclusion_count")
+        
+        if category is not None:
+            if category.strip() == "":
+                item["category"] = None
+                changes.append("category (cleared)")
+            else:
+                cat_match = next((c for c in data["shop_categories"] if c.lower() == category.strip().lower()), None)
+                if not cat_match: return await interaction.followup.send("❌ category not found.")
+                item["category"] = cat_match
+                changes.append("category")
+                
+        if image:
+            p = await persist_image_attachment(image, store_msg_id=True)
+            if p:
+                item["image_url"], item["image_msg_id"] = p
+                changes.append("image")
+                
+        if inclusion_id:
+            if item.get("type") != "album":
+                return await interaction.followup.send(
+                    "❌ inclusion edits are only valid on album items. "
+                    f"`{normalized_id}` is a `{item.get('type', 'unknown')}` item."
+                )
+            if not any([inclusion_name, inclusion_rarity is not None, inclusion_image]):
+                return await interaction.followup.send("❌ provide at least one of: inclusion_name, inclusion_rarity, inclusion_image when specifying an inclusion_id.")
+            
+            inc_id_norm = f"inc_{inclusion_id.strip()}" if not inclusion_id.strip().startswith("inc_") else inclusion_id.strip()
+            inc = next((i for i in item.get("inclusions", []) if i["inclusion_id"] == inc_id_norm), None)
+            if not inc: return await interaction.followup.send("❌ inclusion not found.")
+            
+            if inclusion_name:
+                inc["name"] = inclusion_name
+                changes.append("inclusion name")
+            if inclusion_rarity is not None and inclusion_rarity >= 1:
+                inc["rarity"] = inclusion_rarity
+                changes.append("inclusion rarity")
+            if inclusion_image:
+                if not inclusion_image.content_type or not inclusion_image.content_type.startswith("image/"):
+                    return await interaction.followup.send("❌ inclusion image must be an image file.")
+                p = await persist_image_attachment(inclusion_image, store_msg_id=True)
+                if p:
+                    inc["image_url"], inc["image_msg_id"] = p
+                    changes.append("inclusion image")
+                
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="edit_item"))
+        embed = discord.Embed(title="item edited", description=f"fields updated: {', '.join(changes) if changes else 'none'}", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"shop_edit error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+@bot.tree.command(name="shop_remove_item", description="dev | remove an item from the shop entirely.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(item_id="7-digit item number (e.g. 1234567)", confirm="type the item name exactly to confirm")
+async def shop_remove_item(interaction: discord.Interaction, item_id: str, confirm: str):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+        normalized_id = _resolve_item_id(item_id, data["shop"])
+        if not normalized_id:
+            return await interaction.followup.send("❌ item not found.")
+        item = data["shop"][normalized_id]
+        
+        if item["name"] != confirm:
+            return await interaction.followup.send("❌ confirmation name does not match item name.")
+            
+        del data["shop"][normalized_id]
+        data.setdefault("used_item_ids", []).append(normalized_id)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="rm_item"))
+        embed = discord.Embed(title="item removed", color=discord.Color.green())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"shop_rm_item error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+
+def _build_shop_pages(data) -> dict:
+    categories = {}
+    for item in data["shop"].values():
+        if item.get("type") not in PURCHASABLE_TYPES:
+            continue
+        cat = item.get("category")
+        if not cat or cat.lower() not in [c.lower() for c in data["shop_categories"]]:
+            cat = "uncategorized"
+        else:
+            cat = next(c for c in data["shop_categories"] if c.lower() == cat.lower())
+        categories.setdefault(cat, []).append(item)
+        
+    for cat in categories:
+        categories[cat].sort(key=lambda i: i["name"].lower())
+        
+    sorted_cats = sorted([c for c in categories if c != "uncategorized"], key=str.lower)
+    if "uncategorized" in categories:
+        sorted_cats.append("uncategorized")
+        
+    pages = {}
+    for cat in sorted_cats:
+        items = categories[cat]
+        chunked = [items[i:i + 10] for i in range(0, len(items), 10)]
+        if not chunked:
+            chunked = [[]]
+        pages[cat] = chunked
+    return pages
+
+class PurchaseRevealView(discord.ui.View):
+    def __init__(
+        self,
+        pulled: list[dict],
+        album_name: str,
+        oc_name: str,
+        album_image_url: Optional[str],
+        invoker_id: int,
+        quantity: int = 1,
+    ):
+        super().__init__(timeout=300)
+        self.pulled          = pulled
+        self.album_name      = album_name
+        self.oc_name         = oc_name
+        self.album_cover     = album_image_url
+        self.invoker_id      = invoker_id
+        self.quantity        = quantity
+        self.index           = 0
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "❌ this reveal belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _sync_buttons(self) -> None:
+        if not self.pulled: return
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index >= len(self.pulled) - 1)
+
+    def _rarity_color(self, rarity_int: int) -> discord.Color:
+        if rarity_int == 1:   return discord.Color.light_grey()
+        if rarity_int == 2:   return discord.Color.green()
+        if rarity_int == 3:   return discord.Color.blue()
+        if rarity_int == 4:   return discord.Color.purple()
+        if rarity_int >= 5:   return discord.Color.gold()
+        return discord.Color.blurple()
+
+    def build_embed(self) -> discord.Embed:
+        if not self.pulled: return discord.Embed(description="no inclusions pulled.")
+        inc   = self.pulled[self.index]
+        total = len(self.pulled)
+        page  = self.index + 1
+
+        rarity_int   = inc.get("rarity", 0)
+        all_rarities = [i.get("rarity", 0) for i in self.pulled]
+        rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
+
+        qty_note = f" (x{self.quantity} purchased)" if self.quantity > 1 else ""
+        embed = discord.Embed(
+            title=f"✨ {inc['name']}",
+            description=(
+                f"**album:** {self.album_name}{qty_note}\n"
+                f"**oc:** {self.oc_name}"
+            ),
+            color=self._rarity_color(rarity_int),
+        )
+        embed.add_field(name="rarity", value=rarity_label, inline=True)
+        embed.add_field(name="inclusion", value=f"{page} of {total}", inline=True)
+
+        img_url = inc.get("image_url") or self.album_cover
+        if img_url:
+            embed.set_image(url=img_url)
+
+        embed.set_footer(text="use ◀ ▶ to reveal your other inclusions.")
         return embed
 
-    def _build_view_for_type(member: discord.Member, oc_data: Optional[dict], oc_n: Optional[str]) -> Optional[discord.ui.View]:
-        if type == "selection":
-            if not oc_n: return None
-            return DebutView(
-                guild_id=guild.id, user_id=member.id,
-                oc_name=oc_n, group_name=group_name or "Unknown",
-                transport_channel_id=transport_ch.id,
-                custom_channel_message=channel_message,
-                accept_label=accept_label,
-                accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-                decline_label=decline_label,
-                decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger)
-            )
-        elif type == "qa":
-            if require_response:
-                return DevDMView(
-                    guild_id=guild.id, dev_id=interaction.user.id,
-                    reply_label=reply_label or "Reply to Dev",
-                    reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary)
-                )
-            return None
-        elif type == "custom":
-            has_debut_btns = bool((accept_label or decline_label or target_channel or group_name) and oc_n)
-            has_reply_btn  = require_response
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="reveal_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-            if has_debut_btns and has_reply_btn:
-                return CombinedNotifyView(
-                    guild_id=guild.id, user_id=member.id, dev_id=interaction.user.id,
-                    oc_name=oc_n or "", group_name=group_name or "Unknown",
-                    transport_channel_id=transport_ch.id,
-                    custom_channel_message=channel_message,
-                    accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-                    decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
-                    reply_label=reply_label, reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary),
-                    show_reply=True, show_debut=True
-                )
-            elif has_debut_btns:
-                return CombinedNotifyView(
-                    guild_id=guild.id, user_id=member.id, dev_id=interaction.user.id,
-                    oc_name=oc_n or "", group_name=group_name or "Unknown",
-                    transport_channel_id=transport_ch.id,
-                    custom_channel_message=channel_message,
-                    accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-                    decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
-                    reply_label=reply_label, reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary),
-                    show_reply=False, show_debut=True
-                )
-            elif has_reply_btn:
-                return DevDMView(
-                    guild_id=guild.id, dev_id=interaction.user.id,
-                    reply_label=reply_label or "Reply to Dev",
-                    reply_style=resolve_button_style(reply_color, discord.ButtonStyle.primary)
-                )
-            return None
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="reveal_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    def _build_dm_content(member: discord.Member, oc_data: Optional[dict], oc_n: Optional[str]) -> Optional[str]:
-        if type == "selection" and oc_n:
-            return f"You have received a debut contract for your OC **{oc_n}** to join **{group_name}**. Please accept or decline below."
-        elif type == "custom" and oc_n and bool(accept_label or decline_label or target_channel or group_name):
-            return f"You have received a debut contract for your OC **{oc_n}** to join **{group_name or 'Unknown'}**. Please accept or decline below."
-        return None
-
-    successes: list[str] = []
-    failures:  list[str] = []
-
-    for (member, oc_data, oc_n) in resolved_recipients:
-        if type == "selection" and not oc_n:
-            continue
-
-        target_embed = _build_embed_for_type(member, oc_data, oc_n)
-        target_view  = _build_view_for_type(member, oc_data, oc_n)
-        dm_content   = _build_dm_content(member, oc_data, oc_n)
-        
-        try:
-            await member.send(content=dm_content, embed=target_embed, view=target_view)
-            label = f"{member.mention} (**{oc_n}**)" if oc_n else member.mention
-            successes.append(label)
-        except discord.Forbidden:
-            label = f"{member.mention} (**{oc_n}**) — DMs likely disabled" if oc_n else f"{member.mention} — DMs likely disabled"
-            failures.append(label)
-        except discord.HTTPException as e:
-            failures.append(f"{member.mention} — HTTP error: {e.status} {e.text[:80]}")
-
-    result_lines = []
-    if successes: result_lines.append("✅ Sent to: " + ", ".join(successes))
-    if failures:  result_lines.append("❌ Failed: "  + ", ".join(failures))
-    warn_str = "\n".join(dict.fromkeys(warning_msgs))
-    if warn_str: result_lines.append(warn_str)
-
-    await interaction.followup.send("\n".join(result_lines) or "No notifications sent.", ephemeral=True)
-    
-    audit_target_ids = [str(m.id) for (m, _, _) in resolved_recipients]
-    if type == "selection":
-        await audit(guild, f"[DEV_NOTIFY:selection] Debut contract sent to {audit_target_ids} group='{group_name}' by {interaction.user}")
-    elif type == "qa":
-        await audit(guild, f"[DEV_NOTIFY:qa] Dev DM sent to {audit_target_ids} by {interaction.user}. Requires response: {require_response}")
-    elif type == "custom":
-        has_debut = bool((accept_label or decline_label or target_channel or group_name))
-        await audit(guild, f"[DEV_NOTIFY:custom] Custom notify sent to {audit_target_ids} by {interaction.user}. debut={has_debut}, reply={require_response}")
-
-
-class GCInviteView(discord.ui.View):
-    def __init__(
-        self, guild_id: int, invitee_user_id: int, oc_key: str, oc_name: str,
-        group_name: str, target_channel_id: int, dev_ids: list[int],
-        accept_label: Optional[str] = None, accept_style: Optional[discord.ButtonStyle] = None,
-        decline_label: Optional[str] = None, decline_style: Optional[discord.ButtonStyle] = None,
-    ):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.invitee_user_id = invitee_user_id
-        self.oc_key = oc_key
-        self.oc_name = oc_name
-        self.group_name = group_name
-        self.target_channel_id = target_channel_id
-        self.dev_ids = dev_ids
-
+    async def on_timeout(self) -> None:
         for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                if getattr(child, "custom_id", "") == "gcinvite_accept":
-                    child.label = accept_label or "Accept"
-                    child.style = accept_style or discord.ButtonStyle.success
-                elif getattr(child, "custom_id", "") == "gcinvite_decline":
-                    child.label = decline_label or "Decline"
-                    child.style = decline_style or discord.ButtonStyle.danger
+            child.disabled = True
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="gcinvite_accept")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = bot.get_guild(self.guild_id)
-        if not guild: return await interaction.response.edit_message(content="❌ Server not found.", view=None)
+async def _handle_shop_buy(interaction: discord.Interaction, item_id: str, oc_name: str, quantity: int = 1):
+    data = load_data()
+    ensure_shop_keys(data)
+    item = data["shop"].get(item_id)
+    if not item:
+        if item_id.startswith("inc_"):
+            return await interaction.response.send_message(
+                "❌ that looks like an inclusion ID (`inc_…`). inclusions cannot be purchased directly — "
+                "they are part of albums. browse the shop with `/shop` and buy the parent album instead.",
+                ephemeral=True
+            )
+        return await interaction.response.send_message("❌ item not found.", ephemeral=True)
+        
+    oc_key = oc_key_of(oc_name)
+    oc = data["ocs"].get(oc_key)
+    if not oc: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+        
+    if not is_dev(interaction) and oc.get("owner_id") != interaction.user.id:
+        return await interaction.response.send_message("❌ you do not own this oc.", ephemeral=True)
+        
+    quantity = max(1, quantity)
+    total_cost = item["price"] * quantity
+    
+    if oc["balance"] < total_cost:
+        return await interaction.response.send_message(f"❌ {oc['name']} doesn't have enough won. current balance: ₩{oc['balance']:,} — purchase costs: ₩{total_cost:,}.", ephemeral=True)
+        
+    embed = discord.Embed(title="confirm purchase", color=discord.Color.orange())
+    qty_str = f" x{quantity}" if quantity > 1 else ""
+    embed.description = f"**item:** {item['name']}{qty_str}\n**total cost:** ₩{total_cost:,}\n**buyer:** {oc['name']}\n**current balance:** ₩{oc['balance']:,}"
+    
+    view = discord.ui.View()
+    
+    async def confirm_cb(inter):
+        try:
+            d = load_data()
+            ensure_shop_keys(d)
+            i_data = d["shop"].get(item_id)
+            o_data = d["ocs"].get(oc_key)
+            if not i_data or not o_data or o_data["balance"] < i_data["price"] * quantity:
+                return await inter.response.edit_message(content="❌ purchase failed (insufficient balance or missing info).", embed=None, view=None)
+                
+            o_data["balance"] -= i_data["price"] * quantity
+            all_pulled = []
+            
+            for _ in range(quantity):
+                instance = {"acquired_at": now_iso()}
+                pulled = []
+                if i_data.get("type") == "album":
+                    count = i_data.get("inclusion_count", 0)
+                    incs = i_data.get("inclusions", [])
+                    if count > 0 and incs:
+                        seen_ids: set[str] = set()
+                        pool = []
+                        for inc in incs:
+                            repeat = max(1, round(6 - inc.get("rarity", 1)))
+                            pool.extend([inc] * repeat)
 
-        channel = guild.get_channel(self.target_channel_id)
-        if not channel: return await interaction.response.edit_message(content="❌ Channel no longer exists.", view=None)
+                        if len(pool) >= count:
+                            choices = random.sample(pool, k=count)
+                        else:
+                            weights = [1.0 / max(inc.get("rarity", 1), 1) for inc in incs]
+                            choices = []
+                            attempts = 0
+                            while len(choices) < count and attempts < count * 10:
+                                candidate = random.choices(incs, weights=weights, k=1)[0]
+                                if candidate["inclusion_id"] not in seen_ids:
+                                    choices.append(candidate)
+                                    seen_ids.add(candidate["inclusion_id"])
+                                attempts += 1
+                            if len(choices) < count:
+                                remaining = count - len(choices)
+                                choices.extend(random.choices(incs, weights=weights, k=remaining))
 
-        member = guild.get_member(self.invitee_user_id)
-        if not member: return await interaction.response.edit_message(content="❌ Could not resolve your server membership.", view=None)
+                        for c in choices:
+                            pulled.append({
+                                "inclusion_id": c["inclusion_id"],
+                                "name": c["name"],
+                                "rarity": c["rarity"],
+                                "image_url": c.get("image_url"),
+                            })
+                        all_pulled.extend(pulled)
+                instance["pulled_inclusions"] = pulled
+                d["inventories"].setdefault(oc_key, {}).setdefault(item_id, []).append(instance)
+                
+            save_data(d)
+            asyncio.ensure_future(push_backup_to_discord(d, reason="shop_buy"))
+            
+            qty_success_str = f" x{quantity}" if quantity > 1 else ""
+            res_embed = discord.Embed(
+                title="🛍️ purchase successful",
+                description=(
+                    f"**{o_data['name']}** bought **{i_data['name']}**{qty_success_str} "
+                    f"for ₩{i_data['price'] * quantity:,}!\n"
+                    f"new balance: ₩{o_data['balance']:,}"
+                ),
+                color=discord.Color.green(),
+            )
 
-        await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+            if all_pulled:
+                reveal_view = PurchaseRevealView(
+                    pulled          = all_pulled,
+                    album_name      = i_data["name"],
+                    oc_name         = o_data["name"],
+                    album_image_url = i_data.get("image_url"),
+                    invoker_id      = inter.user.id,
+                    quantity        = quantity,
+                )
+                await inter.response.edit_message(content=None, embed=res_embed, view=None)
+                await inter.followup.send(
+                    embed=reveal_view.build_embed(),
+                    view=reveal_view
+                )
+            else:
+                await inter.response.edit_message(content=None, embed=res_embed, view=None)
+        except Exception as e:
+            log.error(f"buy confirm error: {e}")
+            await inter.response.edit_message(content="❌ an unexpected error occurred.", embed=None, view=None)
+            
+    async def cancel_cb(inter): await inter.response.edit_message(content="❌ purchase cancelled.", embed=None, view=None)
+        
+    btn_y = discord.ui.Button(label="confirm", style=discord.ButtonStyle.success)
+    btn_y.callback = confirm_cb
+    btn_n = discord.ui.Button(label="cancel", style=discord.ButtonStyle.danger)
+    btn_n.callback = cancel_cb
+    view.add_item(btn_y)
+    view.add_item(btn_n)
+    
+    if interaction.response.is_done(): await interaction.followup.send(embed=embed, view=view)
+    else: await interaction.response.send_message(embed=embed, view=view)
+
+class InclusionPaginatorView(discord.ui.View):
+    def __init__(self, item: dict, pages: list[list[dict]], invoker_id: int):
+        super().__init__(timeout=300)
+        self.item = item
+        self.pages = pages
+        self.index = 0
+        self.invoker_id = invoker_id
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "❌ this panel belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index >= len(self.pages) - 1)
+
+    def build_embed(self) -> discord.Embed:
+        page = self.pages[self.index]
+        total_pages = len(self.pages)
+        embed = discord.Embed(
+            title=f"{self.item['name']} — possible inclusions",
+            description=f"page {self.index + 1} of {total_pages}  •  sorted by rarity, then a–z",
+            color=discord.Color.gold()
+        )
+        for inc in page:
+            rarity_int = inc.get("rarity", 0)
+            rarity_label = _rarity_label(rarity_int)
+            embed.add_field(
+                name=inc["name"],
+                value=f"rarity: {rarity_label}  •  `{inc['inclusion_id']}`",
+                inline=False
+            )
+        if self.item.get("image_url"):
+            embed.set_thumbnail(url=self.item["image_url"])
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="inc_details_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="inc_details_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+class ShopDetailsModal(discord.ui.Modal, title="item details"):
+    item_id = discord.ui.TextInput(label="item id", placeholder="e.g. 1234567 (7-digit number only)")
+
+    async def on_submit(self, interaction):
+        raw = self.item_id.value.strip()
+        if raw.startswith("inc_") or raw.startswith("inc"):
+            return await interaction.response.send_message(
+                "❌ that looks like an inclusion ID (`inc_…`). inclusions are part of albums, not standalone shop items. "
+                "use `/open` to browse an album's inclusions.",
+                ephemeral=True
+            )
+        full_id = f"id_{raw}" if not raw.startswith("id_") else raw
 
         data = load_data()
-        gc_key = f"gc_{channel.name}_{int(now_utc().timestamp())}"
-        data["groupchats"][gc_key] = {"name": self.group_name, "channel_id": channel.id, "participants": [self.oc_key], "created_at": now_iso()}
-        save_data(data)
-        asyncio.ensure_future(push_backup_to_discord(data, reason="gc_invite_accept"))
+        ensure_shop_keys(data)
+        item = data["shop"].get(full_id)
+        if not item:
+            return await interaction.response.send_message("❌ item not found.", ephemeral=True)
 
-        await interaction.response.edit_message(content=f"✅ You accepted the group chat invite for **{self.oc_name}** in **{self.group_name}**.", view=None)
-        await audit(guild, f"GC invite accepted: OC '{self.oc_name}' granted access to #{channel.name} by {interaction.user}")
+        embed = discord.Embed(title=item["name"], color=discord.Color.gold())
+        embed.add_field(name="id", value=f"`{full_id}`", inline=True)
+        embed.add_field(name="price", value=f"₩{item['price']:,}", inline=True)
+        embed.add_field(name="type", value=item.get("type", "misc"), inline=True)
+        if item.get("group"):
+            embed.add_field(name="group", value=item["group"], inline=True)
+        if item.get("type") == "album":
+            embed.add_field(name="inclusion count", value=str(item.get("inclusion_count", 0)), inline=True)
+        if item.get("image_url"):
+            embed.set_thumbnail(url=item["image_url"])
+        embed.set_footer(text="use /shop_buy to purchase this item.")
 
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="gcinvite_decline")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content=f"You declined the group chat invite for **{self.oc_name}** in **{self.group_name}**.", view=None)
+        if item.get("type") == "album":
+            sorted_incs = sorted(item.get("inclusions", []), key=_inclusion_sort_key)
+            pages = [sorted_incs[i:i+10] for i in range(0, len(sorted_incs), 10)] or [[]]
+            inc_view = InclusionPaginatorView(item=item, pages=pages, invoker_id=interaction.user.id)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=inc_view.build_embed(), view=inc_view, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
+class ShopCategorySelect(discord.ui.Select):
+    def __init__(self, categories):
+        super().__init__(placeholder="jump to category...", options=[discord.SelectOption(label=c, value=str(i)) for i, c in enumerate(categories)], custom_id="shop_cat_select")
+    async def callback(self, interaction):
+        self.view.cat_idx = int(self.values[0])
+        self.view.page_idx = 0
+        self.view._update_state()
+        await interaction.response.edit_message(embed=self.view._get_embed(), view=self.view)
 
-@bot.tree.command(name="gc_invite", description="Send a group-chat invite to one or more OC owners.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    oc_name="OC to invite", group_name="Display name for GC", message="Custom invitation message",
-    target_channel="Existing channel to grant access to",
-    embed_title="Optional custom embed title", embed_color="Optional hex color",
-    footnote="Optional footer text", thumbnail_url="Optional thumbnail image URL",
-    accept_label="Optional custom accept button label", accept_color="Optional accept button color",
-    decline_label="Optional custom decline button label", decline_color="Optional decline button color",
-    oc_name2="Optional additional OC to invite", oc_name3="Optional additional OC to invite",
-    oc_name4="Optional additional OC to invite", oc_name5="Optional additional OC to invite"
-)
-async def gc_invite(
-    interaction: discord.Interaction, oc_name: str, group_name: str, message: str, target_channel: discord.TextChannel,
-    embed_title: Optional[str] = None, embed_color: Optional[str] = None, footnote: Optional[str] = None,
-    thumbnail_url: Optional[str] = None, accept_label: Optional[str] = None, accept_color: Optional[str] = None,
-    decline_label: Optional[str] = None, decline_color: Optional[str] = None,
-    oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None, oc_name5: Optional[str] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    if not target_channel.permissions_for(guild.me).manage_permissions:
-        return await interaction.response.send_message(f"❌ I lack Manage Permissions in {target_channel.mention}.", ephemeral=True)
-    if accept_label and len(accept_label) > 80: return await interaction.response.send_message("❌ accept_label exceeds 80 characters.", ephemeral=True)
-    if decline_label and len(decline_label) > 80: return await interaction.response.send_message("❌ decline_label exceeds 80 characters.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    raw_oc_names = [n for n in [oc_name, oc_name2, oc_name3, oc_name4, oc_name5] if n]
-    data = load_data()
-    dev_ids = [m.id for m in guild.members if (m.guild_permissions.administrator or m.id == guild.owner_id) and not m.bot]
-
-    warning_msgs = []
-    resolved_color = discord.Color.purple()
-    if embed_color:
-        try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
-        except ValueError: warning_msgs.append("⚠️ Invalid embed color, using default purple.")
-
-    result_lines = []
-    successes = []
-    failures = []
-
-    for oc_n in raw_oc_names:
-        oc_key = oc_key_of(oc_n)
-        if oc_key not in data["ocs"]:
-            warning_msgs.append(f"❌ No OC named **{oc_n}** found.")
-            continue
-            
-        oc = data["ocs"][oc_key]
-        owner_id = oc.get("owner_id")
-        if not owner_id:
-            warning_msgs.append(f"❌ **{oc_n}** has no registered owner.")
-            continue
-
-        member = guild.get_member(owner_id)
-        if not member:
-            warning_msgs.append(f"❌ Owner of **{oc_n}** not in server.")
-            continue
-
-        _fmt = {
-            "oc": oc["name"], "group": group_name, "server": guild.name,
-            "owner": member.display_name, "channel": target_channel.name,
-        }
-        def _r(text: Optional[str]) -> Optional[str]: return _safe_fmt(text, **_fmt) if text else None
-
-        actual_title = _r(embed_title) or f"Group Chat Invite  —  {oc['name']}  |  {group_name}"
-        embed = discord.Embed(title=actual_title, description=_r(message), color=resolved_color, timestamp=now_utc())
-
-        resolved_thumbnail = None
-        if thumbnail_url:
-            if valid_image_url(thumbnail_url): resolved_thumbnail = thumbnail_url
-            else: warning_msgs.append("⚠️ Invalid thumbnail URL, using OC profile picture.")
-        if not resolved_thumbnail and oc.get("profile_picture"): resolved_thumbnail = oc["profile_picture"]
-        if resolved_thumbnail: embed.set_thumbnail(url=resolved_thumbnail)
-
-        embed.add_field(name="OC", value=oc["name"], inline=True)
-        embed.add_field(name="Group Chat", value=group_name, inline=True)
-        embed.add_field(name="Channel", value=target_channel.mention, inline=True)
-
-        if _r(footnote): embed.set_footer(text=_r(footnote))
-
-        view = GCInviteView(
-            guild_id=guild.id, invitee_user_id=member.id, oc_key=oc_key, oc_name=oc["name"],
-            group_name=group_name, target_channel_id=target_channel.id, dev_ids=dev_ids,
-            accept_label=accept_label, accept_style=resolve_button_style(accept_color, discord.ButtonStyle.success),
-            decline_label=decline_label, decline_style=resolve_button_style(decline_color, discord.ButtonStyle.danger),
-        )
-
-        try:
-            await member.send(content=f"You have been invited to add your OC **{oc['name']}** to the group chat **{group_name}**. Accept or decline below.", embed=embed, view=view)
-            successes.append(f"{member.mention} ({oc['name']})")
-            await audit(guild, f"GC invite sent to {member} for OC '{oc['name']}' group '{group_name}' target_channel=#{target_channel.name} by {interaction.user}")
-        except discord.Forbidden:
-            failures.append(f"{member.mention} ({oc['name']})")
-
-    if successes: result_lines.append(f"✅ Sent to: {', '.join(successes)}")
-    if failures: result_lines.append(f"❌ Failed (DMs likely off): {', '.join(failures)}")
-    warn_str = "\n".join(dict.fromkeys(warning_msgs))
-    if warn_str: result_lines.append(warn_str)
-
-    await interaction.followup.send(
-        "\n".join(result_lines) or "✅ All invites sent.", ephemeral=True
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  OC DM
-# ══════════════════════════════════════════════════════════════════════════════
-
-@bot.tree.command(name="oc_dm", description="Open a private DM channel between two OCs.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(your_oc="Your OC's name", target_oc="OC to DM")
-async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data    = load_data()
-    src_key = oc_key_of(your_oc)
-    tgt_key = oc_key_of(target_oc)
-
-    if src_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{your_oc}** found.", ephemeral=True)
-    if tgt_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{target_oc}** found.", ephemeral=True)
-    if src_key == tgt_key: return await interaction.response.send_message("❌ You cannot DM an OC with themselves.", ephemeral=True)
-
-    dm_key       = "dm_" + "_".join(sorted([src_key, tgt_key]))
-    src_oc       = data["ocs"][src_key]
-    tgt_oc       = data["ocs"][tgt_key]
-    tgt_owner_id = tgt_oc.get("owner_id")
-    tgt_member   = guild.get_member(tgt_owner_id) if tgt_owner_id else None
-
-    if dm_key in data["dms"]:
-        existing_ch = guild.get_channel(data["dms"][dm_key]["channel_id"])
-        if existing_ch:
-            await existing_ch.set_permissions(interaction.user, view_channel=True, send_messages=True)
-            if tgt_member: await existing_ch.set_permissions(tgt_member, view_channel=True, send_messages=True)
-            return await interaction.response.send_message(f"DM channel: {existing_ch.mention}", ephemeral=True)
-
-    cat = discord.utils.get(guild.categories, name="OC DMs")
-    if not cat: cat = await guild.create_category("OC DMs")
-
-    ch_name    = f"dm-{src_key[:15]}-{tgt_key[:15]}"
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me:           discord.PermissionOverwrite(view_channel=True),
-        interaction.user:               discord.PermissionOverwrite(view_channel=True, send_messages=True),
-    }
-    if tgt_member: overwrites[tgt_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-    channel = await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
-    data["dms"][dm_key] = {"participants": [src_key, tgt_key], "channel_id": channel.id, "created_at": now_iso()}
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_dm"))
-
-    embed = discord.Embed(
-        title="OC DM",
-        description=f"Private conversation between **{src_oc['name']}** and **{tgt_oc['name']}**.\nVisible only to the owners of these OCs.",
-        color=discord.Color.purple(),
-    )
-    await channel.send(embed=embed)
-    await interaction.response.send_message(f"DM channel created: {channel.mention}", ephemeral=True)
-    await audit(guild, f"OC DM opened: '{your_oc}' <-> '{target_oc}' by {interaction.user}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  OC GROUP CHAT
-# ══════════════════════════════════════════════════════════════════════════════
-
-@bot.tree.command(name="oc_groupchat", description="Create a group chat channel between multiple OCs.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    your_oc="Your OC", group_name="Group name",
-    target_oc1="OC #1", target_oc2="OC #2", target_oc3="OC #3 (optional)",
-    target_oc4="OC #4 (optional)", target_oc5="OC #5 (optional)"
-)
-async def oc_groupchat(
-    interaction: discord.Interaction, your_oc: str, group_name: str,
-    target_oc1: str, target_oc2: str, target_oc3: Optional[str] = None,
-    target_oc4: Optional[str] = None, target_oc5: Optional[str] = None,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data    = load_data()
-    src_key = oc_key_of(your_oc)
-
-    if src_key not in data["ocs"]: return await interaction.response.send_message(f"❌ No OC named **{your_oc}** found.", ephemeral=True)
-
-    raw_targets  = [target_oc1, target_oc2, target_oc3, target_oc4, target_oc5]
-    target_names = [t for t in raw_targets if t]
-    target_keys  = [oc_key_of(t) for t in target_names]
-
-    missing = [n for n, k in zip(target_names, target_keys) if k not in data["ocs"]]
-    if missing: return await interaction.response.send_message(f"❌ OC(s) not found: {', '.join(f'**{m}**' for m in missing)}", ephemeral=True)
-
-    dupes = set()
-    for k in target_keys:
-        if k == src_key or target_keys.count(k) > 1: dupes.add(data["ocs"][k]["name"])
-    if dupes: return await interaction.response.send_message(f"❌ Duplicate OC(s): {', '.join(f'**{d}**' for d in dupes)}", ephemeral=True)
-
-    all_keys = [src_key] + target_keys
-    cat = discord.utils.get(guild.categories, name="OC Group Chats")
-    if not cat: cat = await guild.create_category("OC Group Chats")
-
-    ch_name    = "gc-" + group_name.lower().replace(" ", "-")[:28]
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me:           discord.PermissionOverwrite(view_channel=True),
-        interaction.user:               discord.PermissionOverwrite(view_channel=True, send_messages=True),
-    }
-    members_added = [interaction.user]
-    for oc_k in target_keys:
-        owner_id = data["ocs"][oc_k].get("owner_id")
-        if owner_id:
-            m = guild.get_member(owner_id)
-            if m and m not in members_added:
-                overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-                members_added.append(m)
-
-    channel = await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
-
-    gc_id = f"gc_{int(now_utc().timestamp())}_{src_key[:8]}"
-    data["groupchats"][gc_id] = {
-        "name": group_name, "participants": all_keys, "channel_id": channel.id,
-        "created_by": interaction.user.id, "created_at": now_iso(),
-    }
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_groupchat"))
-
-    oc_names_str = ", ".join(data["ocs"][k]["name"] for k in all_keys)
-    embed = discord.Embed(
-        title=group_name, description=f"**Members:** {oc_names_str}\n\nVisible only to the owners of these OCs.",
-        color=discord.Color.blue(), timestamp=now_utc(),
-    )
-    await channel.send(embed=embed)
-    await interaction.response.send_message(f"Group chat **{group_name}** created: {channel.mention}", ephemeral=True)
-    await audit(guild, f"Group chat '{group_name}' created with [{oc_names_str}] by {interaction.user}")
-
-
-@bot.tree.command(name="oc_groupchat_add", description="Add an OC to an existing OC group chat channel.")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    target_channel="The existing group chat channel to add the OC to",
-    new_oc="Name of the OC to add to the group chat"
-)
-async def oc_groupchat_add(
-    interaction: discord.Interaction,
-    target_channel: discord.TextChannel,
-    new_oc: str,
-):
-    guild = resolve_guild(interaction)
-    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
-
-    data = load_data()
-    new_oc_key = oc_key_of(new_oc)
-
-    if new_oc_key not in data["ocs"]:
-        return await interaction.response.send_message(f"❌ No OC named **{new_oc}** found.", ephemeral=True)
-
-    gc_id = None
-    gc = None
-    for k, v in data["groupchats"].items():
-        if v.get("channel_id") == target_channel.id:
-            gc_id = k
-            gc = v
-            break
-
-    if not gc:
-        return await interaction.response.send_message("❌ The selected channel is not a registered group chat.", ephemeral=True)
-
-    if new_oc_key in gc["participants"]:
-        return await interaction.response.send_message(f"❌ **{new_oc}** is already in this group chat.", ephemeral=True)
-
-    is_participant_owner = any(data["ocs"][p_key].get("owner_id") == interaction.user.id for p_key in gc["participants"] if p_key in data["ocs"])
-    if not is_participant_owner and not is_dev(interaction):
-        return await interaction.response.send_message("❌ You do not own any OCs in this group chat.", ephemeral=True)
-
-    gc["participants"].append(new_oc_key)
-
-    new_owner_id = data["ocs"][new_oc_key].get("owner_id")
-    new_owner_mention = f"<@{new_owner_id}>" if new_owner_id else "Unknown"
-
-    if new_owner_id:
-        new_owner_member = guild.get_member(new_owner_id)
-        if new_owner_member:
-            await target_channel.set_permissions(new_owner_member, view_channel=True, send_messages=True)
-
-    save_data(data)
-    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_groupchat_add"))
-
-    oc_names_str = "\n".join(f"• {data['ocs'][k]['name']}" for k in gc["participants"] if k in data["ocs"])
-    
-    embed = discord.Embed(
-        title="👥 New Member Joined",
-        description=f"**{data['ocs'][new_oc_key]['name']}** (owned by {new_owner_mention}) has joined the group chat!",
-        color=discord.Color.blue(),
-        timestamp=now_utc()
-    )
-    embed.add_field(name="Current Members", value=oc_names_str, inline=False)
-
-    await target_channel.send(embed=embed)
-    await interaction.response.send_message(f"✅ **{new_oc}** added to {target_channel.mention}.", ephemeral=True)
-    await audit(guild, f"OC '{new_oc}' added to group chat #{target_channel.name} by {interaction.user}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELP
-# ══════════════════════════════════════════════════════════════════════════════
-
-class HelpPaginatorView(discord.ui.View):
-    def __init__(self, pages: list[discord.Embed]):
+class ShopPaginationView(discord.ui.View):
+    def __init__(self, pages: dict, user_id: int):
         super().__init__(timeout=300)
         self.pages = pages
-        self.current = 0
+        self.categories = list(pages.keys())
+        self.cat_idx = 0
+        self.page_idx = 0
+        self.user_id = user_id
+        
+        self.prev_btn = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, custom_id="shop_prev")
+        self.prev_btn.callback = self.on_prev
+        self.add_item(self.prev_btn)
+        
+        self.next_btn = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id="shop_next")
+        self.next_btn.callback = self.on_next
+        self.add_item(self.next_btn)
+        
+        if self.categories: self.add_item(ShopCategorySelect(self.categories))
+            
+        self.details_btn = discord.ui.Button(label="details", style=discord.ButtonStyle.primary, custom_id="shop_details")
+        self.details_btn.callback = self.on_details
+        self.add_item(self.details_btn)
+        self._update_state()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ this is not your shop view.", ephemeral=True)
+            return False
+        return True
+
+    def _update_state(self):
+        if not self.categories:
+            self.prev_btn.disabled, self.next_btn.disabled = True, True
+            return
+        self.prev_btn.disabled = (self.cat_idx == 0 and self.page_idx == 0)
+        self.next_btn.disabled = (self.cat_idx == len(self.categories) - 1 and self.page_idx == len(self.pages[self.categories[-1]]) - 1)
+
+    def _get_embed(self):
+        if not self.categories: return discord.Embed(description="the shop is currently empty.")
+        cat_name = self.categories[self.cat_idx]
+        lines = [f"**{item['name']}** — ₩{item['price']:,}  •  {item.get('type', 'misc')}\n  ↳ id: `{item['id'].replace('id_', '')}`" for item in self.pages[cat_name][self.page_idx]]
+        embed = discord.Embed(title=cat_name, description="\n".join(lines), color=discord.Color.green())
+        embed.add_field(name="navigation", value=f"page {self.page_idx + 1} / {len(self.pages[cat_name])}", inline=False)
+        return embed
+
+    async def on_prev(self, interaction):
+        self.page_idx -= 1
+        if self.page_idx < 0:
+            self.cat_idx -= 1
+            self.page_idx = len(self.pages[self.categories[self.cat_idx]]) - 1
+        self._update_state()
+        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+
+    async def on_next(self, interaction):
+        self.page_idx += 1
+        if self.page_idx >= len(self.pages[self.categories[self.cat_idx]]):
+            self.cat_idx += 1
+            self.page_idx = 0
+        self._update_state()
+        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+
+    async def on_details(self, interaction): await interaction.response.send_modal(ShopDetailsModal())
+
+@bot.tree.command(name="shop", description="browse the shop.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def shop_cmd(interaction: discord.Interaction):
+    data = load_data()
+    ensure_shop_keys(data)
+    if not data["shop"]: return await interaction.response.send_message("the shop is currently empty.", ephemeral=True)
+    pages = _build_shop_pages(data)
+    view = ShopPaginationView(pages, interaction.user.id)
+    await interaction.response.send_message(embed=view._get_embed(), view=view)
+
+@bot.tree.command(name="shop_buy", description="purchase a shop item for one of your ocs.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(item_id="7-digit item number (e.g. 1234567)", oc_name="oc making the purchase", quantity="number of items to purchase")
+async def shop_buy_cmd(interaction: discord.Interaction, item_id: str, oc_name: str, quantity: int = 1):
+    data = load_data()
+    ensure_shop_keys(data)
+    normalized_id = f"id_{item_id.strip()}" if not item_id.strip().startswith("id_") else item_id.strip()
+    await _handle_shop_buy(interaction, normalized_id, oc_name, quantity)
+
+
+class InventoryPaginatorView(discord.ui.View):
+    PAGE_SIZE = 8
+
+    def __init__(self, entries: list[dict], oc_name: str, oc_pic_url: Optional[str], invoker_id: int):
+        super().__init__(timeout=300)
+        self.entries = entries
+        self.oc_name = oc_name
+        self.oc_pic_url = oc_pic_url
+        self.invoker_id = invoker_id
+        self.page = 0
+        self.total_pages = max(1, math.ceil(len(entries) / self.PAGE_SIZE))
         self._sync_buttons()
 
     def _sync_buttons(self):
-        self.prev_btn.disabled = (self.current == 0)
-        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+        if not self.entries:
+            self.prev_btn.disabled = True
+            self.next_btn.disabled = True
+            return
+        self.prev_btn.disabled = (self.page == 0)
+        self.next_btn.disabled = (self.page >= self.total_pages - 1)
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="help_prev")
+    def _build_embed(self) -> discord.Embed:
+        page_entries = self.entries[self.page * self.PAGE_SIZE : (self.page + 1) * self.PAGE_SIZE]
+        lines = []
+        for entry in page_entries:
+            lines.append(f"**{entry['name']}** (x{entry['count']})\n`{entry['display_id']}`")
+
+        description = "\n\n".join(lines) if lines else "no items."
+
+        embed = discord.Embed(
+            title=f"{self.oc_name}'s inventory",
+            description=description,
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=f"page {self.page + 1} of {self.total_pages}  •  {len(self.entries)} unique item(s)/inclusion(s)")
+        if self.oc_pic_url:
+            embed.set_thumbnail(url=self.oc_pic_url)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("❌ this inventory belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="inv_prev")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current -= 1
+        self.page -= 1
         self._sync_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="help_next")
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="inv_next")
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current += 1
+        self.page += 1
         self._sync_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
 
-@bot.tree.command(name="help", description="Show available bot commands.")
+@bot.tree.command(name="inventory", description="view an oc's inventory.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def help_cmd(interaction: discord.Interaction):
-    dev = is_dev(interaction)
+@app_commands.describe(oc_name="oc name")
+async def inventory_cmd(interaction: discord.Interaction, oc_name: str):
+    data = load_data()
+    ensure_shop_keys(data)
+    oc_key_str = oc_key_of(oc_name)
+    if oc_key_str not in data["ocs"]:
+        return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
 
-    if dev:
-        embed1 = discord.Embed(title="OC Bot — Full Command Reference (Dev) [1/2]", color=discord.Color.gold())
-        embed1.add_field(name="OC Management", inline=False, value=(
-            "`/oc_add` — Register a new OC\n"
-            "`/oc_edit` — Edit OC fields\n"
-            "`/oc_fix_image` — Re-upload a broken OC profile picture\n"
-            "`/oc_delete` — Delete your OC\n"
-            "`/oc_list` — Browse/filter OCs with paginator\n"
-            "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
-        ))
-        embed1.add_field(name="Floor/Dorm Management", inline=False, value=(
-            "`/dorm_assign` — Assign an OC to a room\n"
-            "`/dorm_unassign` — Remove an OC from their room\n"
-            "`/dorm_view` — View floors and rooms via dropdown selector\n"
-        ))
-        embed1.add_field(name="News & Announcements", inline=False, value=(
-            "`/announce_list` — View pending scheduled announcements\n"
-        ))
-        embed1.add_field(name="Instagram", inline=False, value=(
-            "`/ig_post` — Post 1–10 photos as your OC\n"
-        ))
-        embed1.add_field(name="Messaging", inline=False, value=(
-            "`/oc_dm` — Private DM channel between two OCs\n"
-            "`/oc_groupchat` — Group chat for multiple OCs\n"
-            "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
-            "`/gc_invite` — Send a group chat invite to up to 5 OC owners\n"
-        ))
-        embed1.add_field(name="Utility", inline=False, value=(
-            "`/ping` — Check the bot's WebSocket latency\n"
-        ))
+    oc = data["ocs"][oc_key_str]
+    inv = data["inventories"].get(oc_key_str, {})
+    if not inv:
+        return await interaction.response.send_message(
+            f"**{oc['name']}**'s inventory is empty."
+        )
 
-        embed2 = discord.Embed(title="OC Bot — Full Command Reference (Dev) [2/2]", color=discord.Color.gold())
-        embed2.add_field(name="⚙️ Dev Tools", inline=False, value=(
-            "`/floor_create` — Create a floor category\n"
-            "`/floor_rename` — Rename a floor\n"
-            "`/floor_delete` — Delete a floor and all its rooms\n"
-            "`/dorm_create` — Create a dorm room\n"
-            "`/dorm_edit` — Edit a dorm's name and/or capacity\n"
-            "`/dorm_relocate` — Move a dorm to another floor\n"
-            "`/dorm_delete` — Delete a single dorm room\n"
-            "`/dorm_kick` — Force-remove OC(s) from a dorm\n"
-            "`/announce` — Post an immediate announcement\n"
-            "`/news_post` — Post a news article embed\n"
-            "`/send_embed` — Post a custom embed to any channel\n"
-            "`/announce_schedule` — Schedule a future announcement\n"
-            "`/announce_cancel` — Cancel a scheduled announcement\n"
-            "`/dev_notify` — Send a typed notification DM (Selection, Q&A, or Custom) to one or more OCs/users\n"
-            "`/remind` — Set a timed reminder for a user\n"
-            "`/remind_timer` — Set a duration-based reminder (e.g. in 2 hours 30 min)\n"
-            "`/startup` — Re-sync commands and restart task loops\n"
-            "`/refresh_assets` — Re-upload any expired CDN attachment URLs (OC pictures, IG posts)\n"
-        ))
-        embed2.add_field(name="Notes", inline=False, value=(
-            f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
-            f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
-            f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
-            f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
-            f"News channel: `#{NEWS_CHANNEL_NAME}`\n"
-            f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
-            f"Dev Response channel: `#{DEV_RESPONSE_CHANNEL_NAME}`\n"
-            f"DB Backup channel: `#{DB_BACKUP_CHANNEL_NAME}` (auto-created)\n"
-            f"Debut channel: `#{DEBUT_CHANNEL_NAME}` (auto-created)\n"
-            f"Asset channel: `#{ASSET_CHANNEL_NAME}` (auto-created, stores persistent image uploads)\n"
-            f"Scheduled time format: YYYY-MM-DD HH:MM (specify timezone; default UTC)\n"
-            f"Up to {MAX_PHOTOS} photos per Instagram post\n"
-            f"PRIMARY_GUILD_ID env var required for DM command context resolution\n"
-        ))
+    await interaction.response.defer()
+
+    entry_map: dict[str, dict] = {}
+
+    for item_id, instances in inv.items():
+        if item_id.startswith("inc_"):
+            if instances:
+                inc_name = instances[0].get("name", item_id)
+            else:
+                inc_name = item_id
+            existing = entry_map.get(item_id)
+            if existing:
+                existing["count"] += len(instances)
+            else:
+                entry_map[item_id] = {
+                    "name": inc_name,
+                    "display_id": item_id,
+                    "count": len(instances),
+                }
+        else:
+            shop_item = data["shop"].get(item_id)
+            item_name = shop_item["name"] if shop_item else item_id
+            entry_map[item_id] = {
+                "name": item_name,
+                "display_id": item_id,
+                "count": len(instances),
+            }
+
+            if shop_item and shop_item.get("type") == "album":
+                inclusion_counts: dict[str, dict] = {}
+                for inst in instances:
+                    for pulled in inst.get("pulled_inclusions", []):
+                        inc_id = pulled.get("inclusion_id")
+                        if not inc_id:
+                            continue
+                        if inc_id not in inclusion_counts:
+                            inclusion_counts[inc_id] = {
+                                "name": pulled.get("name", inc_id),
+                                "count": 0,
+                            }
+                        inclusion_counts[inc_id]["count"] += 1
+
+                for inc_id, inc_info in inclusion_counts.items():
+                    existing = entry_map.get(inc_id)
+                    if existing:
+                        existing["count"] += inc_info["count"]
+                    else:
+                        entry_map[inc_id] = {
+                            "name": inc_info["name"],
+                            "display_id": inc_id,
+                            "count": inc_info["count"],
+                        }
+
+    sorted_entries = sorted(entry_map.values(), key=lambda e: e["name"].lower())
+
+    if not sorted_entries:
+        return await interaction.followup.send(f"**{oc['name']}**'s inventory is empty.")
+
+    view = InventoryPaginatorView(
+        entries=sorted_entries,
+        oc_name=oc["name"],
+        oc_pic_url=oc.get("profile_picture"),
+        invoker_id=interaction.user.id,
+    )
+    await interaction.followup.send(embed=view._build_embed(), view=view)
+
+
+class AlbumViewerView(discord.ui.View):
+    def __init__(
+        self,
+        inclusions: list[dict],
+        album_name: str,
+        oc_name: str,
+        album_image_url: Optional[str],
+        invoker_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.inclusions    = inclusions
+        self.album_name    = album_name
+        self.oc_name       = oc_name
+        self.album_cover   = album_image_url
+        self.invoker_id    = invoker_id
+        self.index         = 0
+        self._update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "❌ this album viewer belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _update_buttons(self) -> None:
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index == len(self.inclusions) - 1)
+
+    def build_embed(self) -> discord.Embed:
+        inc    = self.inclusions[self.index]
+        total  = len(self.inclusions)
+        page   = self.index + 1
+
+        rarity_int = inc.get("rarity", 0)
+        all_rarities = [i.get("rarity", 0) for i in self.inclusions]
+        rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
         
-        embed1.set_footer(text="Use ◀ ▶ to navigate pages.")
-        embed2.set_footer(text="You are seeing this view because you have Administrator permissions.")
+        if rarity_int == 1: color = discord.Color.light_grey()
+        elif rarity_int == 2: color = discord.Color.green()
+        elif rarity_int == 3: color = discord.Color.blue()
+        elif rarity_int == 4: color = discord.Color.purple()
+        elif rarity_int >= 5: color = discord.Color.gold()
+        else: color = discord.Color.blurple()
 
-        view = HelpPaginatorView(pages=[embed1, embed2])
-        await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
+        embed = discord.Embed(
+            title=inc["name"],
+            description=f"**album:** {self.album_name}\n**oc:** {self.oc_name}",
+            color=color,
+        )
+        embed.add_field(name="rarity", value=rarity_label, inline=True)
+        embed.add_field(name="from instance", value=f"#{inc['_inst_idx']}", inline=True)
+        embed.add_field(name="acquired", value=inc["_acquired_at"] or "unknown", inline=True)
 
-    else:
-        embed1 = discord.Embed(title="OC Bot — Command Reference [1/2]", color=discord.Color.gold())
-        embed1.add_field(name="OC Management", inline=False, value=(
-            "`/oc_add` — Register a new OC\n"
-            "`/oc_edit` — Edit OC fields\n"
-            "`/oc_fix_image` — Re-upload a broken OC profile picture\n"
-            "`/oc_delete` — Delete your OC entirely\n"
-            "`/oc_list` — Browse/filter OCs with interactive paginator\n"
-            "`/birthday_list` — View the next 7 upcoming OC birthdays in a single list\n"
-        ))
-        embed1.add_field(name="Floor/Dorm Management", inline=False, value=(
-            "`/dorm_assign` — Assign an OC to a room\n"
-            "`/dorm_unassign` — Remove an OC from their room\n"
-            "`/dorm_view` — View floors and rooms via dropdown selector\n"
-        ))
-        embed1.add_field(name="Instagram", inline=False, value=(
-            "`/ig_post` — Post 1–10 photos (files or URLs) as your OC\n"
-        ))
-        embed1.add_field(name="Messaging", inline=False, value=(
-            "`/oc_dm` — Private DM channel between two OCs\n"
-            "`/oc_groupchat` — Group chat for multiple OCs\n"
-            "`/oc_groupchat_add` — Add an OC to an existing OC group chat channel\n"
-            "`/gc_invite` — Send a group chat invite to up to 5 OC owners\n"
-        ))
+        img_url = inc.get("image_url") or self.album_cover
+        if img_url:
+            embed.set_image(url=img_url)
 
-        embed2 = discord.Embed(title="OC Bot — Command Reference [2/2]", color=discord.Color.gold())
-        embed2.add_field(name="Utility", inline=False, value=(
-            "`/ping` — Check the bot's WebSocket latency\n"
-        ))
-        embed2.add_field(name="Notes", inline=False, value=(
-            f"Birthday format: **{BIRTHDAY_DISPLAY}**\n"
-            f"Filterable fields: {', '.join(FILTERABLE_FIELDS)}\n"
-            f"Log channel: `#{LOG_CHANNEL_NAME}`\n"
-            f"Audit channel: `#{AUDIT_CHANNEL_NAME}`\n"
-            f"Instagram channel: `#{INSTAGRAM_CHANNEL_NAME}`\n"
-            f"Debut channel: `#{DEBUT_CHANNEL_NAME}`\n"
-            f"Up to {MAX_PHOTOS} photos per Instagram post\n"
-        ))
+        embed.set_footer(text=f"inclusion {page} of {total}  •  common → rare")
+        return embed
 
-        await interaction.response.send_message(embed=embed1, ephemeral=True)
-        await interaction.followup.send(embed=embed2, ephemeral=True)
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="album_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="album_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-# ─── New Dev Command: Refresh Assets ───────────────────────────────────────────
-@bot.tree.command(name="refresh_assets", description="[Dev] Re-upload any expired CDN attachment URLs for OC pictures and IG posts.")
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+@bot.tree.command(name="open", description="[deprecated] use /shop_buy to open albums.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def refresh_assets_cmd(interaction: discord.Interaction):
+@app_commands.describe(
+    oc_name="the oc who owns the album",
+    album_name="name of the album to open (partial matchsupported)"
+)
+async def open_album_cmd(interaction: discord.Interaction, oc_name: str, album_name: str):
     if not is_dev(interaction):
-        return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
+        return await interaction.response.send_message(
+            "⚠️ `/open` has been retired. your inclusions are now revealed automatically "
+            "when you purchase an album via `/shop_buy`. use `/inventory` to see what you own.",
+            ephemeral=True,
+        )
+    data = load_data()
+    ensure_shop_keys(data)
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]:
+        return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+    oc = data["ocs"][oc_key]
+
+    if not is_dev(interaction) and oc.get("owner_id") != interaction.user.id:
+        return await interaction.response.send_message("❌ you do not own this oc.", ephemeral=True)
+
+    inv = data["inventories"].get(oc_key, {})
+    if not inv:
+        return await interaction.response.send_message(f"❌ **{oc['name']}** has no items in their inventory.", ephemeral=True)
+
+    album_name_lower = album_name.strip().lower()
+    matching_album_ids = []
+    for item_id in inv:
+        shop_item = data["shop"].get(item_id)
+        if shop_item and shop_item.get("type") == "album":
+            if album_name_lower in shop_item["name"].lower():
+                matching_album_ids.append(item_id)
+
+    if not matching_album_ids:
+        return await interaction.response.send_message(
+            f"❌ **{oc['name']}** doesn't own an album matching **\"{album_name}\"**.", ephemeral=True
+        )
+    if len(matching_album_ids) > 1:
+        names = ", ".join(f"**{data['shop'][aid]['name']}**" for aid in matching_album_ids)
+        return await interaction.response.send_message(
+            f"❌ multiple albums matched: {names}. please be more specific.", ephemeral=True
+        )
+
+    resolved_item_id = matching_album_ids[0]
+    album_item = data["shop"][resolved_item_id]
+
+    instances = inv.get(resolved_item_id, [])
+    if not instances:
+        return await interaction.response.send_message("❌ no instances of this album found.", ephemeral=True)
+
+    all_pulled = []
+    for inst_idx, inst in enumerate(instances):
+        for pulled in inst.get("pulled_inclusions", []):
+            all_pulled.append({
+                **pulled,
+                "_inst_idx": inst_idx,
+                "_acquired_at": inst.get("acquired_at", "")[:10],
+            })
+
+    if not all_pulled:
+        return await interaction.response.send_message(
+            f"❌ **{album_item['name']}** has no inclusions to browse.", ephemeral=True
+        )
+
+    random.shuffle(all_pulled)
+    all_pulled.sort(key=lambda x: x["rarity"])
+
+    view = AlbumViewerView(
+        inclusions    = all_pulled,
+        album_name    = album_item["name"],
+        oc_name       = oc["name"],
+        album_image_url = album_item.get("image_url"),
+        invoker_id    = interaction.user.id,
+    )
+
+    await interaction.response.send_message(
+        embed=view.build_embed(),
+        view=view,
+        ephemeral=True,
+    )
+
+def _find_inclusion_instance(
+    oc_inv: dict,
+    inc_id: str,
+    instance_index: int,
+) -> tuple[Optional[dict], Optional[dict]]:
+    if inc_id in oc_inv:
+        instances = oc_inv[inc_id]
+        if 0 <= instance_index < len(instances):
+            return (instances[instance_index], {"type": "standalone", "inc_id": inc_id, "inst_idx": instance_index})
+
+    occurrence = 0
+    for album_id, album_instances in oc_inv.items():
+        if not album_id.startswith("id_"):
+            continue
+        for album_inst_idx, album_inst in enumerate(album_instances):
+            for pulled_idx, pulled in enumerate(album_inst.get("pulled_inclusions", [])):
+                if pulled.get("inclusion_id") == inc_id:
+                    if occurrence == instance_index:
+                        return (
+                            pulled,
+                            {
+                                "type": "nested",
+                                "album_id": album_id,
+                                "album_inst_idx": album_inst_idx,
+                                "pulled_idx": pulled_idx,
+                            },
+                        )
+                    occurrence += 1
+
+    return (None, None)
+
+def _count_inclusion_instances(oc_inv: dict, inc_id: str) -> int:
+    total = 0
+    if inc_id in oc_inv:
+        total += len(oc_inv[inc_id])
+    for album_id, album_instances in oc_inv.items():
+        if not album_id.startswith("id_"):
+            continue
+        for album_inst in album_instances:
+            for pulled in album_inst.get("pulled_inclusions", []):
+                if pulled.get("inclusion_id") == inc_id:
+                    total += 1
+    return total
+
+def _pop_n_inclusion_instances(d: dict, oc_key: str, inc_id: str, n: int) -> Optional[list[dict]]:
+    oc_inv = d["inventories"].get(oc_key, {})
+    popped = []
+
+    standalone = oc_inv.get(inc_id, [])
+    while standalone and len(popped) < n:
+        popped.append(standalone.pop(0))
+    if not standalone and inc_id in oc_inv:
+        del oc_inv[inc_id]
+
+    if len(popped) < n:
+        for album_id in list(oc_inv.keys()):
+            if not album_id.startswith("id_"):
+                continue
+            for album_inst in oc_inv[album_id]:
+                pulled_list = album_inst.get("pulled_inclusions", [])
+                i = 0
+                while i < len(pulled_list) and len(popped) < n:
+                    if pulled_list[i].get("inclusion_id") == inc_id:
+                        popped.append(pulled_list.pop(i))
+                    else:
+                        i += 1
+            if len(popped) >= n:
+                break
+
+    if len(popped) < n:
+        return None
+    return popped
+
+def _deposit_inclusion_instances(d: dict, oc_key: str, inc_dicts: list[dict]) -> None:
+    for inc_dict in inc_dicts:
+        inc_id = inc_dict.get("inclusion_id") or "unknown"
+        inc_dict.setdefault("acquired_at", now_iso())
+        d["inventories"].setdefault(oc_key, {}).setdefault(inc_id, []).append(inc_dict)
+
+def _inclusion_sell_price(rarity_int: int, all_rarities: list, album_price: int) -> int:
+    if not all_rarities:
+        return 100
+    min_r = min(all_rarities)
+    max_r = max(all_rarities)
+    if max_r == min_r:
+        score = 0.0
+    else:
+        score = (rarity_int - min_r) / (max_r - min_r)
+    raw_price = album_price * (0.05 + 0.45 * (score ** 2))
+    rounded = round(raw_price / 100) * 100
+    return max(100, rounded)
+
+class UnifiedTradeConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        init_uid: int, tgt_uid: int,
+        init_oc_key: str, tgt_oc_key: str,
+        offered_entries: list[dict],
+        requested_entries: list[dict],
+    ):
+        super().__init__(timeout=None)
+        self.init_uid = init_uid
+        self.tgt_uid = tgt_uid
+        self.init_oc_key = init_oc_key
+        self.tgt_oc_key = tgt_oc_key
+        self.offered_entries = offered_entries
+        self.requested_entries = requested_entries
+
+    @discord.ui.button(label="accept", style=discord.ButtonStyle.success, custom_id="unified_trade_accept")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.tgt_uid:
+            return await interaction.response.send_message("❌ not for you.", ephemeral=True)
+        try:
+            d = load_data()
+            ensure_shop_keys(d)
+
+            for entry in self.offered_entries:
+                if entry["kind"] == "money":
+                    bal = d["ocs"].get(self.init_oc_key, {}).get("balance", 0)
+                    if bal < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: **{d['ocs'][self.init_oc_key]['name']}** only has ₩{bal:,} (needs ₩{entry['qty']:,}).", embed=None, view=None)
+                elif entry["kind"] == "item":
+                    if len(d["inventories"].get(self.init_oc_key, {}).get(entry["id"], [])) < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: offering oc no longer has {entry['qty']}× `{entry['id']}`.", embed=None, view=None)
+                else:
+                    if _count_inclusion_instances(d["inventories"].get(self.init_oc_key, {}), entry["id"]) < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: offering oc no longer has {entry['qty']}× `{entry['id']}`.", embed=None, view=None)
+
+            for entry in self.requested_entries:
+                if entry["kind"] == "money":
+                    bal = d["ocs"].get(self.tgt_oc_key, {}).get("balance", 0)
+                    if bal < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: **{d['ocs'][self.tgt_oc_key]['name']}** only has ₩{bal:,} (needs ₩{entry['qty']:,}).", embed=None, view=None)
+                elif entry["kind"] == "item":
+                    if len(d["inventories"].get(self.tgt_oc_key, {}).get(entry["id"], [])) < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: requested oc no longer has {entry['qty']}× `{entry['id']}`.", embed=None, view=None)
+                else:
+                    if _count_inclusion_instances(d["inventories"].get(self.tgt_oc_key, {}), entry["id"]) < entry["qty"]:
+                        return await interaction.response.edit_message(content=f"❌ trade failed: requested oc no longer has {entry['qty']}× `{entry['id']}`.", embed=None, view=None)
+
+            popped_offers = []
+            for entry in self.offered_entries:
+                if entry["kind"] == "money":
+                    d["ocs"][self.init_oc_key]["balance"] -= entry["qty"]
+                    popped_offers.append((entry, [{"amount": entry["qty"]}]))
+                elif entry["kind"] == "item":
+                    insts = [d["inventories"][self.init_oc_key][entry["id"]].pop(-1) for _ in range(entry["qty"])]
+                    if not d["inventories"][self.init_oc_key][entry["id"]]:
+                        del d["inventories"][self.init_oc_key][entry["id"]]
+                    popped_offers.append((entry, insts))
+                else:
+                    insts = _pop_n_inclusion_instances(d, self.init_oc_key, entry["id"], entry["qty"])
+                    popped_offers.append((entry, insts))
+
+            popped_requests = []
+            for entry in self.requested_entries:
+                if entry["kind"] == "money":
+                    d["ocs"][self.tgt_oc_key]["balance"] -= entry["qty"]
+                    popped_requests.append((entry, [{"amount": entry["qty"]}]))
+                elif entry["kind"] == "item":
+                    insts = [d["inventories"][self.tgt_oc_key][entry["id"]].pop(-1) for _ in range(entry["qty"])]
+                    if not d["inventories"][self.tgt_oc_key][entry["id"]]:
+                        del d["inventories"][self.tgt_oc_key][entry["id"]]
+                    popped_requests.append((entry, insts))
+                else:
+                    insts = _pop_n_inclusion_instances(d, self.tgt_oc_key, entry["id"], entry["qty"])
+                    popped_requests.append((entry, insts))
+
+            for entry, insts in popped_offers:
+                if entry["kind"] == "money":
+                    d["ocs"][self.tgt_oc_key]["balance"] = d["ocs"].get(self.tgt_oc_key, {}).get("balance", 0) + entry["qty"]
+                elif entry["kind"] == "item":
+                    for inst in insts:
+                        d["inventories"].setdefault(self.tgt_oc_key, {}).setdefault(entry["id"], []).append(inst)
+                else:
+                    _deposit_inclusion_instances(d, self.tgt_oc_key, insts)
+
+            for entry, insts in popped_requests:
+                if entry["kind"] == "money":
+                    d["ocs"][self.init_oc_key]["balance"] = d["ocs"].get(self.init_oc_key, {}).get("balance", 0) + entry["qty"]
+                elif entry["kind"] == "item":
+                    for inst in insts:
+                        d["inventories"].setdefault(self.init_oc_key, {}).setdefault(entry["id"], []).append(inst)
+                else:
+                    _deposit_inclusion_instances(d, self.init_oc_key, insts)
+
+            save_data(d)
+            asyncio.ensure_future(push_backup_to_discord(d, reason="unified_trade"))
+
+            await interaction.response.edit_message(content="✅ trade executed.", embed=None, view=None)
+
+            init_user = bot.get_user(self.init_uid)
+            if init_user:
+                try:
+                    tgt_name = d["ocs"].get(self.tgt_oc_key, {}).get("name", "the other oc")
+                    await init_user.send(f"✅ your trade offer was **accepted** by **{tgt_name}**.")
+                except Exception: pass
+
+        except Exception as e:
+            log.error(f"unified trade accept error: {e}")
+            await interaction.response.edit_message(content="❌ an unexpected error occurred.", embed=None, view=None)
+
+    @discord.ui.button(label="decline", style=discord.ButtonStyle.danger, custom_id="unified_trade_decline")
+    async def decline_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.tgt_uid:
+            return await interaction.response.send_message("❌ not for you.", ephemeral=True)
+        await interaction.response.edit_message(content="❌ trade declined.", embed=None, view=None)
+        init_user = bot.get_user(self.init_uid)
+        if init_user:
+            try:
+                tgt_name = (load_data())["ocs"].get(self.tgt_oc_key, {}).get("name", "the other oc")
+                await init_user.send(f"❌ your trade offer was **declined** by **{tgt_name}**.")
+            except Exception: pass
+
+@bot.tree.command(name="trade", description="trade items, inclusions, or money (cross-type, supports one-sided).")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    your_oc="your oc making the offer",
+    their_oc="the oc you are trading with",
+    offer="comma-separated IDs to offer (or 'none')",
+    offer_quantity="comma-separated quantities matching offer list (default '1')",
+    request="comma-separated IDs to request (or 'none')",
+    request_quantity="comma-separated quantities matching request list (default '1')",
+    offer_type="type of offer: 'item', 'inclusion', or 'money' (default: auto-detect)",
+    request_type="type of item to request: 'item', 'inclusion', or 'money' (default: auto-detect)",
+)
+@app_commands.choices(
+    offer_type=[
+        app_commands.Choice(name="item",      value="item"),
+        app_commands.Choice(name="inclusion", value="inclusion"),
+        app_commands.Choice(name="money",     value="money"),
+    ],
+    request_type=[
+        app_commands.Choice(name="item",      value="item"),
+        app_commands.Choice(name="inclusion", value="inclusion"),
+        app_commands.Choice(name="money",     value="money"),
+    ],
+)
+async def trade_cmd(
+    interaction: discord.Interaction,
+    your_oc: str,
+    their_oc: str,
+    offer: str = "",
+    offer_quantity: str = "1",
+    request: str = "",
+    request_quantity: str = "1",
+    offer_type: Optional[str] = None,
+    request_type: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        guild = resolve_guild(interaction)
+        d = load_data()
+        ensure_shop_keys(d)
+
+        y_key, t_key = oc_key_of(your_oc), oc_key_of(their_oc)
+        if y_key not in d["ocs"]: return await interaction.followup.send("❌ your oc not found.")
+        if t_key not in d["ocs"]: return await interaction.followup.send("❌ target oc not found.")
+
+        if not is_dev(interaction) and d["ocs"][y_key].get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you don't own the offering oc.")
+
+        def parse_entries(id_str: str, qty_str: str, oc_inv: dict, type_hint: Optional[str] = None):
+            id_str = id_str.strip().lower()
+            if not id_str or id_str == "none":
+                return [], None
+
+            ids = [i.strip() for i in id_str.split(",") if i.strip()]
+            qtys = [q.strip() for q in qty_str.split(",") if q.strip()]
+
+            entries = []
+            errors = []
+
+            for idx, raw_id in enumerate(ids):
+                qty = int(qtys[idx]) if idx < len(qtys) and qtys[idx].isdigit() else 1
+                qty = max(1, qty)
+                
+                if raw_id in ("money", "₩", "won", "krw") or type_hint == "money":
+                    amount = qty
+                    if raw_id.isdigit():
+                        amount = int(raw_id)
+                    if amount < 1:
+                        errors.append(f"money amount must be ≥ ₩1")
+                        continue
+                    entries.append({"kind": "money", "id": "money", "qty": amount, "name": f"₩{amount:,}"})
+                    continue
+
+                if type_hint == "item":
+                    kind = "item"
+                    resolved_id = _resolve_item_id(raw_id, d["shop"]) or raw_id
+                elif type_hint == "inclusion":
+                    kind = "inclusion"
+                    resolved_id = raw_id if raw_id.startswith("inc_") else f"inc_{raw_id}"
+                else:
+                    if raw_id.startswith("inc_"):
+                        kind = "inclusion"
+                        resolved_id = raw_id
+                    elif raw_id.startswith("id_"):
+                        kind = "item"
+                        resolved_id = raw_id
+                    else:
+                        r_item = _resolve_item_id(raw_id, d["shop"])
+                        if r_item:
+                            kind = "item"
+                            resolved_id = r_item
+                        else:
+                            r_inc = f"inc_{raw_id}"
+                            kind = "inclusion"
+                            resolved_id = r_inc
+
+                if kind == "item":
+                    avail = len(oc_inv.get(resolved_id, []))
+                    name = d["shop"].get(resolved_id, {}).get("name", resolved_id)
+                else:
+                    avail = _count_inclusion_instances(oc_inv, resolved_id)
+                    inst, _ = _find_inclusion_instance(oc_inv, resolved_id, 0)
+                    name = inst["name"] if inst else resolved_id
+
+                if avail < qty:
+                    errors.append(f"missing {qty}× `{raw_id}` (has {avail})")
+                else:
+                    entries.append({"kind": kind, "id": resolved_id, "qty": qty, "name": name})
+
+            return entries, errors
+
+        y_inv = d["inventories"].get(y_key, {})
+        t_inv = d["inventories"].get(t_key, {})
+
+        offered_entries, off_err = parse_entries(offer, offer_quantity, y_inv, type_hint=offer_type)
+        requested_entries, req_err = parse_entries(request, request_quantity, t_inv, type_hint=request_type)
+
+        if offer_type:
+            mismatched = [e for e in offered_entries if e["kind"] != offer_type]
+            if mismatched:
+                names = ", ".join(e["id"] for e in mismatched)
+                return await interaction.followup.send(
+                    f"❌ you specified offer type `{offer_type}` but the following IDs could not be resolved as that type: {names}",
+                    ephemeral=True,
+                )
+        if request_type:
+            mismatched = [e for e in requested_entries if e["kind"] != request_type]
+            if mismatched:
+                names = ", ".join(e["id"] for e in mismatched)
+                return await interaction.followup.send(
+                    f"❌ you specified request type `{request_type}` but the following IDs could not be resolved as that type: {names}",
+                    ephemeral=True,
+                )
+
+        if not offered_entries and not requested_entries:
+            return await interaction.followup.send("❌ you must offer or request at least one item or amount.")
+
+        all_errors = []
+        if off_err: all_errors.extend([f"offer: {e}" for e in off_err])
+        if req_err: all_errors.extend([f"request: {e}" for e in req_err])
+
+        if all_errors:
+            err_msg = "\n".join(f"• {e}" for e in all_errors)
+            return await interaction.followup.send(f"❌ trade validation failed:\n{err_msg}")
+
+        tgt_owner_id = d["ocs"][t_key].get("owner_id")
+        if not tgt_owner_id: return await interaction.followup.send("❌ target oc owner missing.")
+
+        embed = discord.Embed(
+            title="🤝 unified trade offer",
+            description=f"**{d['ocs'][y_key]['name']}** wants to trade with **{d['ocs'][t_key]['name']}**.",
+            color=discord.Color.gold()
+        )
+
+        KIND_LABELS = {"item": "📦 item", "inclusion": "🃏 inclusion", "money": "💰 money"}
+
+        off_lines = [
+            f"• {KIND_LABELS.get(e['kind'], e['kind'])} — **{e['name']}**" + (f" × {e['qty']}  (`{e['id']}`)" if e["kind"] != "money" else "")
+            for e in offered_entries
+        ]
+        req_lines = [
+            f"• {KIND_LABELS.get(e['kind'], e['kind'])} — **{e['name']}**" + (f" × {e['qty']}  (`{e['id']}`)" if e["kind"] != "money" else "")
+            for e in requested_entries
+        ]
+
+        embed.add_field(name="📤 they offer", value="\n".join(off_lines) if off_lines else "• nothing", inline=False)
+        embed.add_field(name="📥 they request", value="\n".join(req_lines) if req_lines else "• nothing", inline=False)
+
+        view = UnifiedTradeConfirmView(interaction.user.id, tgt_owner_id, y_key, t_key, offered_entries, requested_entries)
+
+        tgt_member = guild.get_member(tgt_owner_id) if guild else None
+        sent = False
+        if tgt_member:
+            try:
+                await tgt_member.send(embed=embed, view=view)
+                sent = True
+            except: pass
+
+        if not sent and guild:
+            ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+            if ch:
+                await ch.send(content=f"<@{tgt_owner_id}> you have a trade offer!", embed=embed, view=view)
+                sent = True
+
+        if sent:
+            await interaction.followup.send("✅ trade offer sent.")
+            off_ids = ",".join(e["name"] if e["kind"] == "money" else f"{e['id']}x{e['qty']}" for e in offered_entries)
+            req_ids = ",".join(e["name"] if e["kind"] == "money" else f"{e['id']}x{e['qty']}" for e in requested_entries)
+            await audit(guild, f"trade: {y_key} ↔ {t_key} [offered: {off_ids}] [requested: {req_ids}] by {interaction.user}")
+        else:
+            await interaction.followup.send("❌ failed to send offer.")
+
+    except Exception as e:
+        log.error(f"trade cmd error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+
+class TradeAddItemModal(discord.ui.Modal):
+    item_id_input = discord.ui.TextInput(
+        label="item id (7-digit number, no 'id_' prefix)",
+        placeholder="e.g. 1234567",
+        min_length=1, max_length=10,
+    )
+    instance_index_input = discord.ui.TextInput(
+        label="instance index (0, 1, 2 ...)",
+        placeholder="0",
+        min_length=1, max_length=10,
+    )
+
+    def __init__(self, builder_view: "TradeMultiBuilderView", side: str):
+        super().__init__(title=f"add {'offered' if side == 'offer' else 'requested'} item")
+        self.builder_view = builder_view
+        self.side = side
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_id = self.item_id_input.value.strip().lower()
+
+        if raw_id in ("money", "₩", "won", "krw") or (raw_id.isdigit()):
+            amount_str = self.instance_index_input.value.strip() if raw_id in ("money", "₩", "won", "krw") else raw_id
+            try:
+                amount = int(amount_str)
+            except ValueError:
+                return await interaction.response.send_message("❌ invalid money amount.", ephemeral=True)
+            if amount < 1:
+                return await interaction.response.send_message("❌ amount must be ≥ ₩1.", ephemeral=True)
+            entry = {
+                "kind": "money", "item_id": "money", "inc_id": None,
+                "instance_index": 0, "name": f"₩{amount:,}", "amount": amount,
+            }
+            if self.side == "offer":
+                if len(self.builder_view.offered_items) >= 10:
+                    return await interaction.response.send_message("❌ maximum 10 offered items.", ephemeral=True)
+                self.builder_view.offered_items.append(entry)
+            else:
+                if len(self.builder_view.requested_items) >= 10:
+                    return await interaction.response.send_message("❌ maximum 10 requested items.", ephemeral=True)
+                self.builder_view.requested_items.append(entry)
+            return await interaction.response.edit_message(
+                embed=self.builder_view.build_summary_embed(), view=self.builder_view
+            )
+
+        if raw_id.startswith("inc_") or (not raw_id.startswith("id_") and len(raw_id) == 11 and raw_id[:4] == "inc_"):
+            inc_id = raw_id if raw_id.startswith("inc_") else f"inc_{raw_id}"
+            try:
+                idx = int(self.instance_index_input.value.strip())
+            except ValueError:
+                return await interaction.response.send_message("❌ instance index must be an integer.", ephemeral=True)
+
+            data = load_data()
+            if self.side == "offer":
+                inst, source = _find_inclusion_instance(
+                    data["inventories"].get(self.builder_view.init_oc_key, {}), inc_id, idx
+                )
+                if inst is None:
+                    return await interaction.response.send_message(
+                        f"❌ **{self.builder_view.init_oc_name}** does not have inclusion `{inc_id}` at index {idx}.",
+                        ephemeral=True,
+                    )
+                if any(o.get("inc_id") == inc_id and o.get("instance_index") == idx for o in self.builder_view.offered_items):
+                    return await interaction.response.send_message("❌ that inclusion is already in your offer.", ephemeral=True)
+                if len(self.builder_view.offered_items) >= 10:
+                    return await interaction.response.send_message("❌ maximum 10 offered items per trade.", ephemeral=True)
+                self.builder_view.offered_items.append({
+                    "kind": "inclusion", "inc_id": inc_id, "item_id": None,
+                    "instance_index": idx, "name": inst["name"], "source": source,
+                })
+            else:
+                inst, source = _find_inclusion_instance(
+                    data["inventories"].get(self.builder_view.tgt_oc_key, {}), inc_id, idx
+                )
+                if inst is None:
+                    return await interaction.response.send_message(
+                        f"❌ **{self.builder_view.tgt_oc_name}** does not have inclusion `{inc_id}` at index {idx}.",
+                        ephemeral=True,
+                    )
+                if any(r.get("inc_id") == inc_id and r.get("instance_index") == idx for r in self.builder_view.requested_items):
+                    return await interaction.response.send_message("❌ that inclusion is already in your request.", ephemeral=True)
+                if len(self.builder_view.requested_items) >= 10:
+                    return await interaction.response.send_message("❌ maximum 10 requested items per trade.", ephemeral=True)
+                self.builder_view.requested_items.append({
+                    "kind": "inclusion", "inc_id": inc_id, "item_id": None,
+                    "instance_index": idx, "name": inst["name"], "source": source,
+                })
+
+            return await interaction.response.edit_message(
+                embed=self.builder_view.build_summary_embed(), view=self.builder_view
+            )
+
+        item_id = f"id_{raw_id}" if not raw_id.startswith("id_") else raw_id
+        try:
+            idx = int(self.instance_index_input.value.strip())
+        except ValueError:
+            return await interaction.response.send_message("❌ instance index must be an integer.", ephemeral=True)
+
+        data = load_data()
+        item = data["shop"].get(item_id)
+        if not item:
+            return await interaction.response.send_message(f"❌ item `{item_id}` not found in shop.", ephemeral=True)
+
+        if self.side == "offer":
+            oc_inv = data["inventories"].get(self.builder_view.init_oc_key, {}).get(item_id, [])
+            if idx < 0 or idx >= len(oc_inv):
+                return await interaction.response.send_message(
+                    f"❌ **{self.builder_view.init_oc_name}** does not have instance #{idx} of **{item['name']}**.", ephemeral=True
+                )
+            if any(o.get("item_id") == item_id and o.get("instance_index") == idx for o in self.builder_view.offered_items):
+                return await interaction.response.send_message("❌ that instance is already in your offer.", ephemeral=True)
+            if len(self.builder_view.offered_items) >= 10:
+                return await interaction.response.send_message("❌ maximum 10 offered items per trade.", ephemeral=True)
+            self.builder_view.offered_items.append({"kind": "item", "item_id": item_id, "instance_index": idx, "name": item["name"]})
+        else:
+            tgt_inv = data["inventories"].get(self.builder_view.tgt_oc_key, {}).get(item_id, [])
+            if idx < 0 or idx >= len(tgt_inv):
+                return await interaction.response.send_message(
+                    f"❌ **{self.builder_view.tgt_oc_name}** does not have instance #{idx} of **{item['name']}**.", ephemeral=True
+                )
+            if any(r.get("item_id") == item_id and r.get("instance_index") == idx for r in self.builder_view.requested_items):
+                return await interaction.response.send_message("❌ that instance is already in your request.", ephemeral=True)
+            if len(self.builder_view.requested_items) >= 10:
+                return await interaction.response.send_message("❌ maximum 10 requested items per trade.", ephemeral=True)
+            self.builder_view.requested_items.append({"kind": "item", "item_id": item_id, "instance_index": idx, "name": item["name"]})
+
+        await interaction.response.edit_message(embed=self.builder_view.build_summary_embed(), view=self.builder_view)
+
+
+class MultiTradeConfirmView(discord.ui.View):
+    def __init__(self, init_uid: int, tgt_uid: int,
+                 init_oc_key: str, tgt_oc_key: str,
+                 offered_items: list[dict], requested_items: list[dict]):
+        super().__init__(timeout=None)
+        self.init_uid = init_uid
+        self.tgt_uid  = tgt_uid
+        self.init_oc_key = init_oc_key
+        self.tgt_oc_key  = tgt_oc_key
+        self.offered_items   = offered_items
+        self.requested_items = requested_items
+
+    def _remove_inclusion(self, d: dict, oc_key: str, source: dict) -> Optional[dict]:
+        oc_inv = d["inventories"].get(oc_key, {})
+        if source["type"] == "standalone":
+            instances = oc_inv.get(source["inc_id"], [])
+            idx = source["inst_idx"]
+            if idx >= len(instances): return None
+            inst = instances.pop(idx)
+            if not instances: del oc_inv[source["inc_id"]]
+            return inst
+        elif source["type"] == "nested":
+            album_instances = oc_inv.get(source["album_id"], [])
+            a_idx = source["album_inst_idx"]
+            p_idx = source["pulled_idx"]
+            if a_idx >= len(album_instances):
+                return None
+            pulled_list = album_instances[a_idx].get("pulled_inclusions", [])
+            if p_idx >= len(pulled_list):
+                return None
+            return pulled_list.pop(p_idx)
+        return None
+
+    def _deposit_inclusion(self, d: dict, oc_key: str, inc_dict: dict) -> None:
+        inc_id = inc_dict.get("inclusion_id") or inc_dict.get("inc_id", "unknown")
+        inc_dict.setdefault("acquired_at", now_iso())
+        d["inventories"].setdefault(oc_key, {}).setdefault(inc_id, []).append(inc_dict)
+
+    @discord.ui.button(label="accept", style=discord.ButtonStyle.success, custom_id="mtrade_accept")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.tgt_uid:
+            return await interaction.response.send_message("❌ not for you.", ephemeral=True)
+        try:
+            d = load_data()
+            for o in self.offered_items:
+                if o.get("kind") == "money":
+                    bal = d["ocs"].get(self.init_oc_key, {}).get("balance", 0)
+                    if bal < o["amount"]:
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{d['ocs'].get(self.init_oc_key, {}).get('name', 'oc')}** only has ₩{bal:,} (needs ₩{o['amount']:,}).",
+                            embed=None, view=None
+                        )
+                elif o.get("kind") == "inclusion":
+                    inst, _ = _find_inclusion_instance(d["inventories"].get(self.init_oc_key, {}), o["inc_id"], o["instance_index"])
+                    if inst is None:
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{o['name']}** inclusion instance #{o['instance_index']} from the offering oc no longer exists.",
+                            embed=None, view=None
+                        )
+                else:
+                    inv = d["inventories"].get(self.init_oc_key, {}).get(o["item_id"], [])
+                    if o["instance_index"] >= len(inv):
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{o['name']}** instance #{o['instance_index']} from the offering oc no longer exists.",
+                            embed=None, view=None
+                        )
+            for r in self.requested_items:
+                if r.get("kind") == "money":
+                    bal = d["ocs"].get(self.tgt_oc_key, {}).get("balance", 0)
+                    if bal < r["amount"]:
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{d['ocs'].get(self.tgt_oc_key, {}).get('name', 'oc')}** only has ₩{bal:,} (needs ₩{r['amount']:,}).",
+                            embed=None, view=None
+                        )
+                elif r.get("kind") == "inclusion":
+                    inst, _ = _find_inclusion_instance(d["inventories"].get(self.tgt_oc_key, {}), r["inc_id"], r["instance_index"])
+                    if inst is None:
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{r['name']}** inclusion instance #{r['instance_index']} from your oc no longer exists.",
+                            embed=None, view=None
+                        )
+                else:
+                    inv = d["inventories"].get(self.tgt_oc_key, {}).get(r["item_id"], [])
+                    if r["instance_index"] >= len(inv):
+                        return await interaction.response.edit_message(
+                            content=f"❌ trade failed: **{r['name']}** instance #{r['instance_index']} from your oc no longer exists.",
+                            embed=None, view=None
+                        )
+
+            init_inc_sources = []
+            for o in self.offered_items:
+                if o.get("kind") == "inclusion":
+                    _, src = _find_inclusion_instance(d["inventories"].get(self.init_oc_key, {}), o["inc_id"], o["instance_index"])
+                    init_inc_sources.append(src)
+                else:
+                    init_inc_sources.append(None)
+                    
+            tgt_inc_sources = []
+            for r in self.requested_items:
+                if r.get("kind") == "inclusion":
+                    _, src = _find_inclusion_instance(d["inventories"].get(self.tgt_oc_key, {}), r["inc_id"], r["instance_index"])
+                    tgt_inc_sources.append(src)
+                else:
+                    tgt_inc_sources.append(None)
+
+            def _pop_item_instances(oc_key: str, items: list[dict]) -> dict:
+                from collections import defaultdict
+                groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+                for pos, item in enumerate(items):
+                    if item.get("kind") == "item":
+                        groups[item["item_id"]].append((pos, item["instance_index"]))
+
+                popped = {}
+                for item_id, entries in groups.items():
+                    entries_sorted = sorted(entries, key=lambda x: x[1], reverse=True)
+                    inv_list = d["inventories"][oc_key][item_id]
+                    for pos, idx in entries_sorted:
+                        popped[pos] = inv_list.pop(idx)
+                    if not d["inventories"][oc_key][item_id]:
+                        del d["inventories"][oc_key][item_id]
+                if not d["inventories"].get(oc_key):
+                    d["inventories"].pop(oc_key, None)
+                return popped
+
+            init_item_instances = _pop_item_instances(self.init_oc_key, self.offered_items)
+            tgt_item_instances  = _pop_item_instances(self.tgt_oc_key,  self.requested_items)
+
+            init_instances = []
+            for i, o in enumerate(self.offered_items):
+                if o.get("kind") == "money":
+                    d["ocs"][self.init_oc_key]["balance"] -= o["amount"]
+                    init_instances.append(None)
+                elif o.get("kind") == "inclusion":
+                    init_instances.append(self._remove_inclusion(d, self.init_oc_key, init_inc_sources[i]))
+                else:
+                    init_instances.append(init_item_instances[i])
+                    
+            tgt_instances = []
+            for i, r in enumerate(self.requested_items):
+                if r.get("kind") == "money":
+                    d["ocs"][self.tgt_oc_key]["balance"] -= r["amount"]
+                    tgt_instances.append(None)
+                elif r.get("kind") == "inclusion":
+                    tgt_instances.append(self._remove_inclusion(d, self.tgt_oc_key, tgt_inc_sources[i]))
+                else:
+                    tgt_instances.append(tgt_item_instances[i])
+
+            for i, r in enumerate(self.requested_items):
+                if r.get("kind") == "money":
+                    d["ocs"][self.init_oc_key]["balance"] += r["amount"]
+                elif r.get("kind") == "inclusion":
+                    self._deposit_inclusion(d, self.init_oc_key, tgt_instances[i])
+                else:
+                    d["inventories"].setdefault(self.init_oc_key, {}).setdefault(r["item_id"], []).append(tgt_instances[i])
+
+            for i, o in enumerate(self.offered_items):
+                if o.get("kind") == "money":
+                    d["ocs"][self.tgt_oc_key]["balance"] += o["amount"]
+                elif o.get("kind") == "inclusion":
+                    self._deposit_inclusion(d, self.tgt_oc_key, init_instances[i])
+                else:
+                    d["inventories"].setdefault(self.tgt_oc_key, {}).setdefault(o["item_id"], []).append(init_instances[i])
+
+            save_data(d)
+            asyncio.ensure_future(push_backup_to_discord(d, reason="multi_trade"))
+            await interaction.response.edit_message(content="✅ multi-item trade executed.", embed=None, view=None)
+
+            init_user = bot.get_user(self.init_uid)
+            if init_user:
+                try:
+                    await init_user.send(f"✅ your multi-item trade with **{d['ocs'][self.tgt_oc_key]['name']}** was accepted.")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.error(f"multi_trade accept error: {e}")
+            await interaction.response.edit_message(content="❌ an unexpected error occurred.", embed=None, view=None)
+
+    @discord.ui.button(label="decline", style=discord.ButtonStyle.danger, custom_id="mtrade_decline")
+    async def decline_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.tgt_uid:
+            return await interaction.response.send_message("❌ not for you.", ephemeral=True)
+        await interaction.response.edit_message(content="❌ trade declined.", embed=None, view=None)
+        init_user = bot.get_user(self.init_uid)
+        if init_user:
+            try:
+                await init_user.send("❌ your multi-item trade offer was declined.")
+            except Exception:
+                pass
+
+
+async def _send_multi_trade_offer(
+    interaction: discord.Interaction,
+    builder: "TradeMultiBuilderView"
+) -> None:
+    guild = resolve_guild(interaction)
+
+    if not builder.offered_items and not builder.requested_items:
+        return await interaction.response.send_message("❌ you must offer or request at least one item.", ephemeral=True)
+
+    data = load_data()
+    for o in builder.offered_items:
+        if o.get("kind") == "money":
+            pass
+        elif o.get("kind") == "inclusion":
+            inst, _ = _find_inclusion_instance(data["inventories"].get(builder.init_oc_key, {}), o["inc_id"], o["instance_index"])
+            if inst is None:
+                return await interaction.response.send_message(
+                    f"❌ offered inclusion instance of **{o['name']}** no longer exists (index #{o['instance_index']}). please rebuild the offer.",
+                    ephemeral=True
+                )
+        else:
+            inv = data["inventories"].get(builder.init_oc_key, {}).get(o["item_id"], [])
+            if o["instance_index"] >= len(inv):
+                return await interaction.response.send_message(
+                    f"❌ offered instance of **{o['name']}** no longer exists (index #{o['instance_index']}). please rebuild the offer.",
+                    ephemeral=True
+                )
+    for r in builder.requested_items:
+        if r.get("kind") == "money":
+            pass
+        elif r.get("kind") == "inclusion":
+            inst, _ = _find_inclusion_instance(data["inventories"].get(builder.tgt_oc_key, {}), r["inc_id"], r["instance_index"])
+            if inst is None:
+                return await interaction.response.send_message(
+                    f"❌ requested inclusion instance of **{r['name']}** no longer exists (index #{r['instance_index']}). please rebuild the offer.",
+                    ephemeral=True
+                )
+        else:
+            inv = data["inventories"].get(builder.tgt_oc_key, {}).get(r["item_id"], [])
+            if r["instance_index"] >= len(inv):
+                return await interaction.response.send_message(
+                    f"❌ requested instance of **{r['name']}** no longer exists (index #{r['instance_index']}). please rebuild the offer.",
+                    ephemeral=True
+                )
+
+    embed = discord.Embed(
+        title="🤝 multi-item trade offer",
+        description=(
+            f"**{builder.init_oc_name}** wants to trade with **{builder.tgt_oc_name}**.\n"
+            f"accept or decline below."
+        ),
+        color=discord.Color.gold()
+    )
+    offer_lines = []
+    for o in builder.offered_items:
+        if o.get("kind") == "money":
+            offer_lines.append(f"• 💰 money — **{o['name']}**")
+        elif o.get("kind") == "inclusion":
+            offer_lines.append(f"• 🃏 inclusion — **{o['name']}** (`{o['inc_id']}`, inst #{o['instance_index']})")
+        else:
+            offer_lines.append(f"• 📦 item — **{o['name']}** (`{o['item_id'].replace('id_', '')}`, inst #{o['instance_index']})")
+            
+    req_lines = []
+    for r in builder.requested_items:
+        if r.get("kind") == "money":
+            req_lines.append(f"• 💰 money — **{r['name']}**")
+        elif r.get("kind") == "inclusion":
+            req_lines.append(f"• 🃏 inclusion — **{r['name']}** (`{r['inc_id']}`, inst #{r['instance_index']})")
+        else:
+            req_lines.append(f"• 📦 item — **{r['name']}** (`{r['item_id'].replace('id_', '')}`, inst #{r['instance_index']})")
+            
+    embed.add_field(name="📤 they offer", value="\n".join(offer_lines) if offer_lines else "• nothing", inline=False)
+    embed.add_field(name="📥 they request", value="\n".join(req_lines) if req_lines else "• nothing", inline=False)
+
+    confirm_view = MultiTradeConfirmView(
+        init_uid=interaction.user.id,
+        tgt_uid=builder.tgt_owner_id,
+        init_oc_key=builder.init_oc_key,
+        tgt_oc_key=builder.tgt_oc_key,
+        offered_items=list(builder.offered_items),
+        requested_items=list(builder.requested_items),
+    )
+
+    tgt_member = guild.get_member(builder.tgt_owner_id) if guild else None
+    sent = False
+    if tgt_member:
+        try:
+            await tgt_member.send(embed=embed, view=confirm_view)
+            sent = True
+        except Exception:
+            pass
+    if not sent and guild:
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        if ch:
+            await ch.send(content=f"<@{builder.tgt_owner_id}> you have a multi-item trade offer!", embed=embed, view=confirm_view)
+            sent = True
+
+    if sent:
+        await interaction.response.edit_message(content="✅ multi-item trade offer sent.", embed=None, view=None)
+    else:
+        await interaction.response.send_message("❌ could not reach the target oc's owner.", ephemeral=True)
+
+class TradeMultiBuilderView(discord.ui.View):
+    def __init__(self, invoker_id: int, init_oc_key: str, tgt_oc_key: str,
+                 init_oc_name: str, tgt_oc_name: str, tgt_owner_id: int,
+                 init_inventory: dict, shop_data: dict):
+        super().__init__(timeout=600)
+        self.invoker_id = invoker_id
+        self.init_oc_key = init_oc_key
+        self.tgt_oc_key = tgt_oc_key
+        self.init_oc_name = init_oc_name
+        self.tgt_oc_name = tgt_oc_name
+        self.tgt_owner_id = tgt_owner_id
+        self.init_inventory = init_inventory
+        self.shop_data = shop_data
+        self.offered_items: list[dict] = []
+        self.requested_items: list[dict] = []
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("❌ not your trade builder.", ephemeral=True)
+            return False
+        return True
+
+    def build_summary_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"🤝 trade builder — {self.init_oc_name} → {self.tgt_oc_name}",
+            color=discord.Color.gold()
+        )
+        offer_lines = []
+        for o in self.offered_items:
+            if o.get("kind") == "money":
+                offer_lines.append(f"• 💰 money — **{o['name']}**")
+            elif o.get("kind") == "inclusion":
+                offer_lines.append(f"• 🃏 inclusion — **{o['name']}** (`{o['inc_id']}`, inst #{o['instance_index']})")
+            else:
+                offer_lines.append(f"• 📦 item — **{o['name']}** (`{o['item_id'].replace('id_', '')}`, inst #{o['instance_index']})")
+        if not offer_lines:
+            offer_lines = ["*nothing added yet*"]
+            
+        request_lines = []
+        for r in self.requested_items:
+            if r.get("kind") == "money":
+                request_lines.append(f"• 💰 money — **{r['name']}**")
+            elif r.get("kind") == "inclusion":
+                request_lines.append(f"• 🃏 inclusion — **{r['name']}** (`{r['inc_id']}`, inst #{r['instance_index']})")
+            else:
+                request_lines.append(f"• 📦 item — **{r['name']}** (`{r['item_id'].replace('id_', '')}`, inst #{r['instance_index']})")
+        if not request_lines:
+            request_lines = ["*nothing added yet*"]
+            
+        embed.add_field(name=f"📤 you offer ({len(self.offered_items)} item(s))", value="\n".join(offer_lines), inline=False)
+        embed.add_field(name=f"📥 you request ({len(self.requested_items)} item(s))", value="\n".join(request_lines), inline=False)
+        embed.set_footer(text="add items, then press 'send offer' when ready.")
+        return embed
+
+    @discord.ui.button(label="+ add offered item", style=discord.ButtonStyle.primary, custom_id="add_offer")
+    async def add_offer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TradeAddItemModal(self, "offer"))
+
+    @discord.ui.button(label="+ add requested item", style=discord.ButtonStyle.primary, custom_id="add_req")
+    async def add_req(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TradeAddItemModal(self, "request"))
+
+    @discord.ui.button(label="🗑 clear all", style=discord.ButtonStyle.secondary, custom_id="clear_all")
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.offered_items.clear()
+        self.requested_items.clear()
+        await interaction.response.edit_message(embed=self.build_summary_embed(), view=self)
+
+    @discord.ui.button(label="📨 send offer", style=discord.ButtonStyle.success, custom_id="send_offer")
+    async def send_offer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _send_multi_trade_offer(interaction, self)
+
+@bot.tree.command(name="trade_multi", description="offer a multi-item trade from your oc to another oc.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    your_oc="your oc making the offer",
+    their_oc="the oc you're trading with",
+)
+async def trade_multi_cmd(interaction: discord.Interaction, your_oc: str, their_oc: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        guild = resolve_guild(interaction)
+        data = load_data()
+        init_key = oc_key_of(your_oc)
+        tgt_key = oc_key_of(their_oc)
+        
+        if init_key not in data["ocs"]:
+            return await interaction.followup.send("❌ your oc not found.")
+        if tgt_key not in data["ocs"]:
+            return await interaction.followup.send("❌ target oc not found.")
+        
+        if not is_dev(interaction) and data["ocs"][init_key].get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you don't own the offering oc.")
+        
+        tgt_owner_id = data["ocs"][tgt_key].get("owner_id")
+        if not tgt_owner_id:
+            return await interaction.followup.send("❌ target oc owner missing.")
+        
+        builder_view = TradeMultiBuilderView(
+            invoker_id=interaction.user.id,
+            init_oc_key=init_key,
+            tgt_oc_key=tgt_key,
+            init_oc_name=data["ocs"][init_key]["name"],
+            tgt_oc_name=data["ocs"][tgt_key]["name"],
+            tgt_owner_id=tgt_owner_id,
+            init_inventory=data["inventories"].get(init_key, {}),
+            shop_data=data["shop"]
+        )
+        
+        await interaction.followup.send(embed=builder_view.build_summary_embed(), view=builder_view, ephemeral=True)
+    except Exception as e:
+        log.error(f"trade_multi cmd error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+@bot.tree.command(name="gift", description="gift an item from one oc to another.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(from_oc="your oc", to_oc="recipient oc", item_id="7-digit item number (e.g. 1234567)", instance_index="index to gift (0, 1, 2...)")
+async def gift_cmd(interaction: discord.Interaction, from_oc: str, to_oc: str, item_id: str, instance_index: int):
+    await interaction.response.defer()
+    try:
+        d = load_data()
+        f_key, t_key = oc_key_of(from_oc), oc_key_of(to_oc)
+        item_id = f"id_{item_id.strip()}" if not item_id.strip().startswith("id_") else item_id.strip()
+        
+        if f_key not in d["ocs"]: return await interaction.followup.send("❌ your oc not found.")
+        if t_key not in d["ocs"]: return await interaction.followup.send("❌ recipient oc not found.")
+        
+        if not is_dev(interaction) and d["ocs"][f_key].get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you don't own the sending oc.")
+            
+        f_inv = d["inventories"].get(f_key, {}).get(item_id, [])
+        if instance_index < 0 or instance_index >= len(f_inv):
+            return await interaction.followup.send("❌ invalid instance index.")
+            
+        inst = f_inv.pop(instance_index)
+        if not f_inv: del d["inventories"][f_key][item_id]
+            
+        d["inventories"].setdefault(t_key, {}).setdefault(item_id, []).append(inst)
+        save_data(d)
+        asyncio.ensure_future(push_backup_to_discord(d, reason="gift"))
+        
+        item_name = d["shop"].get(item_id, {}).get("name", "an item")
+        embed = discord.Embed(title="🎁 gift delivered!", description=f"**{d['ocs'][f_key]['name'].lower()}** gifted **{item_name.lower()}** to **{d['ocs'][t_key]['name'].lower()}**.", color=discord.Color.purple())
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        log.error(f"gift error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+
+@bot.tree.command(name="gift_money", description="gift ₩ from one oc to another.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    from_oc="your oc sending the money",
+    to_oc="the recipient oc",
+    amount="amount of ₩ to send (must be ≥ 1)",
+)
+async def gift_money_cmd(
+    interaction: discord.Interaction,
+    from_oc: str,
+    to_oc: str,
+    amount: int,
+):
+    await interaction.response.defer()
+    try:
+        if amount < 1:
+            return await interaction.followup.send("❌ amount must be at least ₩1.")
+
+        d = load_data()
+        f_key = oc_key_of(from_oc)
+        t_key = oc_key_of(to_oc)
+
+        if f_key not in d["ocs"]:
+            return await interaction.followup.send("❌ your oc not found.")
+        if t_key not in d["ocs"]:
+            return await interaction.followup.send("❌ recipient oc not found.")
+        if f_key == t_key:
+            return await interaction.followup.send("❌ an oc cannot gift money to themselves.")
+
+        f_oc = d["ocs"][f_key]
+        t_oc = d["ocs"][t_key]
+
+        if not is_dev(interaction) and f_oc.get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you do not own the sending oc.")
+
+        if f_oc["balance"] < amount:
+            return await interaction.followup.send(
+                f"❌ **{f_oc['name'].lower()}** only has ₩{f_oc['balance']:,} "
+                f"(you tried to send ₩{amount:,})."
+            )
+
+        confirm_embed = discord.Embed(
+            title="💸 confirm money gift",
+            description=(
+                f"**from:** {f_oc['name'].lower()}\n"
+                f"**to:** {t_oc['name'].lower()}\n"
+                f"**amount:** ₩{amount:,}\n"
+                f"**{f_oc['name'].lower()}'s balance after:** ₩{f_oc['balance'] - amount:,}"
+            ),
+            color=discord.Color.orange(),
+        )
+
+        if await wait_for_confirm(interaction, confirm_embed):
+            dconf = load_data()
+            fo = dconf["ocs"].get(f_key)
+            to = dconf["ocs"].get(t_key)
+            if not fo or not to:
+                return await interaction.followup.send("❌ oc data missing.", ephemeral=True)
+            if fo["balance"] < amount:
+                return await interaction.followup.send("❌ insufficient balance.", ephemeral=True)
+            fo["balance"] -= amount
+            to["balance"] += amount
+            save_data(dconf)
+            asyncio.ensure_future(push_backup_to_discord(dconf, reason="gift_money"))
+
+            guild = resolve_guild(interaction)
+            result_embed = discord.Embed(
+                title="💸 money gifted!",
+                description=(
+                    f"**{fo['name'].lower()}** sent ₩{amount:,} to **{to['name'].lower()}**.\n"
+                    f"**{fo['name'].lower()}'s** new balance: ₩{fo['balance']:,}\n"
+                    f"**{to['name'].lower()}'s** new balance: ₩{to['balance']:,}"
+                ),
+                color=discord.Color.green(),
+            )
+            await interaction.followup.send(embed=result_embed, ephemeral=True)
+            await audit(guild, f"gift_money: {fo['name'].lower()} → {to['name'].lower()} ₩{amount:,} by {interaction.user}")
+        else:
+            await interaction.followup.send("❌ cancelled.", ephemeral=True)
+
+    except Exception as e:
+        log.error(f"gift_money error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.")
+
+
+@bot.tree.command(name="sell", description="sell copies of an item from an oc's inventory.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name="the oc selling the item",
+    item_id="7-digit item id (e.g. 1234567)",
+    quantity="number of copies to sell (must be ≥ 1, max = how many you own)"
+)
+async def sell_cmd(interaction: discord.Interaction, oc_name: str, item_id: str, quantity: int):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if quantity < 1:
+            return await interaction.followup.send("❌ quantity must be at least 1.", ephemeral=True)
+
+        data = load_data()
+        ensure_shop_keys(data)
+        guild = resolve_guild(interaction)
+
+        oc_key = oc_key_of(oc_name)
+        if oc_key not in data["ocs"]:
+            return await interaction.followup.send("❌ oc not found.", ephemeral=True)
+
+        oc = data["ocs"][oc_key]
+
+        if not is_dev(interaction) and oc.get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you do not own this oc.", ephemeral=True)
+
+        resolved_id = _resolve_item_id(item_id, data["shop"])
+        shop_item = data["shop"].get(resolved_id) if resolved_id else None
+        if not shop_item:
+            return await interaction.followup.send(
+                "❌ this item is no longer listed in the shop and cannot be valued for sale. "
+                "use `/gift` or `/trade` to transfer it instead.",
+                ephemeral=True
+            )
+
+        item_name = shop_item["name"]
+        oc_inv = data["inventories"].get(oc_key, {})
+        instances = oc_inv.get(resolved_id, [])
+        available = len(instances)
+
+        if available < quantity:
+            return await interaction.followup.send(
+                f"❌ {oc['name'].lower()} only has {available} cop{'y' if available == 1 else 'ies'} of {item_name} (you requested {quantity}).",
+                ephemeral=True
+            )
+
+        base_price = shop_item["price"]
+        if shop_item.get("type") == "album":
+            discount = round(base_price * 0.30 / 100) * 100
+            sell_price_per_unit = max(100, base_price - discount)
+        else:
+            sell_price_per_unit = base_price
+        total_payout = sell_price_per_unit * quantity
+
+        confirm_desc = (
+            f"**item:** {item_name.lower()}\n"
+            f"**quantity:** {quantity}\n"
+            f"**sell price per copy:** ₩{sell_price_per_unit:,}\n"
+            f"**total payout:** ₩{total_payout:,}\n"
+            f"**seller:** {oc['name'].lower()}\n"
+            f"**current balance:** ₩{oc['balance']:,}\n"
+            f"**balance after sale:** ₩{oc['balance'] + total_payout:,}\n\n"
+            f"this action cannot be undone."
+        )
+        confirm_embed = discord.Embed(
+            title="💰 confirm sale",
+            description=confirm_desc,
+            color=discord.Color.orange()
+        )
+        if shop_item.get("type") == "album":
+            confirm_embed.set_footer(text=f"albums are sold at 30% off the original price (₩{base_price:,} → ₩{sell_price_per_unit:,} per copy)")
+        if shop_item.get("image_url"):
+            confirm_embed.set_thumbnail(url=shop_item["image_url"])
+
+        if await wait_for_confirm(interaction, confirm_embed):
+            d = load_data()
+            ensure_shop_keys(d)
+
+            o = d["ocs"].get(oc_key)
+            shop_i = d["shop"].get(resolved_id)
+            inv = d["inventories"].get(oc_key, {}).get(resolved_id, [])
+
+            if not o or not shop_i:
+                return await interaction.followup.send("❌ sale failed: oc or item data is no longer valid.", ephemeral=True)
+            if len(inv) < quantity:
+                return await interaction.followup.send(
+                    f"❌ sale failed: only {len(inv)} cop{'y' if len(inv)==1 else 'ies'} remain (you requested {quantity}).",
+                    ephemeral=True
+                )
+
+            for _ in range(quantity):
+                inv.pop()
+            if not inv:
+                del d["inventories"][oc_key][resolved_id]
+                if not d["inventories"][oc_key]:
+                    del d["inventories"][oc_key]
+
+            o["balance"] += total_payout
+
+            save_data(d)
+            asyncio.ensure_future(push_backup_to_discord(d, reason="sell"))
+
+            result_embed = discord.Embed(
+                title="✅ item sold",
+                description=(
+                    f"**{o['name'].lower()}** sold {quantity}× **{shop_i['name'].lower()}** "
+                    f"for ₩{sell_price_per_unit:,} each (₩{total_payout:,} total).\n"
+                    f"new balance: ₩{o['balance']:,}"
+                ),
+                color=discord.Color.green()
+            )
+            await interaction.followup.send(embed=result_embed, ephemeral=True)
+            await audit(guild, f"sell: {o['name'].lower()} sold {quantity}× {shop_i['name'].lower()} (id: {resolved_id}) for ₩{total_payout:,} by {interaction.user}")
+        else:
+            await interaction.followup.send("❌ sale cancelled.", ephemeral=True)
+
+    except Exception as e:
+        log.error(f"sell cmd error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+
+@bot.tree.command(name="sell_inclusion", description="sell an inclusion from an oc's inventory.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name="the oc selling the inclusion",
+    inclusion_id="7-digit inclusion id (e.g. 1234567, without 'inc_' prefix)",
+    quantity="number of copies to sell (must be ≥ 1, max = how many the oc owns)",
+)
+async def sell_inclusion_cmd(
+    interaction: discord.Interaction,
+    oc_name: str,
+    inclusion_id: str,
+    quantity: int = 1,
+):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if quantity < 1:
+            return await interaction.followup.send("❌ quantity must be at least 1.", ephemeral=True)
+        data = load_data()
+        ensure_shop_keys(data)
+        guild = resolve_guild(interaction)
+
+        stripped = inclusion_id.strip()
+        inc_id = f"inc_{stripped}" if not stripped.startswith("inc_") else stripped
+        inc_name = inc_id
+
+        oc_key = oc_key_of(oc_name)
+        if oc_key not in data["ocs"]:
+            return await interaction.followup.send("❌ oc not found.", ephemeral=True)
+
+        oc = data["ocs"][oc_key]
+        if not is_dev(interaction) and oc.get("owner_id") != interaction.user.id:
+            return await interaction.followup.send("❌ you do not own this oc.", ephemeral=True)
+
+        oc_inv = data["inventories"].get(oc_key, {})
+        count = _count_inclusion_instances(oc_inv, inc_id)
+        if count == 0:
+            return await interaction.followup.send("❌ no instances of this inclusion found.", ephemeral=True)
+        if quantity > count:
+            return await interaction.followup.send(
+                f"❌ {oc['name'].lower()} only has {count} cop{'y' if count == 1 else 'ies'} "
+                f"of **{inc_name}** (you requested {quantity}).",
+                ephemeral=True,
+            )
+
+        rarity_int = 0
+        inc_name = inc_id
+        album_price = 50_000
+        all_rarities = [0]
+        found_in_album = False
+        for shop_item in data["shop"].values():
+            if shop_item.get("type") != "album":
+                continue
+            for inc_def in shop_item.get("inclusions", []):
+                if inc_def.get("inclusion_id") == inc_id:
+                    rarity_int = inc_def.get("rarity", 0)
+                    inc_name = inc_def.get("name", inc_id)
+                    album_price = shop_item.get("price", 50_000)
+                    all_rarities = [i.get("rarity", 0) for i in shop_item.get("inclusions", [])]
+                    found_in_album = True
+                    break
+            if found_in_album:
+                break
+
+        if not found_in_album:
+            all_rarities = [rarity_int]
+
+        sell_price = _inclusion_sell_price(rarity_int, all_rarities, album_price)
+        rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
+        total_payout = sell_price * quantity
+
+        confirm_embed = discord.Embed(
+            title="💰 confirm inclusion sale",
+            description=(
+                f"**inclusion:** {inc_name}\n"
+                f"**inclusion id:** `{inc_id}`\n"
+                f"**rarity:** {rarity_label}\n"
+                f"**sell price per copy:** ₩{sell_price:,}\n"
+                f"**quantity:** {quantity}\n"
+                f"**total payout:** ₩{total_payout:,}\n"
+                f"**copies owned:** {count}\n"
+                f"**seller:** {oc['name'].lower()}\n"
+                f"**current balance:** ₩{oc['balance']:,}\n"
+                f"**balance after sale:** ₩{oc['balance'] + total_payout:,}\n\n"
+                f"this action cannot be undone."
+            ),
+            color=discord.Color.orange()
+        )
+
+        if await wait_for_confirm(interaction, confirm_embed):
+            d = load_data()
+            ensure_shop_keys(d)
+            o = d["ocs"].get(oc_key)
+            if not o:
+                return await interaction.followup.send("❌ sale failed: oc no longer exists.", ephemeral=True)
+
+            popped = _pop_n_inclusion_instances(d, oc_key, inc_id, quantity)
+            if popped is None:
+                return await interaction.followup.send(
+                    "❌ sale failed: not enough copies remain.", ephemeral=True
+                )
+            o["balance"] += total_payout
+            await save_and_backup(d, reason="sell_inclusion")
+            result_embed = discord.Embed(
+                title="✅ inclusion sold",
+                description=(
+                    f"**{o['name'].lower()}** sold {quantity}× **{inc_name}** "
+                    f"for ₩{sell_price:,} each (₩{total_payout:,} total).\n"
+                    f"new balance: ₩{o['balance']:,}"
+                ),
+                color=discord.Color.green()
+            )
+            await interaction.followup.send(embed=result_embed, ephemeral=True)
+            await audit(
+                guild,
+                f"sell_inclusion: {o['name'].lower()} sold {quantity}× {inc_name} "
+                f"({inc_id}) for ₩{total_payout:,} by {interaction.user}"
+            )
+        else:
+            await interaction.followup.send("❌ sale cancelled.", ephemeral=True)
+
+    except Exception as e:
+        log.error(f"sell_inclusion cmd error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+
+class DevInclusionPaginatorView(discord.ui.View):
+    def __init__(
+        self,
+        item: dict,
+        pages: list[list[dict]],
+        invoker_id: int,
+        normalized_id: str,
+    ):
+        super().__init__(timeout=300)
+        self.item = item
+        self.pages = pages
+        self.index = 0
+        self.invoker_id = invoker_id
+        self.normalized_id = normalized_id
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "❌ this panel belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _sync_buttons(self) -> None:
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index >= len(self.pages) - 1)
+
+    def build_dev_embed(self) -> discord.Embed:
+        page = self.pages[self.index]
+        all_rarities = [inc.get("rarity", 0) for p in self.pages for inc in p]
+        embed = discord.Embed(
+            title=f"[dev] {self.item['name'].lower()} — inclusions ({sum(len(p) for p in self.pages)} total)",
+            description=f"album id: `{self.normalized_id}`  •  page {self.index + 1}/{len(self.pages)}",
+            color=discord.Color.orange(),
+        )
+        for inc in page:
+            embed.add_field(
+                name=inc["name"].lower(),
+                value=(
+                    f"id: `{inc['inclusion_id']}`\n"
+                    f"rarity: {_rarity_label_proportional(inc.get('rarity', 0), all_rarities)}\n"
+                    f"image: {'✅' if inc.get('image_url') else '❌ none'}"
+                ),
+                inline=True,
+            )
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="dev_inc_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_dev_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="dev_inc_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_dev_embed(), view=self)
+
+
+@bot.tree.command(name="album_inclusions", description="dev | list all inclusions for an album, including their IDs.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(item_id="7-digit item number of the album (e.g. 1234567)")
+async def album_inclusions_cmd(interaction: discord.Interaction, item_id: str):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
     data = load_data()
-    refreshed = 0
-    failed = 0
+    ensure_shop_keys(data)
+
+    normalized_id = _resolve_item_id(item_id, data["shop"])
+    if not normalized_id:
+        return await interaction.followup.send("❌ item not found.", ephemeral=True)
+
+    item = data["shop"][normalized_id]
+    if item.get("type") != "album":
+        return await interaction.followup.send("❌ that item is not an album.", ephemeral=True)
+
+    inclusions = item.get("inclusions", [])
+    if not inclusions:
+        return await interaction.followup.send(f"**{item['name'].lower()}** has no inclusions defined.", ephemeral=True)
+
+    sorted_incs = sorted(inclusions, key=_inclusion_sort_key)
+    INC_PAGE_SIZE = 10
+    pages = [sorted_incs[i:i+INC_PAGE_SIZE] for i in range(0, len(sorted_incs), INC_PAGE_SIZE)]
+
+    view = DevInclusionPaginatorView(item=item, pages=pages, invoker_id=interaction.user.id, normalized_id=normalized_id)
+    await interaction.followup.send(embed=view.build_dev_embed(), view=view, ephemeral=True)
+
+
+class InclusionsBrowserView(discord.ui.View):
+    PAGE_SIZE = 1
+
+    def __init__(
+        self,
+        inclusions: list[dict],
+        album_name: str,
+        album_image_url: Optional[str],
+        invoker_id: int,
+        album_price: int = 50_000,
+    ):
+        super().__init__(timeout=300)
+        self.inclusions     = inclusions
+        self.album_name     = album_name
+        self.album_cover    = album_image_url
+        self.invoker_id     = invoker_id
+        self.album_price    = album_price
+        self.index          = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        if not self.inclusions:
+            self.prev_btn.disabled = True
+            self.next_btn.disabled = True
+            return
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index >= len(self.inclusions) - 1)
+
+    def _build_embed(self) -> discord.Embed:
+        inc   = self.inclusions[self.index]
+        total = len(self.inclusions)
+        page  = self.index + 1
+
+        rarity_int   = inc.get("rarity", 0)
+        all_rarities = [i.get("rarity", 0) for i in self.inclusions]
+        rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
+        sell_price = _inclusion_sell_price(rarity_int, all_rarities, self.album_price)
+        
+        if rarity_int == 1: color = discord.Color.light_grey()
+        elif rarity_int == 2: color = discord.Color.green()
+        elif rarity_int == 3: color = discord.Color.blue()
+        elif rarity_int == 4: color = discord.Color.purple()
+        elif rarity_int >= 5: color = discord.Color.gold()
+        else: color = discord.Color.blurple()
+
+        embed = discord.Embed(
+            title=inc["name"].lower(),
+            description=f"**album:** {self.album_name}",
+            color=color,
+        )
+        embed.add_field(name="rarity",        value=rarity_label,                  inline=True)
+        embed.add_field(name="inclusion id",  value=f"`{inc['inclusion_id']}`",    inline=True)
+        embed.add_field(name="sell price",    value=f"₩{sell_price:,}",            inline=True)
+        embed.set_footer(text=f"inclusion {page} of {total}  •  common → rare")
+
+        img_url = inc.get("image_url") or self.album_cover
+        if img_url:
+            embed.set_image(url=img_url)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return True
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="inclbr_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="inclbr_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+@bot.tree.command(name="inclusions", description="browse all inclusions for an album.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(album_name="album name or partial match")
+async def inclusions_cmd(interaction: discord.Interaction, album_name: str):
+    await interaction.response.defer()
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+
+        matches = [
+            (item_id, item)
+            for item_id, item in data["shop"].items()
+            if item.get("type") == "album"
+            and album_name.strip().lower() in item["name"].lower()
+        ]
+
+        if not matches:
+            return await interaction.followup.send("❌ no album found matching that name.", ephemeral=True)
+
+        if len(matches) > 1:
+            names = ", ".join(f"**{item['name']}**" for _, item in matches)
+            return await interaction.followup.send(
+                f"❌ multiple albums matched: {names}. please be more specific.",
+                ephemeral=True,
+            )
+
+        _, album_item = matches[0]
+        raw_inclusions = album_item.get("inclusions", [])
+
+        if not raw_inclusions:
+            return await interaction.followup.send(
+                f"**{album_item['name']}** has no inclusions registered yet.", ephemeral=True
+            )
+
+        sorted_incs = sorted(raw_inclusions, key=_inclusion_sort_key)
+
+        view = InclusionsBrowserView(
+            inclusions=sorted_incs,
+            album_name=album_item["name"],
+            album_image_url=album_item.get("image_url"),
+            invoker_id=interaction.user.id,
+            album_price=album_item.get("price", 50_000),
+        )
+        await interaction.followup.send(embed=view._build_embed(), view=view)
+
+    except Exception as e:
+        log.error(f"inclusions_cmd error: {e}")
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+class AlbumCog(commands.GroupCog, group_name="album", group_description="album purchase tracking"):
+    def __init__(self, bot):
+        self.bot = bot
+        
+    @app_commands.command(name="list", description="browse all albums available in the shop with purchase totals.")
+    async def album_list(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        data = load_data()
+        ensure_shop_keys(data)
+
+        shop_albums = [
+            (item_id, item)
+            for item_id, item in data["shop"].items()
+            if item.get("type") == "album"
+        ]
+
+        if not shop_albums:
+            return await interaction.followup.send(
+                embed=get_embed("album list", "no albums are currently listed in the shop.", "neutral")
+            )
+
+        unified = _build_album_totals(data)
+
+        def _total_for_item_safe(item_id: str) -> tuple[int, str]:
+            item_name_lower = data["shop"][item_id].get("name", "").lower()
+            title_to_uuid = {
+                a.get("title", "").lower(): a_id
+                for a_id, a in data.get("albums", {}).items()
+            }
+            uuid_key = title_to_uuid.get(item_name_lower)
+            shop_key = f"shop:{item_id}"
+
+            per_oc: dict[str, int] = {}
+            for oc_key, oc_map in unified.items():
+                count = max(oc_map.get(shop_key, 0), oc_map.get(uuid_key, 0) if uuid_key else 0)
+                if count > 0:
+                    per_oc[oc_key] = count
+
+            total = sum(per_oc.values())
+
+            if per_oc:
+                top_oc_key, top_qty = max(per_oc.items(), key=lambda x: x[1])
+                top_name = data.get("ocs", {}).get(top_oc_key, {}).get("name", "unknown").lower()
+                top_str = f"{top_name} ({top_qty} cop{'y' if top_qty == 1 else 'ies'})"
+            else:
+                top_str = "—"
+
+            return total, top_str
+
+        album_rows = []
+        for item_id, item in shop_albums:
+            total, top_str = _total_for_item_safe(item_id)
+            album_rows.append((item_id, item, total, top_str))
+        album_rows.sort(key=lambda x: x[2], reverse=True)
+
+        PAGE_SIZE = 5
+        pages = []
+        total_pages = max(1, math.ceil(len(album_rows) / PAGE_SIZE))
+        for i in range(0, len(album_rows), PAGE_SIZE):
+            chunk = album_rows[i:i + PAGE_SIZE]
+            embed = get_embed(
+                "album list",
+                f"page {i // PAGE_SIZE + 1} of {total_pages}  •  {len(album_rows)} album(s) in shop"
+            )
+            for item_id, item, total, top_str in chunk:
+                short_id = item_id.replace("id_", "")
+                embed.add_field(
+                    name=item["name"],
+                    value=(
+                        f"shop id: `{short_id}`\n"
+                        f"price: ₩{item['price']:,}\n"
+                        f"total purchased: {total} cop{'y' if total == 1 else 'ies'}\n"
+                        f"top buyer: {top_str}"
+                    ),
+                    inline=False
+                )
+            pages.append(embed)
+
+        view = RankingPaginationView(pages)
+        await interaction.followup.send(embed=pages[0], view=view)
+
+    @app_commands.command(name="stats", description="view album purchase stats for an oc")
+    @app_commands.describe(album_ref="album title or album ID")
+    async def album_stats(self, interaction: discord.Interaction, oc_name: str, album_ref: str = None):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc:
+            return await interaction.response.send_message(embed=get_embed("error", "oc not found.", "error"), ephemeral=True)
+            
+        purchases = [p for p in data.get("album_purchases", {}).values() if p["oc_id"] == oc["id"]]
+            
+        if album_ref:
+            album = _resolve_album(album_ref, data)
+            if not album:
+                return await interaction.response.send_message(embed=get_embed("error", f"album '{album_ref.lower()}' not found.", "error"), ephemeral=True)
+            
+            album_purchases = [p for p in purchases if p["album_id"] == album["album_id"]]
+            album_purchases.sort(key=lambda x: x["purchase_date"])
+            
+            log_total = sum(p["quantity"] for p in album_purchases)
+
+            unified = _build_album_totals(data)
+            oc_unified = unified.get(oc["id"], {})
+            resolved_item_id = None
+            album_title_lower = album.get("title", "").lower()
+            for iid, si in data.get("shop", {}).items():
+                if si.get("type") == "album" and si.get("name", "").lower() == album_title_lower:
+                    resolved_item_id = iid
+                    break
+            inv_count = max(
+                oc_unified.get(f"shop:{resolved_item_id}", 0) if resolved_item_id else 0,
+                oc_unified.get(album["album_id"], 0)
+            )
+            total = max(log_total, inv_count)
+
+            if total == 0 and not album_purchases:
+                return await interaction.response.send_message(embed=get_embed("album stats", f"**{oc['name'].lower()}** has no purchases for **{album['title']}**.", "neutral"))
+            
+            all_album_purchases = [
+                p for p in data.get("album_purchases", {}).values()
+                if p["album_id"] == album["album_id"]
+            ]
+            album_grand_total = sum(p["quantity"] for p in all_album_purchases)
+            pct = (total / max(album_grand_total, total) * 100) if max(album_grand_total, total) else 0.0
+            
+            oc_totals_for_album: dict[str, int] = {}
+            for p in all_album_purchases:
+                oc_totals_for_album[p["oc_id"]] = oc_totals_for_album.get(p["oc_id"], 0) + p["quantity"]
+            top_oc_id, top_oc_count = max(oc_totals_for_album.items(), key=lambda x: x[1]) if oc_totals_for_album else (None, 0)
+            top_oc_name = data.get("ocs", {}).get(top_oc_id, {}).get("name", "n/a").lower() if top_oc_id else "n/a"
+
+            inv_note = f"\n*(+ {inv_count - log_total} from shop inventory)*" if inv_count > log_total else ""
+            
+            pages = []
+            page_source = album_purchases if album_purchases else [None]
+            for i in range(0, max(len(album_purchases), 1), 5):
+                chunk = album_purchases[i:i+5]
+                if i == 0:
+                    embed = get_embed(
+                        f"{oc['name'].lower()} — {album['title']}",
+                        (
+                            f"**total:** {total} cop{'y' if total == 1 else 'ies'} ({pct:.1f}% of all {album_grand_total} logged){inv_note}\n"
+                            f"**top buyer:** {top_oc_name} ({top_oc_count} cop{'y' if top_oc_count == 1 else 'ies'})\n"
+                            f"page {i//5 + 1}"
+                        )
+                    )
+                else:
+                    embed = get_embed(f"{oc['name'].lower()} — {album['title']}", f"total: {total} cop{'y' if total == 1 else 'ies'}\npage {i//5 + 1}")
+                
+                for p in chunk:
+                    v_str = p.get('version') or "—"
+                    n_str = p.get('note') or "—"
+                    embed.add_field(name=f"date: {p['purchase_date']}", value=f"quantity: {p['quantity']}\nversion: {v_str.lower()}\nnote: {n_str.lower()}", inline=False)
+                pages.append(embed)
+            
+            if not pages:
+                return await interaction.response.send_message(embed=get_embed("album stats", f"**{oc['name'].lower()}** has no purchases for **{album['title']}**.", "neutral"))
+            
+            view = RankingPaginationView(pages)
+            await interaction.response.send_message(embed=pages[0], view=view)
+        else:
+            totals_by_album = {}
+            for p in purchases:
+                a_id = p["album_id"]
+                if a_id not in totals_by_album:
+                    totals_by_album[a_id] = {"total": 0, "versions": {}}
+                totals_by_album[a_id]["total"] += p["quantity"]
+                v = p.get("version") or "unspecified"
+                totals_by_album[a_id]["versions"][v.lower()] = totals_by_album[a_id]["versions"].get(v.lower(), 0) + p["quantity"]
+
+            unified = _build_album_totals(data)
+            oc_unified = unified.get(oc["id"], {})
+            for a_key, inv_qty in oc_unified.items():
+                if a_key in totals_by_album:
+                    totals_by_album[a_key]["total"] = max(totals_by_album[a_key]["total"], inv_qty)
+                else:
+                    if a_key.startswith("shop:"):
+                        item_id_part = a_key[5:]
+                        display_name = data.get("shop", {}).get(item_id_part, {}).get("name", "unknown album")
+                    else:
+                        display_name = data.get("albums", {}).get(a_key, {}).get("title", "unknown album")
+                    totals_by_album[a_key] = {"total": inv_qty, "versions": {}, "_display_name": display_name}
+
+            if not totals_by_album:
+                return await interaction.response.send_message(embed=get_embed("album stats", f"**{oc['name'].lower()}** has no album purchase records yet.", "neutral"))
+
+            grand_total = sum(t["total"] for t in totals_by_album.values())
+            
+            embeds = []
+            album_list = list(totals_by_album.items())
+            for i in range(0, len(album_list), 5):
+                chunk = album_list[i:i+5]
+                embed = get_embed(f"{oc['name'].lower()} — all albums", f"grand total: {grand_total} cop{'y' if grand_total == 1 else 'ies'}\npage {i//5 + 1}")
+                for a_id, stats in chunk:
+                    if "_display_name" in stats:
+                        a_title = stats["_display_name"]
+                    else:
+                        a_title = data.get("albums", {}).get(a_id, {}).get("title", "unknown")
+                    v_lines = "\n".join(f"- {v}: {c}" for v, c in stats["versions"].items())
+                    embed.add_field(name=f"{a_title} (total: {stats['total']})", value=v_lines or "—", inline=False)
+                embeds.append(embed)
+            
+            view = RankingPaginationView(embeds)
+            await interaction.response.send_message(embed=embeds[0], view=view)
+
+    @app_commands.command(name="leaderboard", description="see who has bought the most copies of a specific album.")
+    @app_commands.describe(album_ref="7-digit shop item id or album name (partial match ok)")
+    async def album_leaderboard(self, interaction: discord.Interaction, album_ref: str):
+        await interaction.response.defer()
+        data = load_data()
+        ensure_shop_keys(data)
+
+        resolved_item_id: Optional[str] = None
+        resolved_name: Optional[str] = None
+        resolved_uuid_key: Optional[str] = None
+
+        shop_candidate = _resolve_item_id(album_ref.strip(), data["shop"])
+        if shop_candidate and data["shop"].get(shop_candidate, {}).get("type") == "album":
+            resolved_item_id = shop_candidate
+            resolved_name = data["shop"][shop_candidate]["name"]
+            name_lower = resolved_name.lower()
+            for a_id, a in data.get("albums", {}).items():
+                if a.get("title", "").lower() == name_lower:
+                    resolved_uuid_key = a_id
+                    break
+
+        if not resolved_item_id:
+            needle = album_ref.strip().lower()
+            name_matches = [
+                (iid, item)
+                for iid, item in data["shop"].items()
+                if item.get("type") == "album" and needle in item["name"].lower()
+            ]
+            if len(name_matches) == 1:
+                resolved_item_id = name_matches[0][0]
+                resolved_name = name_matches[0][1]["name"]
+                name_lower = resolved_name.lower()
+                for a_id, a in data.get("albums", {}).items():
+                    if a.get("title", "").lower() == name_lower:
+                        resolved_uuid_key = a_id
+                        break
+            elif len(name_matches) > 1:
+                names = ", ".join(f"**{item['name'].lower()}**" for _, item in name_matches)
+                return await interaction.followup.send(
+                    f"❌ multiple albums matched: {names}. use the 7-digit shop id to be specific.",
+                    ephemeral=True
+                )
+
+        if not resolved_item_id:
+            legacy_album = _resolve_album(album_ref, data)
+            if legacy_album:
+                resolved_uuid_key = legacy_album["album_id"]
+                resolved_name = legacy_album.get("title", "unknown album")
+
+        if not resolved_item_id and not resolved_uuid_key:
+            return await interaction.followup.send(
+                embed=get_embed("error", f"album `{album_ref}` not found in shop or records.", "error"),
+                ephemeral=True
+            )
+
+        unified = _build_album_totals(data)
+        shop_key = f"shop:{resolved_item_id}" if resolved_item_id else None
+
+        per_oc: dict[str, int] = {}
+        for oc_key, oc_map in unified.items():
+            count = 0
+            if shop_key:
+                count = max(count, oc_map.get(shop_key, 0))
+            if resolved_uuid_key:
+                count = max(count, oc_map.get(resolved_uuid_key, 0))
+            if count > 0:
+                per_oc[oc_key] = count
+
+        if not per_oc:
+            return await interaction.followup.send(
+                embed=get_embed(
+                    "leaderboard",
+                    f"no purchases found for **{resolved_name.lower()}** yet.",
+                    "neutral"
+                )
+            )
+
+        album_grand_total = sum(per_oc.values())
+        sorted_ocs = sorted(per_oc.items(), key=lambda x: x[1], reverse=True)
+
+        display_id = resolved_item_id.replace("id_", "") if resolved_item_id else resolved_uuid_key
+        pages = []
+        for i in range(0, len(sorted_ocs), 10):
+            chunk = sorted_ocs[i:i + 10]
+            page_num = i // 10 + 1
+            total_pages = max(1, math.ceil(len(sorted_ocs) / 10))
+            header = (
+                f"**total copies:** {album_grand_total}\n"
+                f"**shop id:** `{display_id}`\n"
+                f"page {page_num} of {total_pages}"
+            ) if i == 0 else f"page {page_num} of {total_pages}"
+            embed = get_embed(f"leaderboard — {resolved_name}", header)
+            lines = []
+            for idx, (oc_id, total) in enumerate(chunk):
+                oc_name = data.get("ocs", {}).get(oc_id, {}).get("name", "unknown oc").lower()
+                share_pct = (total / album_grand_total * 100) if album_grand_total else 0.0
+                lines.append(
+                    f"**#{i + idx + 1}** · {oc_name} · {total} cop{'y' if total == 1 else 'ies'} ({share_pct:.1f}%)"
+                )
+            embed.description += "\n\n" + "\n".join(lines)
+            pages.append(embed)
+
+        view = RankingPaginationView(pages)
+        await interaction.followup.send(embed=pages[0], view=view)
+
+    @app_commands.command(name="global_leaderboard", description="overall leaderboard — total albums purchased across all albums, sourced from shop + logs")
+    async def album_global_leaderboard(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        data = load_data()
+        unified = _build_album_totals(data)
+
+        oc_grand: dict[str, int] = {}
+        for oc_key, album_map in unified.items():
+            oc_grand[oc_key] = sum(album_map.values())
+
+        if not oc_grand:
+            return await interaction.followup.send(
+                embed=get_embed("global leaderboard", "no album purchase data found.", "neutral")
+            )
+
+        grand_total = sum(oc_grand.values())
+        sorted_ocs = sorted(oc_grand.items(), key=lambda x: x[1], reverse=True)
+
+        pages = []
+        for i in range(0, len(sorted_ocs), 10):
+            chunk = sorted_ocs[i:i+10]
+            header = (
+                f"**overall copies across all albums: {grand_total}**\n"
+                f"sources: shop inventories + purchase logs (max deduplication)\n"
+                f"page {i // 10 + 1}"
+            ) if i == 0 else f"page {i // 10 + 1}"
+            embed = get_embed("🏆 global album leaderboard", header)
+            lines = []
+            for idx, (oc_id, total) in enumerate(chunk):
+                oc_name = data.get("ocs", {}).get(oc_id, {}).get("name", "unknown oc").lower()
+                share_pct = (total / grand_total * 100) if grand_total else 0.0
+                lines.append(f"**#{i + idx + 1}** · {oc_name} · {total} cop{'y' if total == 1 else 'ies'} ({share_pct:.1f}%)")
+            embed.description += "\n\n" + "\n".join(lines)
+            pages.append(embed)
+
+        view = RankingPaginationView(pages)
+        await interaction.followup.send(embed=pages[0], view=view)
+
+    @app_commands.command(name="archive", description="[dev] soft-delete an album (purchase history is preserved)")
+    @app_commands.describe(album_ref="album title or album ID")
+    @is_dev_dec()
+    async def album_archive(self, interaction: discord.Interaction, album_ref: str):
+        data = load_data()
+        album = _resolve_album(album_ref, data)
+        if not album:
+            return await interaction.response.send_message(embed=get_embed("error", "album not found or already archived.", "error"), ephemeral=True)
+        
+        data["albums"][album["album_id"]]["active"] = False
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="album_archive"))
+        
+        count = sum(1 for p in data.get("album_purchases", {}).values() if p["album_id"] == album["album_id"])
+        await interaction.response.send_message(embed=get_embed("success", f"album **{album['title'].lower()}** has been archived. its {count} purchase record(s) are preserved but the album will no longer appear in active listings.", "success"), ephemeral=True)
+
+@bot.tree.command(name="shop_export", description="dev | export all shop items (including album inclusions and image URLs) as a JSON file.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    category="optional: export only items in this category (case-insensitive). omit to export all.",
+    include_images="if true, image_url fields are included as-is (cdn urls). default true.",
+)
+async def shop_export_cmd(
+    interaction: discord.Interaction,
+    category: Optional[str] = None,
+    include_images: bool = True,
+) -> None:
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    guild = resolve_guild(interaction)
+    try:
+        data = load_data()
+        ensure_shop_keys(data)
+
+        resolved_category: Optional[str] = None
+        if category is not None:
+            for cat in data["shop_categories"]:
+                if cat.lower() == category.lower():
+                    resolved_category = cat
+                    break
+            if resolved_category is None:
+                return await interaction.followup.send("❌ category not found.", ephemeral=True)
+
+        items = []
+        for item in data["shop"].values():
+            if item.get("type") not in PURCHASABLE_TYPES:
+                continue
+            if resolved_category is not None and item.get("category", "").lower() != resolved_category.lower():
+                continue
+            items.append(item)
+
+        export_items = []
+        for item in items:
+            item_copy = {
+                "id":              item.get("id"),
+                "type":            item.get("type"),
+                "name":            item.get("name"),
+                "group":           item.get("group", ""),
+                "price":           item.get("price"),
+                "inclusion_count": item.get("inclusion_count"),
+                "category":        item.get("category"),
+                "inclusions":      [],
+                "image_url":       item.get("image_url") if include_images else None,
+                "image_msg_id":    item.get("image_msg_id") if include_images else None,
+                "created_at":      item.get("created_at"),
+            }
+            for inc in item.get("inclusions", []):
+                inc_copy = dict(inc)
+                if not include_images:
+                    inc_copy["image_url"] = None
+                    inc_copy["image_msg_id"] = None
+                item_copy["inclusions"].append(inc_copy)
+            export_items.append(item_copy)
+
+        export = {
+            "export_version": 1,
+            "exported_at":    now_iso(),
+            "categories":     data["shop_categories"],
+            "items":          export_items,
+        }
+
+        raw_bytes = json.dumps(export, indent=2, ensure_ascii=False).encode("utf-8")
+        if len(raw_bytes) > 8 * 1024 * 1024:
+            return await interaction.followup.send(
+                "❌ export too large (> 8 MB). use the category filter to split it.", ephemeral=True
+            )
+
+        filename = f"shop_export_{now_utc().strftime('%Y%m%d_%H%M%S')}.json"
+        file_obj = discord.File(io.BytesIO(raw_bytes), filename=filename)
+
+        albums  = sum(1 for i in export_items if i.get("type") == "album")
+        miscs   = sum(1 for i in export_items if i.get("type") == "misc")
+        inc_tot = sum(len(i.get("inclusions", [])) for i in export_items)
+
+        embed = discord.Embed(title="📦 shop export", color=discord.Color.green())
+        embed.add_field(name="items exported",    value=str(len(export_items)), inline=True)
+        embed.add_field(name="albums",            value=str(albums),            inline=True)
+        embed.add_field(name="misc",              value=str(miscs),             inline=True)
+        embed.add_field(name="inclusions total",  value=str(inc_tot),           inline=True)
+        embed.add_field(name="category filter",   value=resolved_category or "all", inline=True)
+
+        await interaction.followup.send(embed=embed, file=file_obj, ephemeral=True)
+        await audit(guild, f"shop_export: {len(export_items)} items exported by {interaction.user}")
+    except Exception as e:
+        log.error("shop_export_cmd error: %s", e, exc_info=True)
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+
+@bot.tree.command(name="shop_import", description="dev | import shop items from a previously exported JSON file. images are re-persisted automatically.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    file="the .json file produced by /shop_export",
+    dry_run="if true, validate and preview what would be imported without writing any data. default false.",
+    skip_existing="if true, silently skip items whose name already exists in the shop (same type). if false, fail on first conflict. default true.",
+    reimport_images="if true, re-download and re-persist any image_url fields via the bot-assets channel. if false, keep URLs as-is. default true.",
+)
+async def shop_import_cmd(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    dry_run: bool = False,
+    skip_existing: bool = True,
+    reimport_images: bool = True,
+) -> None:
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    guild = resolve_guild(interaction)
+    try:
+        if not file.filename.lower().endswith(".json"):
+            return await interaction.followup.send("❌ attachment must be a .json file.", ephemeral=True)
+        if file.size > 8 * 1024 * 1024:
+            return await interaction.followup.send("❌ file too large.", ephemeral=True)
+
+        raw = await file.read()
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return await interaction.followup.send("❌ file is not valid JSON.", ephemeral=True)
+
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+            return await interaction.followup.send("❌ invalid export format (missing 'items' list).", ephemeral=True)
+
+        warnings: list[str] = []
+        if parsed.get("export_version") != 1:
+            warnings.append(f"export_version is {parsed.get('export_version')!r}, expected 1 — proceed with caution.")
+
+        data = load_data()
+        ensure_shop_keys(data)
+
+        errors:   list[str] = []
+        skipped:  list[str] = []
+        to_import: list[dict] = []
+
+        for idx, raw_item in enumerate(parsed["items"]):
+            label = raw_item.get("name") or f"item[{idx}]"
+
+            if not isinstance(raw_item.get("name"), str) or not raw_item["name"].strip():
+                errors.append(f"{label}: missing or empty 'name' field.")
+                continue
+            if raw_item.get("type") not in PURCHASABLE_TYPES:
+                errors.append(f"{label}: 'type' must be one of {PURCHASABLE_TYPES}, got {raw_item.get('type')!r}.")
+                continue
+            if not isinstance(raw_item.get("price"), (int, float)) or int(raw_item["price"]) < 0:
+                errors.append(f"{label}: 'price' must be a non-negative integer.")
+                continue
+            if raw_item["type"] == "album":
+                if not isinstance(raw_item.get("inclusion_count"), (int, float)) or int(raw_item.get("inclusion_count", 0)) < 1:
+                    errors.append(f"{label}: 'inclusion_count' must be a positive integer for albums.")
+                    continue
+                if not isinstance(raw_item.get("inclusions"), list):
+                    errors.append(f"{label}: 'inclusions' must be a list for albums.")
+                    continue
+                inc_errors = []
+                for i, inc in enumerate(raw_item["inclusions"]):
+                    if not isinstance(inc.get("name"), str):
+                        inc_errors.append(f"inclusion[{i}] missing 'name'")
+                    if not isinstance(inc.get("rarity"), (int, float)) or int(inc.get("rarity", 0)) < 1:
+                        inc_errors.append(f"inclusion[{i}] 'rarity' must be int ≥ 1")
+                if inc_errors:
+                    errors.append(f"{label}: " + "; ".join(inc_errors))
+                    continue
+
+            conflict = any(
+                s.get("name", "").lower() == raw_item["name"].lower() and s.get("type") == raw_item["type"]
+                for s in data["shop"].values()
+            )
+            if conflict:
+                if skip_existing:
+                    skipped.append(raw_item["name"])
+                    continue
+                else:
+                    errors.append(f"{label}: name conflict — an item of type '{raw_item['type']}' with this name already exists.")
+                    continue
+
+            to_import.append(raw_item)
+
+        if errors:
+            err_text = "\n".join(errors)
+            if len(err_text) > 4000:
+                err_text = err_text[:3997] + "…"
+            embed = discord.Embed(
+                title="❌ shop import — validation errors",
+                description=err_text,
+                color=discord.Color.red(),
+            )
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        if dry_run:
+            embed = discord.Embed(title="🔍 shop import dry run", color=discord.Color.gold())
+            embed.add_field(name="would import", value=str(len(to_import)), inline=True)
+            embed.add_field(name="would skip",   value=str(len(skipped)),  inline=True)
+            embed.add_field(name="warnings",     value="\n".join(warnings) or "none", inline=False)
+            skip_preview = "\n".join(skipped[:20]) + ("…" if len(skipped) > 20 else "")
+            embed.add_field(name="skipped items", value=skip_preview or "none", inline=False)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        if not to_import:
+            embed = discord.Embed(
+                title="ℹ️ shop import",
+                description="nothing to import — all items were skipped or the file contained no valid items.",
+                color=discord.Color.blue(),
+            )
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        asset_ch = None
+        if reimport_images and bot.guilds:
+            asset_ch = discord.utils.get(bot.guilds[0].text_channels, name=ASSET_CHANNEL_NAME)
+
+        used_inc_ids_this_batch: list[str] = []
+        all_existing_inc_ids: set[str] = set()
+        for shop_item in data["shop"].values():
+            for inc in shop_item.get("inclusions", []):
+                if inc_id_val := inc.get("inclusion_id"):
+                    all_existing_inc_ids.add(inc_id_val)
+
+        async def _repersist_image(url: Optional[str], filename: str) -> tuple[Optional[str], Optional[int]]:
+            if not url or not reimport_images:
+                return url, None
+            if not asset_ch:
+                return url, None
+            if _http_session is None or _http_session.closed:
+                return url, None
+            try:
+                async with _http_session.get(url) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        file_obj = discord.File(io.BytesIO(img_bytes), filename=filename)
+                        msg = await asset_ch.send(file=file_obj)
+                        if msg.attachments:
+                            return msg.attachments[0].url.split("?")[0], msg.id
+            except Exception:
+                pass
+            return url, None
+
+        imported_count = 0
+        for raw_item in to_import:
+            new_item_id = _gen_item_id(data["shop"], list(data.get("used_item_ids", [])))
+            data.setdefault("used_item_ids", []).append(new_item_id)
+
+            item_img_url   = raw_item.get("image_url")
+            item_img_msg   = raw_item.get("image_msg_id")
+            if reimport_images and item_img_url:
+                new_url, new_msg = await _repersist_image(item_img_url, f"import_{new_item_id}.png")
+                if new_url != item_img_url or new_msg is not None:
+                    item_img_url, item_img_msg = new_url, new_msg
+                elif new_url == item_img_url and new_msg is None and reimport_images:
+                    warnings.append(f"item '{raw_item['name']}': image re-persist failed, kept original URL")
+
+            resolved_cat: Optional[str] = None
+            raw_cat = raw_item.get("category")
+            if raw_cat:
+                for cat in data["shop_categories"]:
+                    if cat.lower() == raw_cat.lower():
+                        resolved_cat = cat
+                        break
+                if resolved_cat is None:
+                    warnings.append(f"item '{raw_item['name']}': category '{raw_cat}' not found in shop_categories, set to None.")
+
+            new_record: dict = {
+                "id":           new_item_id,
+                "type":         raw_item["type"],
+                "name":         raw_item["name"],
+                "price":        int(raw_item["price"]),
+                "category":     resolved_cat,
+                "image_url":    item_img_url,
+                "image_msg_id": item_img_msg,
+                "created_at":   now_iso(),
+            }
+            if raw_item["type"] == "album":
+                new_record["group"]           = raw_item.get("group", "")
+                new_record["inclusion_count"] = int(raw_item["inclusion_count"])
+                new_record["inclusions"]      = []
+
+                for inc in raw_item.get("inclusions", []):
+                    combined_used = all_existing_inc_ids | set(used_inc_ids_this_batch)
+                    new_inc_id = _gen_inclusion_id(combined_used, [])
+                    used_inc_ids_this_batch.append(new_inc_id)
+                    all_existing_inc_ids.add(new_inc_id)
+                    data.setdefault("used_inclusion_ids", []).append(new_inc_id)
+
+                    inc_img_url = inc.get("image_url")
+                    inc_img_msg = inc.get("image_msg_id")
+                    if reimport_images and inc_img_url:
+                        new_url, new_msg = await _repersist_image(inc_img_url, f"import_{new_inc_id}.png")
+                        if new_url != inc_img_url or new_msg is not None:
+                            inc_img_url, inc_img_msg = new_url, new_msg
+                        elif new_url == inc_img_url and new_msg is None:
+                            warnings.append(f"item '{raw_item['name']}' inclusion '{inc.get('name', new_inc_id)}': image re-persist failed, kept original URL")
+
+                    new_record["inclusions"].append({
+                        "inclusion_id": new_inc_id,
+                        "name":         inc["name"],
+                        "rarity":       int(inc["rarity"]),
+                        "image_url":    inc_img_url,
+                        "image_msg_id": inc_img_msg,
+                    })
+
+            data["shop"][new_item_id] = new_record
+            imported_count += 1
+
+        await save_and_backup(data, reason="shop_import")
+
+        embed = discord.Embed(title="✅ shop import complete", color=discord.Color.green())
+        embed.add_field(name="imported", value=str(imported_count),    inline=True)
+        embed.add_field(name="skipped",  value=str(len(skipped)),      inline=True)
+        embed.add_field(name="dry run",  value="no",                   inline=True)
+        embed.add_field(name="warnings", value=("\n".join(warnings)[:1000] or "none"), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await audit(guild, f"shop_import: {imported_count} items imported, {len(skipped)} skipped by {interaction.user}")
+    except Exception as e:
+        log.error("shop_import_cmd error: %s", e, exc_info=True)
+        await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+        @bot.tree.command(name="refresh_assets", description="[Dev] Re-upload any expired CDN attachment URLs for OC pictures, IG posts, and Tweets.")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+        
+        async def refresh_assets_cmd(interaction: discord.Interaction):
+            if not is_dev(interaction):
+                return await interaction.response.send_message("❌ Only devs can use this command.", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+            data = load_data()
+            refreshed = 0
+            failed = 0
 
     def _is_cdn_attachment(url: str) -> bool:
-        """Heuristic: is this a raw Discord CDN attachment link (not a user-supplied direct URL)?"""
         return bool(url and "cdn.discordapp.com/attachments/" in url)
 
     # -- OC profile pictures --
     for oc_key, oc in data["ocs"].items():
         url = oc.get("profile_picture", "")
         if _is_cdn_attachment(url):
-            msg_id = oc.get("profile_picture_msg_id")
-            updated = False
-            if msg_id:
-                for guild in bot.guilds:
-                    ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
-                    if ch:
-                        try:
-                            msg = await ch.fetch_message(msg_id)
-                            if msg.attachments:
-                                oc["profile_picture"] = msg.attachments[0].url.split("?")[0]
-                                refreshed += 1
-                                updated = True
-                                break
-                        except Exception:
-                            pass
-            if updated:
-                continue
-
             try:
-                # Fetch the image bytes directly via HTTP since the URL may still be valid
                 async with _http_session.get(url) as resp:
                     if resp.status == 200:
-                        img_bytes = await resp.read()
-                        content_type = resp.headers.get("Content-Type", "image/png")
-                        ext = content_type.split("/")[-1].split(";")[0] or "png"
-                        file_obj = discord.File(io.BytesIO(img_bytes), filename=f"oc_{oc_key}.{ext}")
+                        file_obj = discord.File(io.BytesIO(await resp.read()), filename=f"oc_{oc_key}.png")
                         for guild in bot.guilds:
                             ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
                             if ch:
                                 msg = await ch.send(file=file_obj)
-                                try:
-                                    await msg.pin()
-                                except Exception:
-                                    pass
                                 if msg.attachments:
                                     oc["profile_picture"] = msg.attachments[0].url.split("?")[0]
                                     oc["profile_picture_msg_id"] = msg.id
                                     refreshed += 1
                                     break
-                    else:
-                        failed += 1
-            except Exception as e:
-                log.warning("refresh_assets: OC '%s' profile picture failed: %s", oc_key, e)
-                failed += 1
+                    else: failed += 1
+            except: failed += 1
 
     # -- Instagram post photos --
-    for post_id, post in data["instagram"].items():
-        new_photos = []
-        for photo_url in post.get("photos", []):
-            if _is_cdn_attachment(photo_url):
-                try:
-                    async with _http_session.get(photo_url) as resp:
-                        if resp.status == 200:
-                            img_bytes = await resp.read()
-                            content_type = resp.headers.get("Content-Type", "image/png")
-                            ext = content_type.split("/")[-1].split(";")[0] or "png"
-                            file_obj = discord.File(io.BytesIO(img_bytes), filename=f"ig_{post_id}.{ext}")
-                            for guild in bot.guilds:
-                                ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
-                                if ch:
-                                    msg = await ch.send(file=file_obj)
-                                    try:
-                                        await msg.pin()
-                                    except Exception:
-                                        pass
-                                    if msg.attachments:
-                                        new_photos.append(msg.attachments[0].url.split("?")[0])
-                                        refreshed += 1
-                                        break
-                        else:
-                            new_photos.append(photo_url)
-                            failed += 1
-                except Exception as e:
-                    log.warning("refresh_assets: IG post '%s' photo failed: %s", post_id, e)
-                    new_photos.append(photo_url)
-                    failed += 1
-            else:
-                new_photos.append(photo_url)
-        post["photos"] = new_photos
+    for post_id, post in data.get("instagram", {}).items():
+        new_media = []
+        for m in post.get("media", []):
+            if m["type"] != "image" or not _is_cdn_attachment(m["url"]):
+                new_media.append(m)
+                continue
+            try:
+                async with _http_session.get(m["url"]) as resp:
+                    if resp.status == 200:
+                        file_obj = discord.File(io.BytesIO(await resp.read()), filename=f"ig_{post_id}.png")
+                        for guild in bot.guilds:
+                            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+                            if ch:
+                                msg = await ch.send(file=file_obj)
+                                if msg.attachments:
+                                    new_media.append({"url": msg.attachments[0].url.split("?")[0], "type": "image"})
+                                    refreshed += 1
+                                    break
+                    else:
+                        new_media.append(m)
+                        failed += 1
+            except:
+                new_media.append(m)
+                failed += 1
+        post["media"] = new_media
+        post["photos"] = [m["url"] for m in new_media if m["type"] == "image"]
+
+    # -- Twitter media --
+    for tweet_id, tweet in data.get("twitter", {}).items():
+        new_media = []
+        for m in tweet.get("media", []):
+            if m["type"] != "image" or not _is_cdn_attachment(m["url"]):
+                new_media.append(m)
+                continue
+            try:
+                async with _http_session.get(m["url"]) as resp:
+                    if resp.status == 200:
+                        file_obj = discord.File(io.BytesIO(await resp.read()), filename=f"tw_{tweet_id}.png")
+                        for guild in bot.guilds:
+                            ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+                            if ch:
+                                msg = await ch.send(file=file_obj)
+                                if msg.attachments:
+                                    new_media.append({"url": msg.attachments[0].url.split("?")[0], "type": "image"})
+                                    refreshed += 1
+                                    break
+                    else:
+                        new_media.append(m)
+                        failed += 1
+            except:
+                new_media.append(m)
+                failed += 1
+        tweet["media"] = new_media
 
     await save_and_backup(data, reason="refresh_assets")
 
@@ -3412,6 +5537,14 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
     embed.add_field(name="❌ Failed", value=str(failed), inline=True)
     embed.set_footer(text=f"Run by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.event
+async def on_close():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        log.info("on_close: aiohttp session closed cleanly.")
 
 
 # ─── Shutdown & Emergency Backup ───────────────────────────────────────────────
@@ -3467,9 +5600,18 @@ async def startup_cmd(interaction: discord.Interaction):
         (check_birthdays, "check_birthdays"),
         (check_scheduled, "check_scheduled"),
         (check_reminders, "check_reminders"),
-        (auto_backup_db, "auto_backup_db")
+        (auto_backup_db, "auto_backup_db"),
+        (run_weekly_evaluations, "run_weekly_evaluations"),
+        (weverse_billing_loop, "weverse_billing_loop"),
     ]:
-        if not task_obj.is_running():
+        if task_obj is run_weekly_evaluations and not task_obj.is_running():
+            data = load_data()
+            if data.get("evaluation_config", {}).get("running"):
+                global _EVAL_SKIP_FIRST_TICK
+                _EVAL_SKIP_FIRST_TICK = True
+            task_obj.start()
+            task_lines.append(f"🔄 `{label}` — restarted.")
+        elif not task_obj.is_running():
             task_obj.start()
             task_lines.append(f"🔄 `{label}` — restarted.")
         else:
