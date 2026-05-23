@@ -52,6 +52,20 @@ BIRTHDAY_FORMAT           = "%Y/%m/%d"
 BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [1, 2, 3, 4]
 MAX_PHOTOS                = 10
+
+# Channels that must exist for the bot to function correctly.
+# Each entry: (name, topic, make_private, category_hint)
+# make_private=True means only the bot can see it; False means default permissions.
+REQUIRED_CHANNELS: list[tuple[str, str, bool, Optional[str]]] = [
+    (LOG_CHANNEL_NAME,          "📋 OC registrations, dorm assignments, and birthday announcements.", False, None),
+    (AUDIT_CHANNEL_NAME,        "🔍 Full user action audit trail. Do not delete messages here.",      False, None),
+    (DEBUT_CHANNEL_NAME,        "🎤 OC debut announcements.",                                         False, None),
+    (NEWS_CHANNEL_NAME,         "📢 Server announcements and news posts.",                            False, None),
+    (DEV_RESPONSE_CHANNEL_NAME, "💬 Bot developer DM response relay.",                               False, None),
+    (INSTAGRAM_CHANNEL_NAME,    "📸 OC Instagram feed.",                                             False, None),
+    (TWITTER_CHANNEL_NAME,      "🐦 OC Twitter/X feed.",                                             False, None),
+    (WEVERSE_CHANNEL_NAME,      "💜 Weverse posts and fan updates.",                                 False, None),
+]
 PORT                      = int(os.environ.get("PORT", 8080))
 KST                       = timezone(timedelta(hours=9))  # GMT+9, no DST
 PRIMARY_GUILD_ID          = int(os.environ.get("PRIMARY_GUILD_ID", "0"))
@@ -795,6 +809,57 @@ async def audit(guild: discord.Guild, message: str) -> None:
     if ch:
         ts = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
         await ch.send(f"[{ts}]  {message}")
+
+async def ensure_required_channels(guild: discord.Guild) -> None:
+    """
+    Idempotently creates any REQUIRED_CHANNELS entries that do not already
+    exist in the given guild. Existing channels (matched by name, case-insensitive)
+    are left completely untouched — their topic, permissions, and position are
+    never modified. Only absent channels are created.
+    """
+    existing_names = {ch.name.lower() for ch in guild.text_channels}
+    for ch_name, topic, make_private, category_hint in REQUIRED_CHANNELS:
+        if ch_name.lower() in existing_names:
+            continue  # Already present — do nothing.
+        try:
+            category = None
+            if category_hint:
+                category = discord.utils.get(guild.categories, name=category_hint)
+            overwrites: dict = {}
+            if make_private:
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    guild.me: discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True,
+                        read_message_history=True
+                    ),
+                }
+            await guild.create_text_channel(
+                ch_name,
+                topic=topic,
+                category=category,
+                overwrites=overwrites if overwrites else discord.utils.MISSING,
+            )
+            log.info(
+                "ensure_required_channels: created #%s in guild '%s' (%s).",
+                ch_name, guild.name, guild.id
+            )
+        except discord.Forbidden:
+            log.warning(
+                "ensure_required_channels: missing Manage Channels permission "
+                "in guild '%s' (%s) — cannot create #%s.",
+                guild.name, guild.id, ch_name
+            )
+        except discord.HTTPException as e:
+            log.error(
+                "ensure_required_channels: HTTPException creating #%s in guild '%s': %s",
+                ch_name, guild.name, e
+            )
+        except Exception as e:
+            log.error(
+                "ensure_required_channels: unexpected error creating #%s in guild '%s': %s",
+                ch_name, guild.name, e
+            )
 
 # ─── OC embed ──────────────────────────────────────────────────────────────────
 def build_oc_embed(oc: dict, key: str) -> discord.Embed:
@@ -2153,6 +2218,9 @@ async def on_ready():
                 except Exception as e:
                     log.warning("Could not create %s channel: %s", ASSET_CHANNEL_NAME, e)
 
+            # Ensure all required operational channels exist.
+            await ensure_required_channels(guild)
+
         DB_LOADED = True
 
     schema_violations = _validate_command_tree_schema(bot.tree)
@@ -2196,6 +2264,13 @@ async def on_ready():
             _EVAL_SKIP_FIRST_TICK = skip_first
         run_weekly_evaluations.start()
     if not weverse_billing_loop.is_running(): weverse_billing_loop.start()
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Ensure all required channels exist when the bot joins a new guild."""
+    log.info("on_guild_join: joined guild '%s' (%s) — ensuring required channels.", guild.name, guild.id)
+    await ensure_required_channels(guild)
 
 
 # ─── Automated Backup loop ─────────────────────────────────────────────────────
@@ -2608,6 +2683,167 @@ async def evaluation_run_cmd(interaction: discord.Interaction):
     except Exception as e:
         log.error(f"evaluation_run error: {e}")
         await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+@bot.tree.command(
+    name="oc_add",
+    description="register a new OC into the system."
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    name            = "the OC's display name (must be unique)",
+    birthday        = "format: YYYY/MM/DD (e.g. 2001/03/15)",
+    gender          = "the OC's gender (max 50 chars)",
+    pronouns        = "the OC's pronouns (max 50 chars)",
+    face_claim      = "the OC's face claim (max 100 chars)",
+    main_skill      = "the OC's main skill (max 100 chars)",
+    ethnicity       = "the OC's ethnicity (max 100 chars)",
+    nationality     = "the OC's nationality (max 100 chars)",
+    profile_picture = "direct image URL ending in .png/.jpg/.jpeg/.gif/.webp (optional)",
+    form_link       = "any valid http/https URL (optional)",
+)
+async def oc_add_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    birthday: str,
+    gender: str,
+    pronouns: str,
+    face_claim: str,
+    main_skill: str,
+    ethnicity: str,
+    nationality: str,
+    profile_picture: Optional[str] = None,
+    form_link: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+
+        # 1. Duplicate key check
+        key = oc_key_of(name)
+        if key in data["ocs"]:
+            return await interaction.followup.send(
+                f"❌ An OC with the name **{name}** already exists (key: `{key}`). Choose a different name.",
+                ephemeral=True
+            )
+
+        # 2. Birthday parse check
+        try:
+            parsed_bday = datetime.strptime(birthday.strip(), BIRTHDAY_FORMAT)
+        except ValueError:
+            return await interaction.followup.send(
+                f"❌ Invalid birthday format. Use **{BIRTHDAY_DISPLAY}** (e.g. `2001/03/15`).",
+                ephemeral=True
+            )
+
+        # 3. Birthday sanity check
+        today = date.today()
+        bday_date = parsed_bday.date()
+        if bday_date > today or bday_date < date(today.year - 120, today.month, today.day):
+            return await interaction.followup.send(
+                "❌ Birthday must be a real past date.",
+                ephemeral=True
+            )
+
+        # 4. Field length checks
+        field_limits = [
+            ("gender",      gender,      50),
+            ("pronouns",    pronouns,    50),
+            ("face_claim",  face_claim,  100),
+            ("main_skill",  main_skill,  100),
+            ("ethnicity",   ethnicity,   100),
+            ("nationality", nationality, 100),
+        ]
+        for field_name, field_val, limit in field_limits:
+            if len(field_val) > limit:
+                return await interaction.followup.send(
+                    f"❌ `{field_name}` exceeds the maximum length of {limit} characters "
+                    f"(currently {len(field_val)} chars).",
+                    ephemeral=True
+                )
+
+        # 5. Profile picture URL check
+        if profile_picture and not valid_image_url(profile_picture):
+            return await interaction.followup.send(
+                "❌ Profile picture must be a direct image URL ending in .png, .jpg, .jpeg, .gif, or .webp.",
+                ephemeral=True
+            )
+
+        # 6. Form link URL check
+        if form_link and not valid_url(form_link):
+            return await interaction.followup.send(
+                "❌ Form link must be a valid URL starting with http:// or https://.",
+                ephemeral=True
+            )
+
+        # Profile picture persistence handling
+        cleaned_pic_url = None
+        if profile_picture:
+            cleaned_pic_url = profile_picture.split("?")[0]
+            if _is_cdn_attachment(profile_picture):
+                log.warning(
+                    "oc_add: profile_picture for '%s' is a Discord CDN attachment URL — "
+                    "it may expire. User should re-upload via /oc_edit.", key
+                )
+
+        # Build and insert OC record
+        oc = {
+            "name":            name.strip(),
+            "birthday":        birthday.strip(),
+            "gender":          gender.strip(),
+            "pronouns":        pronouns.strip(),
+            "face_claim":      face_claim.strip(),
+            "main_skill":      main_skill.strip(),
+            "ethnicity":       ethnicity.strip(),
+            "nationality":     nationality.strip(),
+            "profile_picture": cleaned_pic_url,
+            "form_link":       form_link.strip() if form_link else None,
+            "balance":         500_000,
+            "owner_id":        interaction.user.id,
+            "registered_at":   now_iso(),
+        }
+        data["ocs"][key] = oc
+
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="oc_add"))
+
+        # Success response (ephemeral)
+        success_embed = build_oc_embed(oc, key)
+        await interaction.followup.send(
+            f"✅ **{oc['name']}** has been registered!",
+            embed=success_embed,
+            ephemeral=True
+        )
+
+        # Log channel post
+        if guild:
+            log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+            if log_ch:
+                log_embed = discord.Embed(
+                    title="🎉 New OC Registered",
+                    color=discord.Color.green(),
+                    description=f"**{oc['name']}** has been registered by <@{interaction.user.id}>!",
+                    timestamp=now_utc()
+                )
+                if cleaned_pic_url:
+                    log_embed.set_thumbnail(url=cleaned_pic_url)
+                log_embed.add_field(name="Birthday",    value=oc["birthday"],    inline=True)
+                log_embed.add_field(name="Gender",      value=oc["gender"],      inline=True)
+                log_embed.add_field(name="Pronouns",    value=oc["pronouns"],    inline=True)
+                log_embed.add_field(name="Face Claim",  value=oc["face_claim"],  inline=True)
+                log_embed.add_field(name="Main Skill",  value=oc["main_skill"],  inline=True)
+                log_embed.add_field(name="Ethnicity",   value=oc["ethnicity"],   inline=True)
+                log_embed.add_field(name="Nationality", value=oc["nationality"], inline=True)
+                log_embed.set_footer(text=f"OC ID: {key}")
+                await log_ch.send(embed=log_embed)
+
+        # Audit trail
+        await audit(guild, f"oc_add: '{key}' registered by {interaction.user} ({interaction.user.id})")
+
+    except Exception as e:
+        log.error("oc_add error: %s", e)
+        await interaction.followup.send("❌ An unexpected error occurred. Please try again.", ephemeral=True)
 
 @bot.tree.command(
     name="balance_edit",
