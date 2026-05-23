@@ -15,7 +15,9 @@ from datetime import datetime, date, timezone, timedelta
 import datetime as _dt
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
-
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
 import aiohttp
 
 try:
@@ -23,9 +25,6 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # Python < 3.9
 
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -862,6 +861,13 @@ async def ensure_required_channels(guild: discord.Guild) -> None:
             )
 
 # ─── OC embed ──────────────────────────────────────────────────────────────────
+def _trunc(val, limit: int = 1024) -> str:
+    """Truncate a string to `limit` chars, appending '...' if cut."""
+    if val is None:
+        return "—"
+    s = str(val)
+    return s if len(s) <= limit else s[:limit - 1] + "..."
+
 def build_oc_embed(oc: dict, key: str) -> discord.Embed:
     age     = get_age(oc["birthday"])
     age_str = f" ({age} y/o)" if age is not None else ""
@@ -869,12 +875,12 @@ def build_oc_embed(oc: dict, key: str) -> discord.Embed:
     if oc.get("profile_picture"):
         embed.set_thumbnail(url=oc["profile_picture"])
     embed.add_field(name="Birthday",    value=f"{format_birthday_long(oc['birthday'])}{age_str}", inline=True)
-    embed.add_field(name="Gender",      value=oc["gender"],                 inline=True)
-    embed.add_field(name="Pronouns",    value=oc["pronouns"],               inline=True)
-    embed.add_field(name="Face Claim",  value=oc["face_claim"],             inline=True)
-    embed.add_field(name="Main Skill",  value=oc["main_skill"],             inline=True)
-    embed.add_field(name="Ethnicity",   value=oc["ethnicity"],              inline=True)
-    embed.add_field(name="Nationality", value=oc["nationality"],            inline=True)
+    embed.add_field(name="Gender",      value=_trunc(oc["gender"]),       inline=True)
+    embed.add_field(name="Pronouns",    value=_trunc(oc["pronouns"]),     inline=True)
+    embed.add_field(name="Face Claim",  value=_trunc(oc["face_claim"]),   inline=True)
+    embed.add_field(name="Main Skill",  value=_trunc(oc["main_skill"]),   inline=True)
+    embed.add_field(name="Ethnicity",   value=_trunc(oc["ethnicity"]),    inline=True)
+    embed.add_field(name="Nationality", value=_trunc(oc["nationality"]),  inline=True)
     balance = oc.get("balance", 500_000)
     embed.add_field(name="Balance",     value=f"₩{balance:,}",                     inline=True)
     if oc.get("form_link"):
@@ -2693,14 +2699,15 @@ async def evaluation_run_cmd(interaction: discord.Interaction):
 @app_commands.describe(
     name            = "the OC's display name (must be unique)",
     birthday        = "format: YYYY/MM/DD (e.g. 2001/03/15)",
-    gender          = "the OC's gender (max 50 chars)",
-    pronouns        = "the OC's pronouns (max 50 chars)",
-    face_claim      = "the OC's face claim (max 100 chars)",
-    main_skill      = "the OC's main skill (max 100 chars)",
-    ethnicity       = "the OC's ethnicity (max 100 chars)",
-    nationality     = "the OC's nationality (max 100 chars)",
-    profile_picture = "direct image URL ending in .png/.jpg/.jpeg/.gif/.webp (optional)",
-    form_link       = "any valid http/https URL (optional)",
+    gender               = "the OC's gender",
+    pronouns             = "the OC's pronouns",
+    face_claim           = "the OC's face claim",
+    main_skill           = "the OC's main skill",
+    ethnicity            = "the OC's ethnicity",
+    nationality          = "the OC's nationality",
+    profile_picture      = "direct image URL ending in .png/.jpg/.jpeg/.gif/.webp (optional)",
+    profile_picture_file = "upload an image file directly as the OC's profile picture (alternative to URL)",
+    form_link            = "any valid http/https URL (optional)",
 )
 async def oc_add_cmd(
     interaction: discord.Interaction,
@@ -2713,6 +2720,7 @@ async def oc_add_cmd(
     ethnicity: str,
     nationality: str,
     profile_picture: Optional[str] = None,
+    profile_picture_file: Optional[discord.Attachment] = None,
     form_link: Optional[str] = None,
 ):
     guild = resolve_guild(interaction)
@@ -2746,29 +2754,36 @@ async def oc_add_cmd(
                 ephemeral=True
             )
 
-        # 4. Field length checks
-        field_limits = [
-            ("gender",      gender,      50),
-            ("pronouns",    pronouns,    50),
-            ("face_claim",  face_claim,  100),
-            ("main_skill",  main_skill,  100),
-            ("ethnicity",   ethnicity,   100),
-            ("nationality", nationality, 100),
-        ]
-        for field_name, field_val, limit in field_limits:
-            if len(field_val) > limit:
+        # 5. Resolve profile picture from file upload OR URL
+        cleaned_pic_url: Optional[str] = None
+        if profile_picture_file is not None:
+            if not profile_picture_file.content_type or \
+               not profile_picture_file.content_type.startswith("image/"):
                 return await interaction.followup.send(
-                    f"❌ `{field_name}` exceeds the maximum length of {limit} characters "
-                    f"(currently {len(field_val)} chars).",
-                    ephemeral=True
+                    "❌ `profile_picture_file` must be an image (png, jpg, gif, webp, etc.).",
+                    ephemeral=True,
                 )
-
-        # 5. Profile picture URL check
-        if profile_picture and not valid_image_url(profile_picture):
-            return await interaction.followup.send(
-                "❌ Profile picture must be a direct image URL ending in .png, .jpg, .jpeg, .gif, or .webp.",
-                ephemeral=True
-            )
+            result = await persist_image_attachment(profile_picture_file, store_msg_id=False)
+            if result is None:
+                return await interaction.followup.send(
+                    "❌ Failed to persist the uploaded profile picture. "
+                    "Ensure the `#bot-assets` channel exists and the bot can send files there.",
+                    ephemeral=True,
+                )
+            cleaned_pic_url = result[0]
+            if _is_cdn_attachment(cleaned_pic_url):
+                log.info(
+                    "oc_add: profile_picture for '%s' is a Discord CDN URL; "
+                    "persisting via /oc_edit or direct upload is recommended.", key
+                )
+        elif profile_picture is not None:
+            if not valid_image_url(profile_picture):
+                return await interaction.followup.send(
+                    "❌ Profile picture must be a direct image URL ending in "
+                    ".png, .jpg, .jpeg, .gif, or .webp.",
+                    ephemeral=True,
+                )
+            cleaned_pic_url = profile_picture.split("?")[0]
 
         # 6. Form link URL check
         if form_link and not valid_url(form_link):
@@ -2777,15 +2792,6 @@ async def oc_add_cmd(
                 ephemeral=True
             )
 
-        # Profile picture persistence handling
-        cleaned_pic_url = None
-        if profile_picture:
-            cleaned_pic_url = profile_picture.split("?")[0]
-            if _is_cdn_attachment(profile_picture):
-                log.warning(
-                    "oc_add: profile_picture for '%s' is a Discord CDN attachment URL — "
-                    "it may expire. User should re-upload via /oc_edit.", key
-                )
 
         # Build and insert OC record
         oc = {
@@ -2844,6 +2850,366 @@ async def oc_add_cmd(
     except Exception as e:
         log.error("oc_add error: %s", e)
         await interaction.followup.send("❌ An unexpected error occurred. Please try again.", ephemeral=True)
+
+@bot.tree.command(
+    name="oc_edit",
+    description="edit an existing OC's fields or replace their profile picture.",
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name              = "the OC whose fields you want to edit",
+    gender               = "new gender value (leave blank to keep current)",
+    pronouns             = "new pronouns value (leave blank to keep current)",
+    face_claim           = "new face claim value (leave blank to keep current)",
+    main_skill           = "new main skill value (leave blank to keep current)",
+    ethnicity            = "new ethnicity value (leave blank to keep current)",
+    nationality          = "new nationality value (leave blank to keep current)",
+    profile_picture      = "new direct image URL (leave blank to keep current)",
+    profile_picture_file = "upload a new profile picture image file directly",
+    form_link            = "new form URL (leave blank to keep current; set to 'clear' to remove)",
+)
+async def oc_edit_cmd(
+    interaction: discord.Interaction,
+    oc_name: str,
+    gender: Optional[str]             = None,
+    pronouns: Optional[str]           = None,
+    face_claim: Optional[str]         = None,
+    main_skill: Optional[str]         = None,
+    ethnicity: Optional[str]          = None,
+    nationality: Optional[str]        = None,
+    profile_picture: Optional[str]    = None,
+    profile_picture_file: Optional[discord.Attachment] = None,
+    form_link: Optional[str]          = None,
+):
+    guild = resolve_guild(interaction)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+        key = oc_key_of(oc_name)
+        oc = data["ocs"].get(key)
+        if not oc:
+            return await interaction.followup.send(
+                f"❌ No OC named **{oc_name}** found.", ephemeral=True
+            )
+
+        if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.followup.send(
+                "❌ You do not own this OC.", ephemeral=True
+            )
+
+        changed_fields: list[str] = []
+
+        if gender is not None:
+            oc["gender"] = gender.strip()
+            changed_fields.append("gender")
+        if pronouns is not None:
+            oc["pronouns"] = pronouns.strip()
+            changed_fields.append("pronouns")
+        if face_claim is not None:
+            oc["face_claim"] = face_claim.strip()
+            changed_fields.append("face_claim")
+        if main_skill is not None:
+            oc["main_skill"] = main_skill.strip()
+            changed_fields.append("main_skill")
+        if ethnicity is not None:
+            oc["ethnicity"] = ethnicity.strip()
+            changed_fields.append("ethnicity")
+        if nationality is not None:
+            oc["nationality"] = nationality.strip()
+            changed_fields.append("nationality")
+
+        # Resolve profile picture
+        if profile_picture_file is not None:
+            if not profile_picture_file.content_type or \
+               not profile_picture_file.content_type.startswith("image/"):
+                return await interaction.followup.send(
+                    "❌ `profile_picture_file` must be an image (png, jpg, gif, webp, etc.).",
+                    ephemeral=True,
+                )
+            result = await persist_image_attachment(profile_picture_file, store_msg_id=False)
+            if result is None:
+                return await interaction.followup.send(
+                    "❌ Failed to persist the uploaded profile picture. "
+                    "Ensure the `#bot-assets` channel exists and the bot can send files there.",
+                    ephemeral=True,
+                )
+            oc["profile_picture"] = result[0]
+            changed_fields.append("profile_picture")
+        elif profile_picture is not None:
+            if not valid_image_url(profile_picture):
+                return await interaction.followup.send(
+                    "❌ Profile picture must be a direct image URL ending in "
+                    ".png, .jpg, .jpeg, .gif, or .webp.",
+                    ephemeral=True,
+                )
+            oc["profile_picture"] = profile_picture.split("?")[0]
+            changed_fields.append("profile_picture")
+
+        # form_link special case
+        if form_link is not None:
+            if form_link.strip().lower() == "clear":
+                oc["form_link"] = None
+            elif not valid_url(form_link):
+                return await interaction.followup.send(
+                    "❌ Form link must be a valid URL starting with http:// or https://.",
+                    ephemeral=True,
+                )
+            else:
+                oc["form_link"] = form_link.strip()
+            changed_fields.append("form_link")
+
+        if not changed_fields:
+            return await interaction.followup.send(
+                "❌ No changes provided. Pass at least one field to update.", ephemeral=True
+            )
+
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="oc_edit"))
+
+        success_embed = build_oc_embed(oc, key)
+        await interaction.followup.send(
+            f"✅ **{oc['name']}** has been updated!",
+            embed=success_embed,
+            ephemeral=True,
+        )
+
+        if guild:
+            log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+            if log_ch:
+                log_embed = discord.Embed(
+                    title="✏️ OC Edited",
+                    color=discord.Color.blurple(),
+                    description=(
+                        f"**{oc['name']}** was edited by <@{interaction.user.id}>.\n"
+                        f"Fields changed: `{'`, `'.join(changed_fields)}`"
+                    ),
+                    timestamp=now_utc(),
+                )
+                if oc.get("profile_picture"):
+                    log_embed.set_thumbnail(url=oc["profile_picture"])
+                log_embed.set_footer(text=f"OC ID: {key}")
+                await log_ch.send(embed=log_embed)
+
+        await audit(
+            guild,
+            f"oc_edit: '{key}' edited by {interaction.user} ({interaction.user.id}). "
+            f"fields: {changed_fields}",
+        )
+
+    except Exception as e:
+        log.error("oc_edit error: %s", e)
+        await interaction.followup.send("❌ An unexpected error occurred. Please try again.", ephemeral=True)
+
+
+# ─── OC List paginator ─────────────────────────────────────────────────────────
+class OcListPaginatorView(discord.ui.View):
+    """Paginator for /oc_list results. Owned by a single invoker."""
+    PAGE_SIZE = 10  # OCs per embed page
+
+    def __init__(
+        self,
+        pages: list,
+        invoker_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.pages       = pages
+        self.current     = 0
+        self.invoker_id  = invoker_id
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "❌ this list view belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _sync_buttons(self) -> None:
+        self.prev_btn.disabled = (self.current == 0)
+        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="oclist_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="oclist_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+def _build_oc_list_pages(
+    matched: list,
+    filter_desc: str,
+    page_size: int = OcListPaginatorView.PAGE_SIZE,
+) -> list:
+    """
+    Build paginated embeds for /oc_list.
+    Each entry shows: OC name (bolded), owner mention, and a compact
+    one-line summary of key attributes.
+    """
+    if not matched:
+        embed = discord.Embed(
+            title="OC List",
+            description=f"No OCs matched the given criteria.\n*Filter: {filter_desc}*",
+            color=discord.Color.light_grey(),
+        )
+        return [embed]
+
+    pages: list = []
+    total  = len(matched)
+    chunks = [matched[i : i + page_size] for i in range(0, total, page_size)]
+
+    for page_num, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title="📋 OC List",
+            description=(
+                f"**{total}** OC(s) found  •  page {page_num}/{len(chunks)}"
+                + (f"\n*Filter: {filter_desc}*" if filter_desc else "")
+            ),
+            color=discord.Color.blurple(),
+        )
+        for key, oc in chunk:
+            owner_id  = oc.get("owner_id")
+            owner_str = f"<@{owner_id}>" if owner_id else "unowned"
+            summary = (
+                f"**{oc['name']}** · {owner_str}\n"
+                f"  gender: {_trunc(oc.get('gender', '—'), 60)}  "
+                f"| pronouns: {_trunc(oc.get('pronouns', '—'), 40)}\n"
+                f"  face claim: {_trunc(oc.get('face_claim', '—'), 80)}  "
+                f"| skill: {_trunc(oc.get('main_skill', '—'), 60)}\n"
+                f"  ethnicity: {_trunc(oc.get('ethnicity', '—'), 60)}  "
+                f"| nationality: {_trunc(oc.get('nationality', '—'), 60)}"
+            )
+            embed.add_field(name="\u200b", value=summary, inline=False)
+
+        if matched and matched[0][1].get("profile_picture") and len(chunks) == 1:
+            # Single-page results: show the first OC's picture as a decorative thumbnail.
+            embed.set_thumbnail(url=matched[0][1]["profile_picture"])
+
+        pages.append(embed)
+
+    return pages
+
+
+@bot.tree.command(
+    name="oc_list",
+    description="browse, filter, and search all registered OCs.",
+)
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    search      = "partial match against OC name (case-insensitive)",
+    gender      = "filter: partial match on gender field",
+    pronouns    = "filter: partial match on pronouns field",
+    face_claim  = "filter: partial match on face claim field",
+    main_skill  = "filter: partial match on main skill field",
+    ethnicity   = "filter: partial match on ethnicity field",
+    nationality = "filter: partial match on nationality field",
+    owner       = "filter: show only OCs owned by this Discord user",
+    sort_by     = "sort results (default: name a→z)",
+)
+@app_commands.choices(sort_by=[
+    app_commands.Choice(name="Name A → Z",               value="name_asc"),
+    app_commands.Choice(name="Name Z → A",               value="name_desc"),
+    app_commands.Choice(name="Registered (newest first)", value="reg_desc"),
+    app_commands.Choice(name="Registered (oldest first)", value="reg_asc"),
+    app_commands.Choice(name="Balance (highest first)",   value="balance_desc"),
+    app_commands.Choice(name="Balance (lowest first)",    value="balance_asc"),
+])
+async def oc_list_cmd(
+    interaction: discord.Interaction,
+    search:      Optional[str]            = None,
+    gender:      Optional[str]            = None,
+    pronouns:    Optional[str]            = None,
+    face_claim:  Optional[str]            = None,
+    main_skill:  Optional[str]            = None,
+    ethnicity:   Optional[str]            = None,
+    nationality: Optional[str]            = None,
+    owner:       Optional[discord.Member] = None,
+    sort_by:     Optional[str]            = None,
+):
+    await interaction.response.defer()
+    try:
+        data = load_data()
+        ocs  = data.get("ocs", {})
+
+        # ── Apply filters (all partial, case-insensitive) ─────────────────────
+        field_filters: dict = {}
+        if gender:      field_filters["gender"]      = gender.strip().lower()
+        if pronouns:    field_filters["pronouns"]    = pronouns.strip().lower()
+        if face_claim:  field_filters["face_claim"]  = face_claim.strip().lower()
+        if main_skill:  field_filters["main_skill"]  = main_skill.strip().lower()
+        if ethnicity:   field_filters["ethnicity"]   = ethnicity.strip().lower()
+        if nationality: field_filters["nationality"] = nationality.strip().lower()
+
+        search_term = search.strip().lower() if search else None
+
+        matched: list = []
+        for key, oc in ocs.items():
+            # Name search (partial match)
+            if search_term and search_term not in oc.get("name", "").lower():
+                continue
+            # Per-attribute partial filters
+            skip = False
+            for field, needle in field_filters.items():
+                haystack = str(oc.get(field, "")).lower()
+                if needle not in haystack:
+                    skip = True
+                    break
+            if skip:
+                continue
+            # Owner filter
+            if owner and oc.get("owner_id") != owner.id:
+                continue
+            matched.append((key, oc))
+
+        # ── Sort ──────────────────────────────────────────────────────────────
+        sort_key = sort_by or "name_asc"
+        if sort_key == "name_asc":
+            matched.sort(key=lambda t: t[1].get("name", "").lower())
+        elif sort_key == "name_desc":
+            matched.sort(key=lambda t: t[1].get("name", "").lower(), reverse=True)
+        elif sort_key == "reg_desc":
+            matched.sort(key=lambda t: t[1].get("registered_at", ""), reverse=True)
+        elif sort_key == "reg_asc":
+            matched.sort(key=lambda t: t[1].get("registered_at", ""))
+        elif sort_key == "balance_desc":
+            matched.sort(key=lambda t: t[1].get("balance", 0), reverse=True)
+        elif sort_key == "balance_asc":
+            matched.sort(key=lambda t: t[1].get("balance", 0))
+
+        # ── Build filter description for embed footer ─────────────────────────
+        desc_parts: list = []
+        if search_term:
+            desc_parts.append(f'name contains "{search}"')
+        for field, needle in field_filters.items():
+            desc_parts.append(f'{field} contains "{needle}"')
+        if owner:
+            desc_parts.append(f"owner = {owner.display_name}")
+        filter_desc = "  •  ".join(desc_parts) if desc_parts else "none"
+
+        # ── Build and send paginator ──────────────────────────────────────────
+        pages = _build_oc_list_pages(matched, filter_desc)
+        if len(pages) == 1 and not matched:
+            # Empty result — no paginator needed.
+            return await interaction.followup.send(embed=pages[0])
+        view = OcListPaginatorView(pages=pages, invoker_id=interaction.user.id)
+        await interaction.followup.send(embed=pages[0], view=view)
+
+    except Exception as e:
+        log.error("oc_list error: %s", e)
+        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
+
 
 @bot.tree.command(
     name="balance_edit",
