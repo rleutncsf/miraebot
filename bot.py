@@ -3003,212 +3003,56 @@ async def oc_edit_cmd(
 
 
 # ─── OC List paginator ─────────────────────────────────────────────────────────
-class OcListPaginatorView(discord.ui.View):
-    """Paginator for /oc_list results. Owned by a single invoker."""
-    PAGE_SIZE = 10  # OCs per embed page
-
-    def __init__(
-        self,
-        pages: list,
-        invoker_id: int,
-    ):
+class OCPaginatorView(discord.ui.View):
+    def __init__(self, ocs: list, filters_text: str = ""):
         super().__init__(timeout=300)
-        self.pages       = pages
-        self.current     = 0
-        self.invoker_id  = invoker_id
-        self._sync_buttons()
+        self.ocs = ocs
+        self.filters_text = filters_text
+        self.current_index = 0
+        self._update_buttons()
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "❌ this list view belongs to someone else.", ephemeral=True
-            )
-            return False
-        return True
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.current_index == 0
+        self.next_btn.disabled = self.current_index == len(self.ocs) - 1
 
-    def _sync_buttons(self) -> None:
-        self.prev_btn.disabled = (self.current == 0)
-        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+    def get_embed(self):
+        key, oc = self.ocs[self.current_index]
+        embed = build_oc_embed(oc, key)
+        count_label = f"oc {self.current_index + 1} of {len(self.ocs)}"
+        if self.filters_text:
+            count_label += f"  •  {self.filters_text}"
+        embed.set_footer(text=f"oc id: {key}  |  {count_label}")
+        return embed
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="oclist_prev")
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="prev_oc")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current -= 1
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+        self.current_index -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="oclist_next")
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="next_oc")
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current += 1
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
-
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            item.disabled = True
+        self.current_index += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
 
-def _build_oc_list_pages(
-    matched: list,
-    filter_desc: str,
-    page_size: int = OcListPaginatorView.PAGE_SIZE,
-) -> list:
-    """
-    Build paginated embeds for /oc_list.
-    Each entry shows: OC name (bolded), owner mention, and a compact
-    one-line summary of key attributes.
-    """
-    if not matched:
-        embed = discord.Embed(
-            title="OC List",
-            description=f"No OCs matched the given criteria.\n*Filter: {filter_desc}*",
-            color=discord.Color.light_grey(),
-        )
-        return [embed]
-
-    pages: list = []
-    total  = len(matched)
-    chunks = [matched[i : i + page_size] for i in range(0, total, page_size)]
-
-    for page_num, chunk in enumerate(chunks, start=1):
-        embed = discord.Embed(
-            title="📋 OC List",
-            description=(
-                f"**{total}** OC(s) found  •  page {page_num}/{len(chunks)}"
-                + (f"\n*Filter: {filter_desc}*" if filter_desc else "")
-            ),
-            color=discord.Color.blurple(),
-        )
-        for key, oc in chunk:
-            owner_id  = oc.get("owner_id")
-            owner_str = f"<@{owner_id}>" if owner_id else "unowned"
-            summary = (
-                f"**{oc['name']}** · {owner_str}\n"
-                f"  gender: {_trunc(oc.get('gender', '—'), 60)}  "
-                f"| pronouns: {_trunc(oc.get('pronouns', '—'), 40)}\n"
-                f"  face claim: {_trunc(oc.get('face_claim', '—'), 80)}  "
-                f"| skill: {_trunc(oc.get('main_skill', '—'), 60)}\n"
-                f"  ethnicity: {_trunc(oc.get('ethnicity', '—'), 60)}  "
-                f"| nationality: {_trunc(oc.get('nationality', '—'), 60)}"
-            )
-            embed.add_field(name="\u200b", value=summary, inline=False)
-
-        if matched and matched[0][1].get("profile_picture") and len(chunks) == 1:
-            # Single-page results: show the first OC's picture as a decorative thumbnail.
-            embed.set_thumbnail(url=matched[0][1]["profile_picture"])
-
-        pages.append(embed)
-
-    return pages
-
-
-@bot.tree.command(
-    name="oc_list",
-    description="browse, filter, and search all registered OCs.",
-)
+@bot.tree.command(name="oc_list", description="browse all ocs with an optional filter.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    search      = "partial match against OC name (case-insensitive)",
-    gender      = "filter: partial match on gender field",
-    pronouns    = "filter: partial match on pronouns field",
-    face_claim  = "filter: partial match on face claim field",
-    main_skill  = "filter: partial match on main skill field",
-    ethnicity   = "filter: partial match on ethnicity field",
-    nationality = "filter: partial match on nationality field",
-    owner       = "filter: show only OCs owned by this Discord user",
-    sort_by     = "sort results (default: name a→z)",
-)
-@app_commands.choices(sort_by=[
-    app_commands.Choice(name="Name A → Z",               value="name_asc"),
-    app_commands.Choice(name="Name Z → A",               value="name_desc"),
-    app_commands.Choice(name="Registered (newest first)", value="reg_desc"),
-    app_commands.Choice(name="Registered (oldest first)", value="reg_asc"),
-    app_commands.Choice(name="Balance (highest first)",   value="balance_desc"),
-    app_commands.Choice(name="Balance (lowest first)",    value="balance_asc"),
-])
-async def oc_list_cmd(
-    interaction: discord.Interaction,
-    search:      Optional[str]            = None,
-    gender:      Optional[str]            = None,
-    pronouns:    Optional[str]            = None,
-    face_claim:  Optional[str]            = None,
-    main_skill:  Optional[str]            = None,
-    ethnicity:   Optional[str]            = None,
-    nationality: Optional[str]            = None,
-    owner:       Optional[discord.Member] = None,
-    sort_by:     Optional[str]            = None,
-):
-    await interaction.response.defer()
-    try:
-        data = load_data()
-        ocs  = data.get("ocs", {})
+@app_commands.describe(filter_by="field to filter by", filter_value="value to match", search_name="partial name match")
+@app_commands.choices(filter_by=[app_commands.Choice(name=f, value=f) for f in FILTERABLE_FIELDS])
+async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = None, filter_value: Optional[str] = None, search_name: Optional[str] = None):
+    data = load_data()
+    ocs  = dict(data["ocs"])
 
-        # ── Apply filters (all partial, case-insensitive) ─────────────────────
-        field_filters: dict = {}
-        if gender:      field_filters["gender"]      = gender.strip().lower()
-        if pronouns:    field_filters["pronouns"]    = pronouns.strip().lower()
-        if face_claim:  field_filters["face_claim"]  = face_claim.strip().lower()
-        if main_skill:  field_filters["main_skill"]  = main_skill.strip().lower()
-        if ethnicity:   field_filters["ethnicity"]   = ethnicity.strip().lower()
-        if nationality: field_filters["nationality"] = nationality.strip().lower()
+    if not ocs: return await interaction.response.send_message("❌ no ocs registered.", ephemeral=True)
+    if search_name: ocs = {k: v for k, v in ocs.items() if search_name.lower() in v["name"].lower()}
+    if filter_by and filter_value: ocs = {k: v for k, v in ocs.items() if str(v.get(filter_by, "")).lower() == filter_value.lower()}
+    if not ocs: return await interaction.response.send_message("❌ no ocs match.", ephemeral=True)
 
-        search_term = search.strip().lower() if search else None
-
-        matched: list = []
-        for key, oc in ocs.items():
-            # Name search (partial match)
-            if search_term and search_term not in oc.get("name", "").lower():
-                continue
-            # Per-attribute partial filters
-            skip = False
-            for field, needle in field_filters.items():
-                haystack = str(oc.get(field, "")).lower()
-                if needle not in haystack:
-                    skip = True
-                    break
-            if skip:
-                continue
-            # Owner filter
-            if owner and oc.get("owner_id") != owner.id:
-                continue
-            matched.append((key, oc))
-
-        # ── Sort ──────────────────────────────────────────────────────────────
-        sort_key = sort_by or "name_asc"
-        if sort_key == "name_asc":
-            matched.sort(key=lambda t: t[1].get("name", "").lower())
-        elif sort_key == "name_desc":
-            matched.sort(key=lambda t: t[1].get("name", "").lower(), reverse=True)
-        elif sort_key == "reg_desc":
-            matched.sort(key=lambda t: t[1].get("registered_at", ""), reverse=True)
-        elif sort_key == "reg_asc":
-            matched.sort(key=lambda t: t[1].get("registered_at", ""))
-        elif sort_key == "balance_desc":
-            matched.sort(key=lambda t: t[1].get("balance", 0), reverse=True)
-        elif sort_key == "balance_asc":
-            matched.sort(key=lambda t: t[1].get("balance", 0))
-
-        # ── Build filter description for embed footer ─────────────────────────
-        desc_parts: list = []
-        if search_term:
-            desc_parts.append(f'name contains "{search}"')
-        for field, needle in field_filters.items():
-            desc_parts.append(f'{field} contains "{needle}"')
-        if owner:
-            desc_parts.append(f"owner = {owner.display_name}")
-        filter_desc = "  •  ".join(desc_parts) if desc_parts else "none"
-
-        # ── Build and send paginator ──────────────────────────────────────────
-        pages = _build_oc_list_pages(matched, filter_desc)
-        if len(pages) == 1 and not matched:
-            # Empty result — no paginator needed.
-            return await interaction.followup.send(embed=pages[0])
-        view = OcListPaginatorView(pages=pages, invoker_id=interaction.user.id)
-        await interaction.followup.send(embed=pages[0], view=view)
-
-    except Exception as e:
-        log.error("oc_list error: %s", e)
-        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
+    view = OCPaginatorView(list(ocs.items()))
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
 @bot.tree.command(
