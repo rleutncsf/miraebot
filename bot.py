@@ -676,45 +676,73 @@ def _validate_backup(parsed: dict) -> bool:
     if "used_inclusion_ids" in parsed and not isinstance(parsed["used_inclusion_ids"], list): return False
     return True
 
+def _coerce_to_str(val) -> str:
+    """
+    Coerce any discord.py name/description value to a plain str.
+    locale_str objects (used in i18n-aware commands) are not str subclasses
+    and do not support len(); str() on them returns their default string.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    return str(val)
+
 def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
     violations: list[str] = []
 
-    for cmd in tree.get_commands():
-        desc = getattr(cmd, "description", "") or ""
+    def _check_command(cmd, prefix: str = "") -> None:
+        full_name = f"{prefix}/{cmd.name}" if prefix else f"/{cmd.name}"
+
+        # ── Command-level description ──────────────────────────────────────────
+        desc = _coerce_to_str(getattr(cmd, "description", "")) or ""
         if not (1 <= len(desc) <= 100):
             violations.append(
-                f"/{cmd.name}: command description length={len(desc)} "
+                f"{full_name}: command description length={len(desc)} "
                 f"(must be 1–100). Value: {desc!r}"
             )
 
-        params = getattr(cmd, "_params", {})
-        if len(params) > 25:
-            violations.append(f"/{cmd.name}: has {len(params)} options (max 25).")
+        # ── Recurse into subcommand groups ─────────────────────────────────────
+        # app_commands.Group exposes its children via .commands
+        if isinstance(cmd, app_commands.Group):
+            for child in cmd.commands:
+                _check_command(child, prefix=full_name)
+            return  # Groups have no parameters of their own
 
-        for param_name, param in params.items():
-            p_desc = getattr(param, "description", "") or ""
+        # ── Parameter count ────────────────────────────────────────────────────
+        # Use the public .parameters list, not the private ._params dict.
+        params: list[app_commands.Parameter] = getattr(cmd, "parameters", [])
+        if len(params) > 25:
+            violations.append(f"{full_name}: has {len(params)} options (max 25).")
+
+        for param in params:
+            param_name = _coerce_to_str(getattr(param, "name", ""))
+            p_desc     = _coerce_to_str(getattr(param, "description", "")) or ""
             if not (1 <= len(p_desc) <= 100):
                 violations.append(
-                    f"/{cmd.name} [{param_name}]: option description length={len(p_desc)} "
+                    f"{full_name} [{param_name}]: option description length={len(p_desc)} "
                     f"(must be 1–100). Value: {p_desc!r}"
                 )
             if not (1 <= len(param_name) <= 32):
                 violations.append(
-                    f"/{cmd.name} [{param_name}]: option name length={len(param_name)} "
+                    f"{full_name} [{param_name}]: option name length={len(param_name)} "
                     f"(must be 1–32)."
                 )
             choices = getattr(param, "choices", []) or []
             for choice in choices:
-                c_name = getattr(choice, "name", "") or ""
+                c_name = _coerce_to_str(getattr(choice, "name", "")) or ""
                 c_val  = getattr(choice, "value", "")
                 if not (1 <= len(c_name) <= 100):
                     violations.append(
-                        f"/{cmd.name} [{param_name}] choice name length={len(c_name)}: {c_name!r}"
+                        f"{full_name} [{param_name}] choice name length={len(c_name)}: {c_name!r}"
                     )
                 if isinstance(c_val, str) and not (1 <= len(c_val) <= 100):
                     violations.append(
-                        f"/{cmd.name} [{param_name}] choice value length={len(c_val)}: {c_val!r}"
+                        f"{full_name} [{param_name}] choice value length={len(c_val)}: {c_val!r}"
                     )
+
+    for cmd in tree.get_commands():
+        _check_command(cmd)
 
     return violations
 
@@ -2229,15 +2257,28 @@ async def on_ready():
 
         DB_LOADED = True
 
-    schema_violations = _validate_command_tree_schema(bot.tree)
+    # ── Pre-sync schema validation ─────────────────────────────────────────────
+    try:
+        schema_violations = _validate_command_tree_schema(bot.tree)
+    except Exception as _schema_exc:
+        log.error(
+            "Pre-sync schema validation raised an unexpected exception — "
+            "skipping validation, proceeding with sync. Error: %s",
+            _schema_exc,
+            exc_info=True,
+        )
+        schema_violations = []
     if schema_violations:
         log.critical(
             "Pre-sync schema validation found %d violation(s). Sync will fail!\n%s",
             len(schema_violations),
-            "\n".join(f"  • {v}" for v in schema_violations)
+            "\n".join(f"  • {v}" for v in schema_violations),
         )
     else:
-        log.info("Pre-sync schema validation passed — all %d commands are valid.", len(bot.tree.get_commands()))
+        log.info(
+            "Pre-sync schema validation passed — all %d commands are valid.",
+            len(bot.tree.get_commands()),
+        )
 
     try:
         synced = await bot.tree.sync()
