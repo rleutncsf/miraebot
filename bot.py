@@ -3054,6 +3054,76 @@ async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = N
     view = OCPaginatorView(list(ocs.items()))
     await interaction.response.send_message(embed=view.get_embed(), view=view)
 
+class BirthdayPaginatorView(discord.ui.View):
+    PAGE_SIZE = 7
+    def __init__(self, ocs_sorted: list, today_kst):
+        super().__init__(timeout=300)
+        self.ocs_sorted = ocs_sorted
+        self.today_kst  = today_kst
+        self.page       = 0
+        self.total_pages = max(1, math.ceil(len(ocs_sorted) / self.PAGE_SIZE))
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = (self.page == 0)
+        self.next_btn.disabled = (self.page >= self.total_pages - 1)
+
+    def _get_page_ocs(self):
+        start = self.page * self.PAGE_SIZE
+        return self.ocs_sorted[start : start + self.PAGE_SIZE]
+
+    def get_embed(self):
+        page_ocs = self._get_page_ocs()
+        base_index = self.page * self.PAGE_SIZE
+        lines = []
+        for i, oc in enumerate(page_ocs, start=base_index + 1):
+            days = days_until_birthday(oc["birthday"], self.today_kst)
+            bday = datetime.strptime(oc["birthday"], BIRTHDAY_FORMAT).date()
+            bday_display = bday.strftime("%B %d").lower()
+
+            if days == 0:
+                status = "🎉 today!"
+            elif days < 365:
+                status = f"📅 in {days} day(s)"
+            else:
+                bday_this_year = date(self.today_kst.year, bday.month, bday.day)
+                days_ago = (self.today_kst - bday_this_year).days
+                status = f"✅ passed (celebrated {days_ago} day(s) ago)"
+
+            lines.append(f"**{i}.** **{oc['name']}** — {bday_display} ({status})")
+
+        embed = discord.Embed(
+            title="🎂 upcoming birthdays",
+            description="\n".join(lines),
+            color=discord.Color.from_rgb(255, 182, 193)
+        )
+        embed.set_footer(text=f"page {self.page + 1} of {self.total_pages}")
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="bday_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="bday_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+@bot.tree.command(name="birthday_list", description="view upcoming and past oc birthdays, grouped by 7.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def birthday_list(interaction: discord.Interaction):
+    data = load_data()
+    ocs = list(data["ocs"].values())
+    if not ocs: return await interaction.response.send_message("❌ no ocs registered.", ephemeral=True)
+    today_kst = datetime.now(KST).date()
+    ocs_sorted = sorted(ocs, key=lambda o: days_until_birthday(o["birthday"], today_kst))
+    view = BirthdayPaginatorView(ocs_sorted, today_kst)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
+
 
 @bot.tree.command(
     name="balance_edit",
