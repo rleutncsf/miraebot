@@ -5331,8 +5331,37 @@ async def shop_edit_item(
                 inc["name"] = inclusion_name
                 changes.append("inclusion name")
             if inclusion_rarity is not None and inclusion_rarity >= 1:
+                old_rarity = inc.get("rarity", 0)
                 inc["rarity"] = inclusion_rarity
-                changes.append("inclusion rarity")
+                changes.append(f"inclusion rarity ({old_rarity} → {inclusion_rarity})")
+                # Recompute sell prices for all inclusions in this album now that the
+                # rarity pool has changed.  Build a before/after diff for the response.
+                album_price_for_recalc = item.get("price", 50_000)
+                all_inclusions_in_album = item.get("inclusions", [])
+                updated_rarities = [i.get("rarity", 0) for i in all_inclusions_in_album]
+                price_diff_lines: list[str] = []
+                for sibling_inc in all_inclusions_in_album:
+                    sibling_rarity = sibling_inc.get("rarity", 0)
+                    # Old pool used the pre-edit rarity list; reconstruct it by swapping
+                    # the edited inclusion's old value back temporarily.
+                    old_rarities = [
+                        old_rarity if i.get("inclusion_id") == inc_id_norm else i.get("rarity", 0)
+                        for i in all_inclusions_in_album
+                    ]
+                    old_sp = _inclusion_sell_price(sibling_rarity if sibling_inc.get("inclusion_id") != inc_id_norm else old_rarity,
+                                                   old_rarities, album_price_for_recalc)
+                    new_sp = _inclusion_sell_price(sibling_rarity if sibling_inc.get("inclusion_id") != inc_id_norm else inclusion_rarity,
+                                                   updated_rarities, album_price_for_recalc)
+                    if old_sp != new_sp:
+                        arrow = "↑" if new_sp > old_sp else "↓"
+                        price_diff_lines.append(
+                            f"• **{sibling_inc.get('name', sibling_inc.get('inclusion_id'))}**: "
+                            f"₩{old_sp:,} → ₩{new_sp:,} {arrow}"
+                        )
+                if price_diff_lines:
+                    changes.append("sell prices recalculated:\n" + "\n".join(price_diff_lines))
+                else:
+                    changes.append("sell prices unchanged after rarity edit")
             if inclusion_image:
                 if not inclusion_image.content_type or not inclusion_image.content_type.startswith("image/"):
                     return await interaction.followup.send("❌ inclusion image must be an image file.")
@@ -5343,7 +5372,8 @@ async def shop_edit_item(
                 
         save_data(data)
         asyncio.ensure_future(push_backup_to_discord(data, reason="edit_item"))
-        embed = discord.Embed(title="item edited", description=f"fields updated: {', '.join(changes) if changes else 'none'}", color=discord.Color.green())
+        changes_display = "\n".join(changes) if changes else "none"
+        embed = discord.Embed(title="item edited", description=f"fields updated:\n{changes_display}", color=discord.Color.green())
         await interaction.followup.send(embed=embed)
     except Exception as e:
         log.error(f"shop_edit error: {e}")
@@ -6183,15 +6213,74 @@ def _deposit_inclusion_instances(d: dict, oc_key: str, inc_dicts: list[dict]) ->
         d["inventories"].setdefault(oc_key, {}).setdefault(inc_id, []).append(inc_dict)
 
 def _inclusion_sell_price(rarity_int: int, all_rarities: list, album_price: int) -> int:
+    """
+    Compute the sell price for an inclusion.
+    Formula components:
+      1. Proportional curve  — position of rarity_int within the album's [min_r, max_r]
+                               range mapped through a cubic (^3) curve; yields a score in
+                               [0.0, 1.0].  Cubic is steeper than the old quadratic,
+                               rewarding top-rarity inclusions more aggressively.
+      2. Absolute rarity bonus — log2(rarity_int + 1) * RARITY_ABS_BONUS_PER_LOG2_UNIT,
+                               adding a small flat-won bonus per doubling of the raw
+                               rarity integer.  Caps at RARITY_ABS_BONUS_CAP.
+      3. Tier multiplier     — discrete bonus multiplier based on which RARITY_TIER_LABELS
+                               bucket the inclusion falls into under proportional bucketing.
+                               Upper half of tiers receive multipliers > 1.0.
+      4. Price ceiling       — inclusions in the top two tiers may exceed album_price * 0.50,
+                               up to album_price * RARITY_TOP_TIER_CEILING_FACTOR.
+    Result is rounded to the nearest ₩100 and floored at ₩100.
+    """
+    # ── tuneable constants ───────────────────────────────────────────────────────
+    RARITY_BASE_FLOOR_FRAC   = 0.04   # minimum fraction of album_price for rarity=min_r
+    RARITY_PROP_RANGE_FRAC   = 0.50   # max additional fraction from proportional curve alone
+    RARITY_ABS_BONUS_PER_LOG2_UNIT = 150  # ₩ per log2 step of rarity_int
+    RARITY_ABS_BONUS_CAP     = 8_000  # absolute cap on the log bonus in ₩
+    RARITY_TOP_TIER_CEILING_FACTOR = 0.85  # top two tiers can reach up to 85% of album_price
+    # ── tier multiplier table (index = tier bucket, 0=lowest) ───────────────────
+    # Length must equal len(RARITY_TIER_LABELS); extends automatically if tiers are added.
+    n_tiers = len(RARITY_TIER_LABELS)
+    # Generate multipliers: lower half stay at 1.0x, upper half scale up to 1.30x
+    _half = n_tiers / 2.0
+    TIER_MULTIPLIERS: list[float] = [
+        1.0 if i < _half else round(1.0 + 0.10 * (i - _half + 1), 2)
+        for i in range(n_tiers)
+    ]
+    # e.g. for 7 tiers: [1.0, 1.0, 1.0, 1.0, 1.10, 1.20, 1.30]
+    # ── guard: degenerate inputs ─────────────────────────────────────────────────
     if not all_rarities:
         return 100
     min_r = min(all_rarities)
     max_r = max(all_rarities)
+    # ── 1. proportional cubic score ──────────────────────────────────────────────
     if max_r == min_r:
-        score = 0.0
+        prop_score = 0.0
     else:
-        score = (rarity_int - min_r) / (max_r - min_r)
-    raw_price = album_price * (0.05 + 0.45 * (score ** 2))
+        prop_score = (rarity_int - min_r) / (max_r - min_r)   # [0.0, 1.0]
+    prop_score = max(0.0, min(1.0, prop_score))
+    cubic_score = prop_score ** 3                               # steeper curve
+    # ── 2. proportional price component ─────────────────────────────────────────
+    prop_price = album_price * (RARITY_BASE_FLOOR_FRAC + RARITY_PROP_RANGE_FRAC * cubic_score)
+    # ── 3. absolute rarity log bonus ─────────────────────────────────────────────
+    abs_bonus = min(
+        math.log2(max(rarity_int, 1) + 1) * RARITY_ABS_BONUS_PER_LOG2_UNIT,
+        RARITY_ABS_BONUS_CAP
+    )
+    # ── 4. tier multiplier ───────────────────────────────────────────────────────
+    if max_r == min_r:
+        tier_bucket = 0
+    else:
+        tier_bucket = int((rarity_int - min_r) / ((max_r - min_r) / n_tiers))
+    tier_bucket = max(0, min(n_tiers - 1, tier_bucket))
+    tier_mult = TIER_MULTIPLIERS[tier_bucket]
+    # ── 5. combine and apply ceiling ─────────────────────────────────────────────
+    raw_price = (prop_price + abs_bonus) * tier_mult
+    # Top two tiers may exceed the old 50% cap, up to RARITY_TOP_TIER_CEILING_FACTOR
+    if tier_bucket >= n_tiers - 2:
+        ceiling = album_price * RARITY_TOP_TIER_CEILING_FACTOR
+    else:
+        ceiling = album_price * (RARITY_BASE_FLOOR_FRAC + RARITY_PROP_RANGE_FRAC)
+    raw_price = min(raw_price, ceiling)
+    # ── 6. round and floor ───────────────────────────────────────────────────────
     rounded = round(raw_price / 100) * 100
     return max(100, rounded)
 
