@@ -2900,6 +2900,7 @@ async def oc_add_cmd(
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(
     oc_name              = "the OC whose fields you want to edit",
+    birthday             = f"new birthday in {BIRTHDAY_DISPLAY} (leave blank to keep current)",
     gender               = "new gender value (leave blank to keep current)",
     pronouns             = "new pronouns value (leave blank to keep current)",
     face_claim           = "new face claim value (leave blank to keep current)",
@@ -2913,6 +2914,7 @@ async def oc_add_cmd(
 async def oc_edit_cmd(
     interaction: discord.Interaction,
     oc_name: str,
+    birthday: Optional[str]           = None,
     gender: Optional[str]             = None,
     pronouns: Optional[str]           = None,
     face_claim: Optional[str]         = None,
@@ -2940,6 +2942,17 @@ async def oc_edit_cmd(
             )
 
         changed_fields: list[str] = []
+
+        if birthday is not None:
+            try:
+                datetime.strptime(birthday.strip(), BIRTHDAY_FORMAT)
+            except ValueError:
+                return await interaction.followup.send(
+                    f"❌ Invalid birthday format. Use **{BIRTHDAY_DISPLAY}** (e.g. `2001/03/15`).",
+                    ephemeral=True,
+                )
+            oc["birthday"] = birthday.strip()
+            changed_fields.append("birthday")
 
         if gender is not None:
             oc["gender"] = gender.strip()
