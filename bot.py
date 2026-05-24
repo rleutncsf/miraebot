@@ -96,6 +96,36 @@ COLORS = {
     "neutral": discord.Color.light_grey()
 }
 
+# ─── Rarity tier system ────────────────────────────────────────────────────────
+# To add a new tier: append an entry to RARITY_TIER_LABELS and a matching
+# discord.Color to RARITY_TIER_COLORS. Both tuples must always be the same length.
+# The proportional and absolute bucketing functions below derive their tier count
+# from len(RARITY_TIER_LABELS) at runtime — no other code needs changing.
+
+# Inclusion rarity tier labels — extend this tuple to add more tiers.
+# Index 0 = lowest rarity, last index = highest rarity.
+# _rarity_label() and _rarity_label_proportional() both reference this list.
+RARITY_TIER_LABELS: tuple[str, ...] = (
+    "✦ common",
+    "✦✦ uncommon",
+    "✦✦✦ rare",
+    "✦✦✦✦ epic",
+    "✦✦✦✦✦ legendary",
+    "✦✦✦✦✦✦ mythic",
+    "✦✦✦✦✦✦✦ transcendent",
+)
+
+# Colours corresponding to each tier in RARITY_TIER_LABELS (must be same length).
+RARITY_TIER_COLORS: tuple[discord.Color, ...] = (
+    discord.Color.light_grey(),   # common
+    discord.Color.green(),        # uncommon
+    discord.Color.blue(),         # rare
+    discord.Color.purple(),       # epic
+    discord.Color.gold(),         # legendary
+    discord.Color.from_rgb(255, 50, 50),   # mythic  (vivid red)
+    discord.Color.from_rgb(255, 255, 255), # transcendent (white)
+)
+
 # State Flags for DB Persistence
 DB_LOADED  = False
 DATA_DIRTY = False
@@ -380,30 +410,54 @@ def _extract_inclusion_location(synthetic_key: str) -> Optional[tuple[str, str, 
         return None
 
 def _rarity_label(rarity_int: int) -> str:
-    if rarity_int == 1:   return "✦ common"
-    if rarity_int == 2:   return "✦✦ uncommon"
-    if rarity_int == 3:   return "✦✦✦ rare"
-    if rarity_int == 4:   return "✦✦✦✦ epic"
-    if rarity_int >= 5:   return "✦✦✦✦✦ legendary"
-    return f"rarity {rarity_int}"
+    """
+    Map an absolute rarity integer to a display label.
+    The canonical rarity range 1–N maps linearly to the RARITY_TIER_LABELS tiers.
+    Values < 1 fall back to the lowest tier; values ≥ len(RARITY_TIER_LABELS) map
+    to the highest tier.
+    """
+    n = len(RARITY_TIER_LABELS)
+    # Clamp to [0, n-1]
+    bucket = max(0, min(n - 1, rarity_int - 1))
+    return RARITY_TIER_LABELS[bucket]
 
 def _rarity_label_proportional(rarity_int: int, all_rarities: list) -> str:
-    _TIER_LABELS = [
-        "✦ common",
-        "✦✦ uncommon",
-        "✦✦✦ rare",
-        "✦✦✦✦ epic",
-        "✦✦✦✦✦ legendary",
-    ]
+    """
+    Map rarity_int to a tier label relative to the full rarity range observed in
+    all_rarities. The range is divided into len(RARITY_TIER_LABELS) equal buckets.
+    """
+    n = len(RARITY_TIER_LABELS)
     if not all_rarities:
-        return _TIER_LABELS[0]
+        return RARITY_TIER_LABELS[0]
     min_r = min(all_rarities)
     max_r = max(all_rarities)
     if max_r == min_r:
-        return _TIER_LABELS[0]
-    bucket = int((rarity_int - min_r) / ((max_r - min_r) / 5))
-    bucket = max(0, min(4, bucket))
-    return _TIER_LABELS[bucket]
+        return RARITY_TIER_LABELS[0]
+    # Float division: position of rarity_int within [min_r, max_r] mapped to [0, n)
+    bucket = int((rarity_int - min_r) / ((max_r - min_r) / n))
+    bucket = max(0, min(n - 1, bucket))
+    return RARITY_TIER_LABELS[bucket]
+
+def _rarity_color(rarity_int: int, all_rarities: Optional[list] = None) -> discord.Color:
+    """
+    Return the Discord Color for rarity_int.
+    If all_rarities is supplied, uses proportional bucketing (same logic as
+    _rarity_label_proportional); otherwise uses absolute bucketing (same as _rarity_label).
+    Falls back to blurple if the RARITY_TIER_COLORS tuple is shorter than RARITY_TIER_LABELS.
+    """
+    n = len(RARITY_TIER_LABELS)
+    if all_rarities is not None and len(all_rarities) > 0:
+        min_r, max_r = min(all_rarities), max(all_rarities)
+        if max_r == min_r:
+            bucket = 0
+        else:
+            bucket = int((rarity_int - min_r) / ((max_r - min_r) / n))
+    else:
+        bucket = max(0, rarity_int - 1)
+    bucket = max(0, min(n - 1, bucket))
+    if bucket < len(RARITY_TIER_COLORS):
+        return RARITY_TIER_COLORS[bucket]
+    return discord.Color.blurple()
 
 def _build_album_totals(data: dict) -> dict[str, dict[str, int]]:
     log_totals: dict[str, dict[str, int]] = {}
@@ -921,6 +975,63 @@ async def ensure_required_channels(guild: discord.Guild) -> None:
             log.error(
                 "ensure_required_channels: unexpected error creating #%s in guild '%s': %s",
                 ch_name, guild.name, e
+            )
+
+async def ensure_floor_categories(guild: discord.Guild, data: dict) -> None:
+    """
+    Idempotently creates Discord categories for every floor stored in data["floors"]
+    that does not already have a matching category (matched case-insensitively by name).
+    Existing categories are never modified.
+    """
+    existing_cat_names = {cat.name.lower() for cat in guild.categories}
+    for f_key, floor in data.get("floors", {}).items():
+        floor_name = floor.get("name", "")
+        if not floor_name:
+            continue
+        if floor_name.lower() in existing_cat_names:
+            continue
+        try:
+            new_cat = await guild.create_category(floor_name)
+            existing_cat_names.add(floor_name.lower())
+            log.info(
+                "ensure_floor_categories: created category '%s' in guild '%s' (%s).",
+                floor_name, guild.name, guild.id,
+            )
+            # Immediately create any room channels that should live under this category
+            for r_key, room in floor.get("rooms", {}).items():
+                ch_name = r_key  # room key is already the slug used as channel name
+                if discord.utils.get(guild.text_channels, name=ch_name, category=new_cat):
+                    continue  # channel already exists
+                try:
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        guild.me: discord.PermissionOverwrite(view_channel=True),
+                    }
+                    await guild.create_text_channel(ch_name, category=new_cat, overwrites=overwrites)
+                    log.info(
+                        "ensure_floor_categories: created room channel '#%s' under '%s'.",
+                        ch_name, floor_name,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as room_exc:
+                    log.warning(
+                        "ensure_floor_categories: could not create room channel '#%s': %s",
+                        ch_name, room_exc,
+                    )
+        except discord.Forbidden:
+            log.warning(
+                "ensure_floor_categories: missing Manage Channels permission in guild '%s' (%s) "
+                "— cannot create category '%s'.",
+                guild.name, guild.id, floor_name,
+            )
+        except discord.HTTPException as exc:
+            log.error(
+                "ensure_floor_categories: HTTPException creating category '%s' in guild '%s': %s",
+                floor_name, guild.name, exc,
+            )
+        except Exception as exc:
+            log.error(
+                "ensure_floor_categories: unexpected error for category '%s' in guild '%s': %s",
+                floor_name, guild.name, exc,
             )
 
 # ─── OC embed ──────────────────────────────────────────────────────────────────
@@ -2289,6 +2400,9 @@ async def on_ready():
 
             # Ensure all required operational channels exist.
             await ensure_required_channels(guild)
+            # Ensure Discord categories exist for all floors stored in DB.
+            data_for_floors = load_data()
+            await ensure_floor_categories(guild, data_for_floors)
 
         DB_LOADED = True
 
@@ -2350,9 +2464,11 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """Ensure all required channels exist when the bot joins a new guild."""
-    log.info("on_guild_join: joined guild '%s' (%s) — ensuring required channels.", guild.name, guild.id)
+    """Ensure all required channels and floor categories exist when the bot joins a new guild."""
+    log.info("on_guild_join: joined guild '%s' (%s) — ensuring required channels and floor categories.", guild.name, guild.id)
     await ensure_required_channels(guild)
+    data_for_floors = load_data()
+    await ensure_floor_categories(guild, data_for_floors)
 
 
 # ─── Automated Backup loop ─────────────────────────────────────────────────────
@@ -4552,14 +4668,6 @@ class PurchaseRevealView(discord.ui.View):
         self.prev_btn.disabled = (self.index == 0)
         self.next_btn.disabled = (self.index >= len(self.pulled) - 1)
 
-    def _rarity_color(self, rarity_int: int) -> discord.Color:
-        if rarity_int == 1:   return discord.Color.light_grey()
-        if rarity_int == 2:   return discord.Color.green()
-        if rarity_int == 3:   return discord.Color.blue()
-        if rarity_int == 4:   return discord.Color.purple()
-        if rarity_int >= 5:   return discord.Color.gold()
-        return discord.Color.blurple()
-
     def build_embed(self) -> discord.Embed:
         if not self.pulled: return discord.Embed(description="no inclusions pulled.")
         inc   = self.pulled[self.index]
@@ -4577,7 +4685,7 @@ class PurchaseRevealView(discord.ui.View):
                 f"**album:** {self.album_name}{qty_note}\n"
                 f"**oc:** {self.oc_name}"
             ),
-            color=self._rarity_color(rarity_int),
+            color=_rarity_color(rarity_int, all_rarities),
         )
         embed.add_field(name="rarity", value=rarity_label, inline=True)
         embed.add_field(name="inclusion", value=f"{page} of {total}", inline=True)
@@ -5106,13 +5214,7 @@ class AlbumViewerView(discord.ui.View):
         rarity_int = inc.get("rarity", 0)
         all_rarities = [i.get("rarity", 0) for i in self.inclusions]
         rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
-        
-        if rarity_int == 1: color = discord.Color.light_grey()
-        elif rarity_int == 2: color = discord.Color.green()
-        elif rarity_int == 3: color = discord.Color.blue()
-        elif rarity_int == 4: color = discord.Color.purple()
-        elif rarity_int >= 5: color = discord.Color.gold()
-        else: color = discord.Color.blurple()
+        color = _rarity_color(rarity_int, all_rarities)
 
         embed = discord.Embed(
             title=inc["name"],
@@ -6678,13 +6780,7 @@ class InclusionsBrowserView(discord.ui.View):
         all_rarities = [i.get("rarity", 0) for i in self.inclusions]
         rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
         sell_price = _inclusion_sell_price(rarity_int, all_rarities, self.album_price)
-        
-        if rarity_int == 1: color = discord.Color.light_grey()
-        elif rarity_int == 2: color = discord.Color.green()
-        elif rarity_int == 3: color = discord.Color.blue()
-        elif rarity_int == 4: color = discord.Color.purple()
-        elif rarity_int >= 5: color = discord.Color.gold()
-        else: color = discord.Color.blurple()
+        color = _rarity_color(rarity_int, all_rarities)
 
         embed = discord.Embed(
             title=inc["name"].lower(),
@@ -7339,6 +7435,11 @@ async def shop_import_cmd(
             embed.add_field(name="warnings",     value="\n".join(warnings) or "none", inline=False)
             skip_preview = "\n".join(skipped[:20]) + ("…" if len(skipped) > 20 else "")
             embed.add_field(name="skipped items", value=skip_preview or "none", inline=False)
+            embed.add_field(
+                name="id preservation",
+                value="original item & inclusion IDs will be reused where they do not conflict.",
+                inline=False,
+            )
             return await interaction.followup.send(embed=embed, ephemeral=True)
 
         if not to_import:
@@ -7381,8 +7482,30 @@ async def shop_import_cmd(
 
         imported_count = 0
         for raw_item in to_import:
-            new_item_id = _gen_item_id(data["shop"], list(data.get("used_item_ids", [])))
-            data.setdefault("used_item_ids", []).append(new_item_id)
+            # --- Resolve item ID ---
+            # Honour the original ID from the export if it is safe to reuse.
+            raw_id_field = raw_item.get("id", "")
+            # Normalise: the export stores full keys like "id_1234567"
+            if raw_id_field and not raw_id_field.startswith("id_"):
+                raw_id_field = f"id_{raw_id_field}"
+            if (
+                raw_id_field
+                and re.fullmatch(r"id_\d{7}", raw_id_field)          # valid format
+                and raw_id_field not in data["shop"]                  # not already in use
+                and raw_id_field not in data.get("used_item_ids", []) # not retired
+            ):
+                new_item_id = raw_id_field
+                # Register it so later items in the same batch cannot claim it
+                data.setdefault("used_item_ids", []).append(new_item_id)
+            else:
+                # Fall back to generating a fresh ID (original behaviour for conflicts / missing IDs)
+                new_item_id = _gen_item_id(data["shop"], list(data.get("used_item_ids", [])))
+                data.setdefault("used_item_ids", []).append(new_item_id)
+                if raw_id_field and raw_id_field != new_item_id:
+                    warnings.append(
+                        f"item '{raw_item['name']}': original id '{raw_id_field}' was already in use or "
+                        f"invalid — assigned new id '{new_item_id}'."
+                    )
 
             item_img_url   = raw_item.get("image_url")
             item_img_msg   = raw_item.get("image_msg_id")
@@ -7419,8 +7542,24 @@ async def shop_import_cmd(
                 new_record["inclusions"]      = []
 
                 for inc in raw_item.get("inclusions", []):
+                    # --- Resolve inclusion ID ---
+                    raw_inc_id_field = inc.get("inclusion_id", "")
+                    if raw_inc_id_field and not raw_inc_id_field.startswith("inc_"):
+                        raw_inc_id_field = f"inc_{raw_inc_id_field}"
                     combined_used = all_existing_inc_ids | set(used_inc_ids_this_batch)
-                    new_inc_id = _gen_inclusion_id(combined_used, [])
+                    if (
+                        raw_inc_id_field
+                        and re.fullmatch(r"inc_\d{7}", raw_inc_id_field)         # valid format
+                        and raw_inc_id_field not in combined_used                 # not in use globally or batch
+                    ):
+                        new_inc_id = raw_inc_id_field
+                    else:
+                        new_inc_id = _gen_inclusion_id(combined_used, [])
+                        if raw_inc_id_field and raw_inc_id_field != new_inc_id:
+                            warnings.append(
+                                f"item '{raw_item['name']}' inclusion '{inc.get('name', '?')}': original inclusion_id "
+                                f"'{raw_inc_id_field}' was already in use — assigned new id '{new_inc_id}'."
+                            )
                     used_inc_ids_this_batch.append(new_inc_id)
                     all_existing_inc_ids.add(new_inc_id)
                     data.setdefault("used_inclusion_ids", []).append(new_inc_id)
