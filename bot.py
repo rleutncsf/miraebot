@@ -3207,6 +3207,38 @@ async def oc_edit_cmd(
         await interaction.followup.send("❌ An unexpected error occurred. Please try again.", ephemeral=True)
 
 
+@bot.tree.command(name="oc_fix_image", description="re-upload a broken oc profile picture.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name", new_image="new image file")
+async def oc_fix_image(interaction: discord.Interaction, oc_name: str, new_image: discord.Attachment):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    key = oc_key_of(oc_name)
+    if key not in data["ocs"]: return await interaction.response.send_message(f"❌ no oc named **{oc_name}** found.", ephemeral=True)
+
+    oc = data["ocs"][key]
+    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if not new_image.content_type or not new_image.content_type.startswith("image/"): return await interaction.response.send_message("❌ file must be an image.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    result = await persist_image_attachment(new_image, store_msg_id=True)
+    if result is None: return await interaction.followup.send("❌ failed to persist image.", ephemeral=True)
+
+    cdn_url, msg_id = result
+    oc["profile_picture"] = cdn_url
+    if msg_id: oc["profile_picture_msg_id"] = msg_id
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_fix_image"))
+
+    embed = discord.Embed(title="🖼️ profile picture updated", color=discord.Color.green())
+    embed.set_thumbnail(url=cdn_url)
+    embed.add_field(name="oc", value=oc["name"], inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await audit(guild, f"oc image fixed: '{oc['name']}' by {interaction.user}")
+
+
 # ─── OC List paginator ─────────────────────────────────────────────────────────
 class OCPaginatorView(discord.ui.View):
     def __init__(self, ocs: list, filters_text: str = ""):
@@ -4210,6 +4242,286 @@ async def twitter_post_cmd(
     data["twitter"][tweet_id]["channel_id"]  = tw_ch.id
     save_data(data)
     asyncio.ensure_future(push_backup_to_discord(data, reason="twitter_post"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEWS POSTS & ANNOUNCEMENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="news_post", description="dev | post a news article embed.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    title="headline",
+    content="body text",
+    channel="channel to post in (defaults to the configured news channel)",
+    image_url="optional direct image url",
+    attachment="optional image/video file attachment",
+)
+async def news_post(
+    interaction: discord.Interaction,
+    title: str,
+    content: str,
+    channel: Optional[discord.TextChannel] = None,
+    image_url: Optional[str] = None,
+    attachment: Optional[discord.Attachment] = None,
+):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target_ch = channel or discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
+    if not target_ch:
+        return await interaction.followup.send("❌ no valid channel found.", ephemeral=True)
+    resolved_image_url: Optional[str] = None
+    if attachment:
+        if not attachment.content_type or not (
+            attachment.content_type.startswith("image/")
+            or attachment.content_type.startswith("video/")
+        ):
+            return await interaction.followup.send(
+                "❌ attachment must be an image or video file.", ephemeral=True
+            )
+        result = await persist_media_attachment(attachment, store_msg_id=False)
+        if result:
+            resolved_image_url, _, _ = result
+        else:
+            return await interaction.followup.send(
+                "❌ failed to persist attachment.", ephemeral=True
+            )
+    elif image_url:
+        ok, _ = valid_media_url(image_url)
+        if not ok:
+            return await interaction.followup.send(
+                "❌ image_url must end in .png/.jpg/.jpeg/.gif/.webp/.mp4/.mov/.webm", ephemeral=True
+            )
+        resolved_image_url = image_url
+    embed = discord.Embed(title=title, description=content, color=discord.Color.red(), timestamp=now_utc())
+    if resolved_image_url:
+        embed.set_image(url=resolved_image_url)
+    await target_ch.send(embed=embed)
+    await interaction.followup.send(
+        f"✅ posted to {target_ch.mention}.", ephemeral=True
+    )
+    await audit(guild, f"news_post: '{title}' posted to #{target_ch.name} by {interaction.user}")
+
+
+@bot.tree.command(name="news_post_schedule", description="dev | schedule a future news post.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    title="headline",
+    content="body text",
+    fire_at="scheduled time — format: YYYY-MM-DD HH:MM",
+    channel="channel to post in (defaults to news channel)",
+    image_url="optional image url",
+    timezone_str="timezone for fire_at (default UTC)",
+)
+@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
+async def news_post_schedule(
+    interaction: discord.Interaction,
+    title: str,
+    content: str,
+    fire_at: str,
+    channel: Optional[discord.TextChannel] = None,
+    image_url: Optional[str] = None,
+    timezone_str: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    tz = ZoneInfo(timezone_str or "UTC")
+    try:
+        fire_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(timezone.utc)
+    except Exception:
+        return await interaction.response.send_message(
+            "❌ fire_at must be in format YYYY-MM-DD HH:MM.", ephemeral=True
+        )
+    if fire_dt <= now_utc():
+        return await interaction.response.send_message("❌ scheduled time must be in the future.", ephemeral=True)
+    target_ch = channel or discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
+    if not target_ch:
+        return await interaction.response.send_message("❌ no valid channel found.", ephemeral=True)
+    if image_url:
+        ok, _ = valid_media_url(image_url)
+        if not ok:
+            return await interaction.response.send_message(
+                "❌ image_url must be a direct media link.", ephemeral=True
+            )
+    data = load_data()
+    sched_id = f"newsched_{int(fire_dt.timestamp())}_{interaction.user.id}"
+    data["scheduled"][sched_id] = {
+        "title": title,
+        "content": content,
+        "fire_at": fire_dt.isoformat(),
+        "channel": target_ch.name,
+        "image_url": image_url,
+        "created_by": interaction.user.id,
+        "fired": False,
+        "type": "news_post",
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="news_post_sched"))
+    tz_label = timezone_str or "UTC"
+    fire_local = fire_dt.astimezone(ZoneInfo(timezone_str or "UTC")).strftime("%Y-%m-%d %H:%M")
+    await interaction.response.send_message(
+        f"✅ news post scheduled for **{fire_local} {tz_label}** in {target_ch.mention}.",
+        ephemeral=True,
+    )
+    await audit(guild, f"news_post_schedule: '{title}' scheduled for {fire_dt.isoformat()} in #{target_ch.name} by {interaction.user}")
+
+
+@bot.tree.command(name="send_embed", description="dev | post a custom embed to any channel.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(channel="target channel", title="title", content="description", custom_username="sender name", avatar_url="avatar", color="hex", image_url="image")
+async def send_embed(interaction: discord.Interaction, channel: discord.TextChannel, title: str, content: str, custom_username: Optional[str] = None, avatar_url: Optional[str] = None, color: Optional[str] = None, image_url: Optional[str] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    resolved_color = discord.Color.blurple()
+    if color:
+        try: resolved_color = discord.Color(int(color.lstrip('#'), 16))
+        except: pass
+    embed = discord.Embed(title=title, description=content, color=resolved_color)
+    embed.set_author(name=custom_username or interaction.user.display_name, icon_url=avatar_url or interaction.user.display_avatar.url)
+    if image_url: embed.set_image(url=image_url)
+    await channel.send(embed=embed)
+    await interaction.response.send_message("✅ sent.", ephemeral=True)
+
+
+class AnnounceView(discord.ui.View):
+    def __init__(self, b1_label=None, b1_style=None, b1_url=None, b2_label=None, b2_style=None, b2_url=None):
+        super().__init__(timeout=None)
+        if b1_label: self.add_item(discord.ui.Button(label=b1_label, url=b1_url, style=discord.ButtonStyle.link if b1_url else b1_style or discord.ButtonStyle.primary, custom_id=None if b1_url else "btn1"))
+        if b2_label: self.add_item(discord.ui.Button(label=b2_label, url=b2_url, style=discord.ButtonStyle.link if b2_url else b2_style or discord.ButtonStyle.secondary, custom_id=None if b2_url else "btn2"))
+
+@bot.tree.command(name="announce", description="dev | post a styled announcement embed.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(channel="target channel", title="title", content="body")
+async def announce(
+    interaction: discord.Interaction, channel: discord.TextChannel, title: str, content: str,
+    embed_color: Optional[str] = None, image_url: Optional[str] = None, thumbnail_url: Optional[str] = None,
+    oc_note: Optional[str] = None, oc_name: Optional[str] = None,
+    button1_label: Optional[str] = None, button1_color: Optional[str] = None, button1_url: Optional[str] = None,
+    button2_label: Optional[str] = None, button2_color: Optional[str] = None, button2_url: Optional[str] = None,
+    ping_role: Optional[discord.Role] = None,
+):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    def _resolve(text: Optional[str]) -> Optional[str]:
+        if text: return _safe_fmt(text, server=guild.name, date=now_utc().strftime("%B %d, %Y"), oc=oc_name or "")
+        return None
+
+    resolved_color = discord.Color.blurple()
+    if embed_color:
+        try: resolved_color = discord.Color(int(embed_color.lstrip('#'), 16))
+        except: pass
+
+    embed = discord.Embed(title=_resolve(title), description=_resolve(content), color=resolved_color, timestamp=now_utc())
+    if thumbnail_url: embed.set_thumbnail(url=thumbnail_url)
+    if image_url: embed.set_image(url=image_url)
+    if oc_note: embed.add_field(name="note", value=_resolve(oc_note), inline=False)
+
+    view = None
+    if button1_label or button2_label:
+        view = AnnounceView(b1_label=button1_label, b1_style=resolve_button_style(button1_color, discord.ButtonStyle.primary), b1_url=button1_url,
+                            b2_label=button2_label, b2_style=resolve_button_style(button2_color, discord.ButtonStyle.secondary), b2_url=button2_url)
+
+    await channel.send(content=ping_role.mention if ping_role else None, embed=embed, view=view)
+    await interaction.followup.send("✅ sent.", ephemeral=True)
+
+
+@bot.tree.command(name="announce_schedule", description="dev | schedule a future announcement.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(title="title", content="body", fire_at="YYYY-MM-DD HH:MM", channel="channel", timezone_str="timezone")
+@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
+async def announce_schedule(interaction: discord.Interaction, title: str, content: str, fire_at: str, channel: Optional[discord.TextChannel] = None, image_url: Optional[str] = None, timezone_str: Optional[str] = None):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+
+    tz = ZoneInfo(timezone_str or "UTC")
+    try: fire_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(timezone.utc)
+    except: return await interaction.response.send_message("❌ format YYYY-MM-DD HH:MM.", ephemeral=True)
+    if fire_dt <= now_utc(): return await interaction.response.send_message("❌ must be in future.", ephemeral=True)
+
+    ch = channel or discord.utils.get(guild.text_channels, name=NEWS_CHANNEL_NAME)
+    data = load_data()
+    sched_id = f"sched_{int(fire_dt.timestamp())}_{interaction.user.id}"
+    data["scheduled"][sched_id] = {
+        "title": title, "content": content, "fire_at": fire_dt.isoformat(),
+        "channel": ch.name, "image_url": image_url, "created_by": interaction.user.id, "fired": False,
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_sched"))
+    await interaction.response.send_message("✅ scheduled.", ephemeral=True)
+
+@bot.tree.command(name="announce_list", description="dev | list pending scheduled announcements.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def announce_list(interaction: discord.Interaction):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    data = load_data()
+    pending = {k: v for k, v in data["scheduled"].items() if not v.get("fired")}
+    if not pending: return await interaction.response.send_message("no pending.", ephemeral=True)
+    embed = discord.Embed(title="scheduled announcements", color=discord.Color.blurple())
+    for k, v in sorted(pending.items(), key=lambda x: x[1]["fire_at"]):
+        embed.add_field(name=v["title"], value=f"time: {v['fire_at']}\nchan: #{v['channel']}\nid: `{k}`", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="announce_cancel", description="dev | cancel a scheduled announcement by id.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(sched_id="announcement id")
+async def announce_cancel(interaction: discord.Interaction, sched_id: str):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    data = load_data()
+    if sched_id not in data["scheduled"]: return await interaction.response.send_message("❌ not found.", ephemeral=True)
+    del data["scheduled"][sched_id]
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="announce_cancel"))
+    await interaction.response.send_message("✅ cancelled.", ephemeral=True)
+
+@bot.tree.command(name="remind", description="dev | set a timed reminder for a user.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(user="member", message="message", fire_at="YYYY-MM-DD HH:MM", timezone_str="timezone")
+@app_commands.choices(timezone_str=TIMEZONE_CHOICES)
+async def remind_cmd(interaction: discord.Interaction, user: discord.Member, message: str, fire_at: str, timezone_str: Optional[str] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    tz = ZoneInfo(timezone_str or "UTC")
+    try: fire_dt = datetime.strptime(fire_at, "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(timezone.utc)
+    except: return await interaction.response.send_message("❌ format YYYY-MM-DD HH:MM.", ephemeral=True)
+    if fire_dt <= now_utc() or len(message) > 2000: return await interaction.response.send_message("❌ invalid time or length.", ephemeral=True)
+
+    data = load_data()
+    data["reminders"][f"remind_{int(fire_dt.timestamp())}_{user.id}"] = {
+        "user_id": user.id, "message": message, "fire_at": fire_dt.isoformat(), "fired": False,
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="remind"))
+    await interaction.response.send_message("✅ reminder set.", ephemeral=True)
+
+@bot.tree.command(name="remind_timer", description="dev | set a duration-based reminder.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(user="member", message="message", days="days", hours="hours", minutes="minutes")
+async def remind_timer(interaction: discord.Interaction, user: discord.Member, message: str, days: Optional[int] = None, hours: Optional[int] = None, minutes: Optional[int] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    d, h, m = days or 0, hours or 0, minutes or 0
+    total = d * 86400 + h * 3600 + m * 60
+    if total < 60 or total > 30*86400 or len(message) > 2000: return await interaction.response.send_message("❌ invalid duration or length.", ephemeral=True)
+
+    fire_dt = now_utc() + timedelta(seconds=total)
+    data = load_data()
+    data["reminders"][f"remindtimer_{int(fire_dt.timestamp())}_{user.id}"] = {
+        "user_id": user.id, "message": message.replace("{user}", user.display_name), "fire_at": fire_dt.isoformat(), "fired": False,
+    }
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="remind_timer"))
+    await interaction.response.send_message("✅ reminder set.", ephemeral=True)
 
 
 @bot.tree.command(name="shop_add_category", description="dev | add a new shop category.")
