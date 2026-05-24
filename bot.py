@@ -2316,6 +2316,7 @@ async def on_ready():
             lambda: MultiTradeConfirmView(0, 0, "", "", [], []),
             lambda: InclusionsBrowserView([], "", None, 0),
             lambda: TwitterPostView(tweet_id="", likes=0, retweets=0),
+            lambda: IGPostView(post_id=""),
         ]
 
         for view_factory in _persistent_views:
@@ -4015,6 +4016,391 @@ async def say_cmd(
         reply_to_id = int(reply_to)
     modal = SayModal(target_channel=channel, reply_to_id=reply_to_id)
     await interaction.response.send_modal(modal)
+
+
+@bot.tree.command(name="dev_notify", description="dev | send typed notification dm to ocs/users.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.choices(type=[
+    app_commands.Choice(name="selection — debut contract", value="selection"),
+    app_commands.Choice(name="q&a — dev message with optional reply", value="qa"),
+    app_commands.Choice(name="custom — full control", value="custom"),
+])
+@app_commands.describe(
+    type="notification type", oc_name="primary oc", oc_name2="extra oc", oc_name3="extra oc", oc_name4="extra oc",
+    user="direct user recipient", user2="extra user", user3="extra user", group_name="group name",
+    embed_title="embed title", embed_color="hex color", thumbnail_url="thumbnail", target_channel="channel to grant",
+    channel_message="msg in channel", oc_placeholder="note field", accept_label="accept btn text", accept_color="accept btn color",
+    decline_label="decline btn text", decline_color="decline btn color", message="main body", require_response="adds reply btn",
+    reply_label="reply btn text", reply_color="reply btn color", selection_message_override="override debut text"
+)
+async def dev_notify(
+    interaction: discord.Interaction, type: str, oc_name: Optional[str] = None, oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None,
+    user: Optional[discord.Member] = None, user2: Optional[discord.Member] = None, user3: Optional[discord.Member] = None, group_name: Optional[str] = None,
+    embed_title: Optional[str] = None, embed_color: Optional[str] = None, thumbnail_url: Optional[str] = None,
+    target_channel: Optional[discord.TextChannel] = None, channel_message: Optional[str] = None, oc_placeholder: Optional[str] = None,
+    accept_label: Optional[str] = None, accept_color: Optional[str] = None, decline_label: Optional[str] = None, decline_color: Optional[str] = None,
+    message: Optional[str] = None, require_response: bool = False, reply_label: Optional[str] = None, reply_color: Optional[str] = None,
+    selection_message_override: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    data = load_data()
+    recipients = []
+    seen = set()
+
+    for oc_n in filter(None, [oc_name, oc_name2, oc_name3, oc_name4]):
+        k = oc_key_of(oc_n)
+        if k in data["ocs"]:
+            m = guild.get_member(data["ocs"][k].get("owner_id"))
+            if m and m.id not in seen:
+                seen.add(m.id)
+                recipients.append((m, data["ocs"][k], data["ocs"][k]["name"]))
+
+    for u in filter(None, [user, user2, user3]):
+        if u.id not in seen:
+            seen.add(u.id)
+            recipients.append((u, None, None))
+
+    if not recipients: return await interaction.followup.send("❌ no recipients resolved.", ephemeral=True)
+    color = discord.Color(int(embed_color.lstrip('#'), 16)) if embed_color else discord.Color.brand_red()
+
+    transport_ch = target_channel or discord.utils.get(guild.text_channels, name=DEBUT_CHANNEL_NAME)
+
+    def _res(t, m, o_n): return _safe_fmt(t, server=guild.name, oc=o_n or "", group=group_name or "", recipient=m.display_name) if t else ""
+
+    success = []
+    for m, o_d, o_n in recipients:
+        desc = _res(message, m, o_n)
+        if type == "selection" or (type == "custom" and group_name and not message):
+            desc = _res(selection_message_override, m, o_n) or f"congratulations, {o_n}! 🎉 you've been selected to join {group_name}. review and accept below."
+
+        embed = discord.Embed(title=_res(embed_title, m, o_n) or "dev message", description=desc, color=color)
+        if thumbnail_url or (o_d and o_d.get("profile_picture")): embed.set_thumbnail(url=thumbnail_url or o_d["profile_picture"])
+        if (type == "selection" or group_name) and o_n:
+            embed.add_field(name="oc", value=o_n, inline=True)
+            embed.add_field(name="group", value=group_name or "unknown", inline=True)
+        if oc_placeholder: embed.add_field(name="note", value=_res(oc_placeholder, m, o_n), inline=False)
+
+        view = None
+        has_debut = bool((accept_label or decline_label or target_channel or group_name) and o_n)
+        if type == "selection": view = DebutView(guild.id, m.id, o_n, group_name, transport_ch.id, channel_message, accept_label or "accept", resolve_button_style(accept_color, discord.ButtonStyle.success), decline_label or "decline", resolve_button_style(decline_color, discord.ButtonStyle.danger))
+        elif type == "qa" and require_response: view = DevDMView(guild.id, interaction.user.id, reply_label or "reply", resolve_button_style(reply_color, discord.ButtonStyle.primary))
+        elif type == "custom" and (has_debut or require_response): view = CombinedNotifyView(guild.id, m.id, interaction.user.id, o_n or "", group_name or "", transport_ch.id, channel_message, accept_label or "accept", resolve_button_style(accept_color, discord.ButtonStyle.success), decline_label or "decline", resolve_button_style(decline_color, discord.ButtonStyle.danger), reply_label or "reply", resolve_button_style(reply_color, discord.ButtonStyle.primary), require_response, has_debut)
+
+        try:
+            await m.send(embed=embed, view=view)
+            success.append(m.mention)
+        except: pass
+
+    await interaction.followup.send(f"✅ sent to: {', '.join(success) if success else 'none'}", ephemeral=True)
+
+
+@bot.tree.command(name="gc_invite", description="send a group-chat invite to up to 5 oc owners.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc to invite", group_name="gc name", message="msg", target_channel="channel", oc_name2="extra", oc_name3="extra")
+async def gc_invite(
+    interaction: discord.Interaction, oc_name: str, group_name: str, message: str, target_channel: discord.TextChannel,
+    oc_name2: Optional[str] = None, oc_name3: Optional[str] = None, oc_name4: Optional[str] = None, oc_name5: Optional[str] = None,
+):
+    guild = resolve_guild(interaction)
+    if not target_channel.permissions_for(guild.me).manage_permissions: return await interaction.response.send_message("❌ lack permissions.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+    successes = []
+
+    for oc_n in filter(None, [oc_name, oc_name2, oc_name3, oc_name4, oc_name5]):
+        k = oc_key_of(oc_n)
+        if k in data["ocs"]:
+            m = guild.get_member(data["ocs"][k].get("owner_id"))
+            if m:
+                embed = discord.Embed(title=f"group chat invite  —  {data['ocs'][k]['name']}", description=message, color=discord.Color.purple())
+                if data["ocs"][k].get("profile_picture"): embed.set_thumbnail(url=data["ocs"][k]["profile_picture"])
+                embed.add_field(name="oc", value=data["ocs"][k]["name"])
+                embed.add_field(name="group chat", value=group_name)
+                try:
+                    await m.send(embed=embed, view=GCInviteView(guild.id, m.id, k, data["ocs"][k]["name"], group_name, target_channel.id, []))
+                    successes.append(m.mention)
+                except: pass
+
+    await interaction.followup.send(f"✅ sent: {', '.join(successes)}" if successes else "❌ none sent.", ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OC SOCIAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="oc_dm", description="private dm channel between two ocs.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(your_oc="your oc", target_oc="target oc")
+async def oc_dm(interaction: discord.Interaction, your_oc: str, target_oc: str):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    s_k, t_k = oc_key_of(your_oc), oc_key_of(target_oc)
+    if s_k not in data["ocs"] or t_k not in data["ocs"]: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+    if s_k == t_k: return await interaction.response.send_message("❌ cannot dm self.", ephemeral=True)
+
+    dm_key = "dm_" + "_".join(sorted([s_k, t_k]))
+    tgt_m = guild.get_member(data["ocs"][t_k].get("owner_id"))
+
+    if dm_key in data["dms"] and guild.get_channel(data["dms"][dm_key]["channel_id"]):
+        ch = guild.get_channel(data["dms"][dm_key]["channel_id"])
+        await ch.set_permissions(interaction.user, view_channel=True, send_messages=True)
+        if tgt_m: await ch.set_permissions(tgt_m, view_channel=True, send_messages=True)
+        return await interaction.response.send_message(f"✅ channel: {ch.mention}", ephemeral=True)
+
+    cat = discord.utils.get(guild.categories, name="OC DMs") or await guild.create_category("OC DMs")
+    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)}
+    if tgt_m: overwrites[tgt_m] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    ch = await guild.create_text_channel(f"dm-{s_k[:15]}-{t_k[:15]}", category=cat, overwrites=overwrites)
+    data["dms"][dm_key] = {"participants": [s_k, t_k], "channel_id": ch.id}
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_dm"))
+
+    await ch.send(embed=discord.Embed(title="oc dm", description=f"between **{data['ocs'][s_k]['name']}** & **{data['ocs'][t_k]['name']}**.", color=discord.Color.purple()))
+    await interaction.response.send_message(f"✅ created: {ch.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="oc_groupchat", description="group chat channel for multiple ocs.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(your_oc="your oc", group_name="group name", target_oc1="oc 1", target_oc2="oc 2", target_oc3="oc 3")
+async def oc_groupchat(interaction: discord.Interaction, your_oc: str, group_name: str, target_oc1: str, target_oc2: str, target_oc3: Optional[str] = None):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    s_k = oc_key_of(your_oc)
+    if s_k not in data["ocs"]: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+
+    t_keys = [oc_key_of(t) for t in filter(None, [target_oc1, target_oc2, target_oc3])]
+    if any(k not in data["ocs"] for k in t_keys): return await interaction.response.send_message("❌ missing ocs.", ephemeral=True)
+
+    all_keys = [s_k] + t_keys
+    cat = discord.utils.get(guild.categories, name="OC Group Chats") or await guild.create_category("OC Group Chats")
+
+    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)}
+    for k in t_keys:
+        m = guild.get_member(data["ocs"][k].get("owner_id"))
+        if m: overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    ch = await guild.create_text_channel(f"gc-{group_name.lower().replace(' ', '-')[:28]}", category=cat, overwrites=overwrites)
+    data["groupchats"][f"gc_{int(now_utc().timestamp())}"] = {"name": group_name, "participants": all_keys, "channel_id": ch.id}
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_gc"))
+
+    await ch.send(embed=discord.Embed(title=group_name, description="**members:** " + ", ".join(data["ocs"][k]["name"] for k in all_keys), color=discord.Color.blue()))
+    await interaction.response.send_message(f"✅ created: {ch.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="oc_groupchat_add", description="add an oc to an existing oc group chat channel.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(target_channel="channel", new_oc="oc name")
+async def oc_groupchat_add(interaction: discord.Interaction, target_channel: discord.TextChannel, new_oc: str):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    n_k = oc_key_of(new_oc)
+    if n_k not in data["ocs"]: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+
+    gc = next((v for v in data["groupchats"].values() if v.get("channel_id") == target_channel.id), None)
+    if not gc: return await interaction.response.send_message("❌ not a gc.", ephemeral=True)
+    if n_k in gc["participants"]: return await interaction.response.send_message("❌ already in gc.", ephemeral=True)
+
+    gc["participants"].append(n_k)
+    m = guild.get_member(data["ocs"][n_k].get("owner_id"))
+    if m: await target_channel.set_permissions(m, view_channel=True, send_messages=True)
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_gc_add"))
+
+    embed = discord.Embed(title="👥 new member", description=f"**{data['ocs'][n_k]['name']}** joined!", color=discord.Color.blue())
+    await target_channel.send(embed=embed)
+    await interaction.response.send_message("✅ added.", ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INSTAGRAM & TWITTER POSTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IGPostView(discord.ui.View):
+    def __init__(self, post_id: str, likes: int = 0):
+        super().__init__(timeout=None)
+        self.post_id = post_id
+        self.likes   = likes
+        self._update_like_label()
+
+    def _update_like_label(self):
+        for child in self.children:
+            if getattr(child, "custom_id", "") == "ig_like_btn":
+                child.label = f"🤍 like  {self.likes}" if self.likes else "🤍 like"
+
+    @discord.ui.button(label="🤍 like", style=discord.ButtonStyle.secondary, custom_id="ig_like_btn")
+    async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        if self.post_id not in data["instagram"]: return await interaction.response.send_message("❌ post not found.", ephemeral=True)
+        post = data["instagram"][self.post_id]
+        post["likes"] = post.get("likes", 0) + 1
+        self.likes = post["likes"]
+        self._update_like_label()
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_like"))
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="💬 comment", style=discord.ButtonStyle.primary, custom_id="ig_comment_btn")
+    async def comment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = resolve_guild(interaction)
+        data = load_data()
+        post = data["instagram"].get(self.post_id)
+        if not post: return await interaction.response.send_message("❌ post not found.", ephemeral=True)
+        if post.get("thread_id") and guild.get_thread(post["thread_id"]): return await interaction.response.send_message("💬 thread open.", ephemeral=True)
+
+        ch = guild.get_channel(post.get("channel_id"))
+        try: msg = await ch.fetch_message(post["message_id"])
+        except: return await interaction.response.send_message("❌ original message missing.", ephemeral=True)
+
+        thread = await msg.create_thread(name=f"comments — {post['username']}", auto_archive_duration=10080)
+        post["thread_id"] = thread.id
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="ig_comment"))
+        await interaction.response.send_message(f"💬 thread created: {thread.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="ig_post", description="post 1–10 photos or videos as your oc.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name", username="instagram handle", caption="post caption",
+    photo1_url="url for media 1", photo1_file="photo or video file",
+    photo2_url="url for media 2", photo2_file="photo or video file",
+    photo3_url="url for media 3", photo3_file="photo or video file",
+    photo4_url="url for media 4", photo4_file="photo or video file",
+    photo5_url="url for media 5", photo5_file="photo or video file",
+    photo6_url="url for media 6", photo6_file="photo or video file",
+    photo7_url="url for media 7", photo7_file="photo or video file",
+    photo8_url="url for media 8", photo8_file="photo or video file",
+    photo9_url="url for media 9", photo9_file="photo or video file",
+    photo10_url="url for media 10", photo10_file="photo or video file")
+async def ig_post(
+    interaction: discord.Interaction, oc_name: str, username: str, caption: str,
+    photo1_url: Optional[str] = None, photo1_file: Optional[discord.Attachment] = None,
+    photo2_url: Optional[str] = None, photo2_file: Optional[discord.Attachment] = None,
+    photo3_url: Optional[str] = None, photo3_file: Optional[discord.Attachment] = None,
+    photo4_url: Optional[str] = None, photo4_file: Optional[discord.Attachment] = None,
+    photo5_url: Optional[str] = None, photo5_file: Optional[discord.Attachment] = None,
+    photo6_url: Optional[str] = None, photo6_file: Optional[discord.Attachment] = None,
+    photo7_url: Optional[str] = None, photo7_file: Optional[discord.Attachment] = None,
+    photo8_url: Optional[str] = None, photo8_file: Optional[discord.Attachment] = None,
+    photo9_url: Optional[str] = None, photo9_file: Optional[discord.Attachment] = None,
+    photo10_url: Optional[str] = None, photo10_file: Optional[discord.Attachment] = None,
+):
+    guild = resolve_guild(interaction)
+    await interaction.response.defer(ephemeral=True)
+
+    data = load_data()
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]: return await interaction.followup.send("❌ oc not found.", ephemeral=True)
+
+    pairs = [
+        (photo1_url, photo1_file), (photo2_url, photo2_file), (photo3_url, photo3_file), (photo4_url, photo4_file),
+        (photo5_url, photo5_file), (photo6_url, photo6_file), (photo7_url, photo7_file), (photo8_url, photo8_file),
+        (photo9_url, photo9_file), (photo10_url, photo10_file),
+    ]
+
+    media = []
+    for url, file in pairs:
+        if file:
+            if not file.content_type or not (
+                file.content_type.startswith("image/") or
+                file.content_type.startswith("video/")
+            ):
+                return await interaction.followup.send(
+                    "❌ files must be images or videos (mp4, mov, webm).", ephemeral=True
+                )
+            result = await persist_media_attachment(file)
+            if result:
+                clean_url, _, media_tag = result
+                media.append({"url": clean_url, "type": media_tag})
+            else:
+                media.append({"url": file.url, "type": "video" if file.content_type.startswith("video/") else "image"})
+        elif url:
+            ok, tag = valid_media_url(url)
+            if not ok:
+                return await interaction.followup.send(
+                    "❌ invalid url. accepted: .png .jpg .jpeg .gif .webp .mp4 .mov .webm", ephemeral=True
+                )
+            media.append({"url": url, "type": tag})
+
+    if not media:
+        return await interaction.followup.send("❌ at least one photo or video required.", ephemeral=True)
+
+    oc = data["ocs"][oc_key]
+    handle = username if username.startswith("@") else f"@{username}"
+    post_id = f"{oc_key}_{int(now_utc().timestamp())}"
+
+    data["instagram"][post_id] = {
+        "oc_key": oc_key, "username": handle, "caption": caption,
+        "media": media,
+        "photos": [m["url"] for m in media if m["type"] == "image"],
+        "likes": 0, "posted_by": interaction.user.id, "posted_at": now_iso(),
+    }
+    save_data(data)
+
+    ig_ch = discord.utils.get(guild.text_channels, name=INSTAGRAM_CHANNEL_NAME)
+    if not ig_ch: return await interaction.followup.send("❌ channel missing.", ephemeral=True)
+
+    await interaction.followup.send("📸 posting...", ephemeral=True)
+
+    view = IGPostView(post_id, likes=0)
+
+    async def _send_media_item(channel, media_item: dict, embed_base_color, view=None):
+        if media_item["type"] == "image":
+            e = discord.Embed(color=embed_base_color)
+            e.set_image(url=media_item["url"])
+            return await channel.send(embed=e, view=view)
+        else:
+            content = media_item["url"]
+            return await channel.send(content=content, view=view)
+
+    color = discord.Color.from_rgb(225, 48, 108)
+
+    if len(media) == 1:
+        m = media[0]
+        if m["type"] == "image":
+            embed = discord.Embed(
+                description=f"**{handle}**  {caption}", color=color
+            )
+            embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
+            embed.set_image(url=m["url"])
+            last_msg = await ig_ch.send(embed=embed, view=view)
+        else:
+            header = f"**{oc['name']}**  ({handle})\n{caption}"
+            last_msg = await ig_ch.send(content=f"{header}\n{m['url']}", view=view)
+        data["instagram"][post_id]["message_id"] = last_msg.id
+    else:
+        first_m = media[0]
+        if first_m["type"] == "image":
+            embed = discord.Embed(description=f"**{handle}**  {caption}", color=color)
+            embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
+            embed.set_image(url=first_m["url"])
+            first_msg = await ig_ch.send(embed=embed)
+        else:
+            header = f"**{oc['name']}**  ({handle})\n{caption}"
+            first_msg = await ig_ch.send(content=f"{header}\n{first_m['url']}")
+        data["instagram"][post_id]["message_id"] = first_msg.id
+
+        for m in media[1:-1]:
+            await _send_media_item(ig_ch, m, color)
+
+        last_m = media[-1]
+        await _send_media_item(ig_ch, last_m, color, view=view)
+
+    data["instagram"][post_id]["channel_id"] = ig_ch.id
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="ig_post"))
+
 
 class TwitterPostView(discord.ui.View):
     def __init__(self, tweet_id: str, likes: int = 0, retweets: int = 0):
@@ -7908,6 +8294,137 @@ async def shop_import_cmd(
     except Exception as e:
         log.error("shop_import_cmd error: %s", e, exc_info=True)
         await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+
+
+# ─── Help Command ──────────────────────────────────────────────────────────────
+HELP_SECTIONS = {
+    "albums": {
+        "title": "💿 album tracker",
+        "commands": [
+            ("/album list", "", "browse all registered albums and their total purchase counts."),
+            ("/album stats", "oc_name [album_ref]", "view album purchase history for an oc, per album or across all albums."),
+            ("/album leaderboard", "album_ref", "ranked leaderboard of who has bought the most copies of a specific album."),
+            ("/album global_leaderboard", "", "overall leaderboard of total albums purchased (all albums, all ocs). backwards-compatible — includes shop inventory + purchase logs."),
+        ],
+        "dev_commands": [
+            ("/album archive", "album_ref", "🔒 soft-delete an album from active listings while preserving all purchase history."),
+        ]
+    },
+    "weverse": {
+        "title": "💜 weverse",
+        "commands": [
+            ("/weverse post", "content [oc_name] [media1..3]", "post to the public weverse feed. free for everyone. optionally post as one of your ocs."),
+            ("/weverse reply", "post_id artist_oc_name content", "reply to a post as your registered artist oc."),
+            ("/weverse dm subscribe", "artist_oc_name plan", "subscribe to an artist's private weverse dm. plans: monthly (₩8,000), 6 months (₩40,000), annual (₩80,000)."),
+            ("/weverse dm cancel", "artist_oc_name", "cancel your active dm subscription. access is retained until the end of the billing period."),
+            ("/weverse dm status", "artist_oc_name", "check your subscription status and next billing date."),
+        ],
+        "dev_commands": [
+            ("/weverse config setchannel", "channel", "🔒 set the public weverse feed channel."),
+            ("/weverse config setdmcategory", "category", "🔒 set the discord category for artist dm channels."),
+            ("/weverse config setgroupcategory", "category", "🔒 set the discord category for weverse group dm channels."),
+            ("/weverse config addwon", "user amount", "🔒 add ₩ won to a user's wallet."),
+            ("/weverse config setwon", "user amount", "🔒 set a user's ₩ won balance."),
+            ("/weverse artist register", "oc_name", "🔒 designate an oc as a weverse artist."),
+            ("/weverse artist unregister", "oc_name", "🔒 remove artist designation (no active subscribers allowed)."),
+            ("/weverse artist provisiondm", "oc_name", "🔒 create the artist's private dm discord channel."),
+            ("/weverse artist deprovisiondm", "oc_name", "🔒 delete the artist's dm channel (subscriber data preserved)."),
+            ("/weverse artist subscribers", "oc_name", "🔒 list all dm subscribers for an artist."),
+            ("/weverse group create", "name [initial_members]", "🔒 create a weverse group dm. initial_members is a comma-separated list of oc names."),
+            ("/weverse group addmember", "group_name user", "🔒 add a discord member to a weverse group."),
+            ("/weverse group bulkadd", "group_name oc_names", "🔒 bulk-add oc owners to a group by oc name. comma-separated."),
+            ("/weverse group removemember", "group_name user", "🔒 remove a member from a weverse group."),
+            ("/weverse group archive", "group_name", "🔒 archive a weverse group (data only; discord channel not deleted)."),
+            ("/weverse group list", "", "🔒 list all active weverse groups, their channels, and members."),
+            ("/weverse dev reply",  "artist_oc_name content [post_index]", "🔒 reply to a post as any artist oc using recency index (1 = most recent). no uuid needed."),
+            ("/weverse dev setup",  "oc_name",                             "🔒 register + provision a weverse artist dm channel in one step."),
+        ]
+    }
+}
+
+class HelpPaginatorView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed]):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.current = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.current == 0)
+        self.next_btn.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="help_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="help_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+
+@bot.tree.command(name="help", description="show available bot commands.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.choices(section=[
+    app_commands.Choice(name="Album Tracker", value="albums"),
+    app_commands.Choice(name="Weverse", value="weverse"),
+    app_commands.Choice(name="General", value="general")
+])
+async def help_cmd(interaction: discord.Interaction, section: str = "general"):
+    if section in HELP_SECTIONS:
+        sec = HELP_SECTIONS[section]
+        embed = get_embed(sec["title"], "command reference", "system")
+        if sec.get("commands"):
+            val = "\n".join(f"`{cmd} {args}` - {desc}" for cmd, args, desc in sec["commands"])
+            embed.add_field(name="commands", value=val, inline=False)
+        if sec.get("dev_commands") and is_dev(interaction):
+            val = "\n".join(f"`{cmd} {args}` - {desc}" for cmd, args, desc in sec["dev_commands"])
+            embed.add_field(name="dev commands", value=val, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        if is_dev(interaction):
+            embed1 = discord.Embed(title="oc bot — full command reference (dev) [1/2]", color=discord.Color.gold())
+            embed1.add_field(name="oc management", inline=False, value=(
+                "`/oc_add` — register a new oc\n`/oc_edit` — edit oc fields\n`/oc_fix_image` — re-upload a broken picture\n`/oc_delete` — delete your oc\n`/oc_list` — browse/filter ocs\n`/birthday_list` — upcoming oc birthdays\n"
+            ))
+            embed1.add_field(name="economy & shop", inline=False, value=(
+                "`/balance` — view oc balance\n`/inventory` — view oc inventory\n`/shop` — browse shop\n`/shop_buy` — buy an item\n`/inclusions` — browse inclusions for an album\n`/trade` — trade items, inclusions, and/or ₩ money (cross-type, supports one-sided)\n`/trade_multi` — multi-item trade between ocs\n`/gift` — gift items\n`/gift_money` — send ₩ from one oc to another\n`/sell oc_name item_id quantity` — sell copies of an item (albums sold at 30% off original price)\n`/sell_inclusion oc_name inclusion_id [quantity]` — sell one or more copies of an inclusion from inventory\n"
+            ))
+            embed1.add_field(name="floor/dorm", inline=False, value=(
+                "`/dorm_assign` — assign to a room\n`/dorm_unassign` — remove from room\n`/dorm_view` — view floors and rooms\n"
+            ))
+            embed1.add_field(name="messaging", inline=False, value=(
+                "`/oc_dm` — private oc dm\n`/oc_groupchat` — group chat\n`/oc_groupchat_add` — add oc to gc\n`/gc_invite` — invite to gc\n`/ig_post` — post photos/videos\n`/twitter_post` — tweet as your oc (up to 4 photos/videos, 280 chars, likes/retweets/replies)\n"
+            ))
+
+            embed2 = discord.Embed(title="oc bot — full command reference (dev) [2/2]", color=discord.Color.gold())
+            embed2.add_field(name="⚙️ dev tools — economy", inline=False, value=(
+                "`/balance_edit` — adjust or set oc balances (modes: adjust / set)\n`/balance_setall` — set every oc's balance to the same value at once\n`/evaluation_toggle` — toggle weekly evals\n`/evaluation_run` — force weekly eval\n`/shop_add_category` / `/shop_remove_category`\n`/shop_add_album` / `/shop_add_misc` / `/shop_add_inclusion`\n`/shop_edit_item` / `/shop_remove_item` / `/shop_remove_inclusion`\n`/album_inclusions` — list all inclusions + IDs for an album\n`/shop_export [category]` — export shop catalogue to JSON (with image URLs)\n`/shop_import file [dry_run] [skip_existing] [reimport_images]` — import shop catalogue from JSON, re-persisting images\n"
+            ))
+            embed2.add_field(name="⚙️ dev tools — infrastructure", inline=False, value=(
+                "`/floor_create`, `/floor_rename`, `/floor_delete`\n`/dorm_create`, `/dorm_edit`, `/dorm_relocate`, `/dorm_delete`, `/dorm_kick`\n"
+                "`/announce`, `/news_post`, `/send_embed`\n`/announce_schedule`, `/announce_list`, `/announce_cancel`\n`/news_post_schedule title content fire_at [channel] [image_url] [timezone_str]` — schedule a news post for future delivery\n"
+                "`/dev_notify` — send dm notes\n`/remind`, `/remind_timer`\n`/startup` — re-sync/restart tasks\n`/refresh_assets` — re-upload cdn links\n`/say channel [reply_to]` — send a plain-text message as the bot to any channel\n"
+            ))
+
+            view = HelpPaginatorView(pages=[embed1, embed2])
+            await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
+        else:
+            embed1 = discord.Embed(title="oc bot — command reference", color=discord.Color.gold())
+            embed1.add_field(name="oc management", inline=False, value=(
+                "`/oc_add` — register a new oc\n`/oc_edit` — edit oc fields\n`/oc_fix_image` — fix profile picture\n`/oc_delete` — delete your oc\n`/oc_list` — browse/filter ocs\n`/birthday_list` — upcoming birthdays\n"
+            ))
+            embed1.add_field(name="economy & shop", inline=False, value=(
+                "`/balance` — view oc balance\n`/inventory` — view oc inventory\n`/shop` — browse shop\n`/shop_buy` — buy an item\n`/inclusions` — browse inclusions for an album\n`/trade` — trade items, inclusions, or money (specify type with offer_type/request_type)\n`/trade_multi` — multi-item trade between ocs\n`/gift` — gift items\n`/gift_money` — gift ₩ to another oc\n`/sell oc_name item_id quantity` — sell copies of an item (albums sold at 30% off original price)\n`/sell_inclusion oc_name inclusion_id [quantity]` — sell one or more copies of an inclusion from inventory\n"
+            ))
+            embed1.add_field(name="messaging & social", inline=False, value=(
+                "`/dorm_assign` — assign oc to dorm\n`/dorm_unassign` — unassign dorm\n`/dorm_view` — view dorms\n`/oc_dm` — private oc dm\n`/oc_groupchat` — multi-oc group chat\n`/oc_groupchat_add` — add oc to gc\n`/gc_invite` — invite to gc\n`/ig_post` — post photos/videos as your oc\n`/twitter_post` — tweet as your oc (up to 4 photos/videos, 280 chars, likes/retweets/replies)\n"
+            ))
+            await interaction.response.send_message(embed=embed1, ephemeral=True)
 
 
 # ─── Refresh Assets Command ────────────────────────────────────────────────────
