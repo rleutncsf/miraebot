@@ -550,36 +550,71 @@ async def push_backup_to_discord(data: dict, reason: str = "mutation") -> None:
     if not DB_LOADED:
         log.debug("push_backup_to_discord: DB not yet loaded, skipping upload.")
         return
-
     try:
         payload_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
         if len(payload_bytes) > 8_000_000:  # 8 MB Discord limit
             log.error("push_backup_to_discord: payload too large (%d bytes), skipping upload.", len(payload_bytes))
             return
-
         for guild in bot.guilds:
             ch = discord.utils.get(guild.text_channels, name=DB_BACKUP_CHANNEL_NAME)
-            if ch:
+            if not ch:
+                continue
+            # ── Permission pre-flight ──────────────────────────────────────────
+            me = guild.me
+            perms = ch.permissions_for(me)
+            required = ("view_channel", "send_messages", "attach_files")
+            missing = [p for p in required if not getattr(perms, p)]
+            if missing:
+                log.warning(
+                    "push_backup_to_discord: bot is missing %s on #%s — attempting to restore overwrites.",
+                    missing, ch.name,
+                )
+                try:
+                    await ch.set_permissions(
+                        me,
+                        view_channel=True,
+                        send_messages=True,
+                        attach_files=True,
+                        read_message_history=True,
+                        manage_messages=True,
+                    )
+                    log.info("push_backup_to_discord: permission overwrite restored on #%s.", ch.name)
+                except (discord.Forbidden, discord.HTTPException) as perm_exc:
+                    log.error(
+                        "push_backup_to_discord: could not restore permissions on #%s — "
+                        "grant the bot 'Send Messages' + 'Attach Files' + 'View Channel' manually. Error: %s",
+                        ch.name, perm_exc,
+                    )
+                    continue  # Skip this guild's backup attempt; do not surface a 403
+            # ── End pre-flight ─────────────────────────────────────────────────
+            try:
                 file = discord.File(io.BytesIO(payload_bytes), filename="data.json")
                 new_msg = await ch.send(
                     f"[BACKUP] {reason} — {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                    file=file
+                    file=file,
                 )
                 DATA_DIRTY = False
                 log.info("Backup uploaded — message_id=%s guild=%s", new_msg.id, guild.id)
-
                 try:
                     await ch.purge(limit=50, check=lambda m: m.author == bot.user and m.id != new_msg.id)
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"Could not purge old backups: {e}")
-                
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
                 return
-            
-        log.warning("push_backup_to_discord: No guild with #%s found.", DB_BACKUP_CHANNEL_NAME)
+            except discord.Forbidden as send_exc:
+                log.error(
+                    "push_backup_to_discord: 403 sending to #%s in guild '%s'. "
+                    "Ensure the bot has 'Send Messages' and 'Attach Files' permissions in that channel. "
+                    "Raw error: %s",
+                    ch.name, guild.name, send_exc,
+                )
+            except Exception as send_exc:
+                log.error("push_backup_to_discord: unexpected send error in guild '%s': %s", guild.name, send_exc)
     except Exception as e:
         log.error("push_backup_to_discord failed: %s", e)
 
 async def save_and_backup(data: dict, reason: str = "mutation") -> None:
+    global DATA_DIRTY
+    DATA_DIRTY = True
     save_data(data)
     await push_backup_to_discord(data, reason=reason)
 
