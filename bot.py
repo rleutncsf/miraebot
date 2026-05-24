@@ -3189,6 +3189,7 @@ async def birthday_list(interaction: discord.Interaction):
 @app_commands.describe(floor_name="display name for the floor")
 async def floor_create(interaction: discord.Interaction, floor_name: str):
     guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ Could not resolve server context.", ephemeral=True)
     if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
     data = load_data()
     key  = dorm_key_of(floor_name)
