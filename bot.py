@@ -835,17 +835,31 @@ def _validate_command_tree_schema(tree: app_commands.CommandTree) -> list[str]:
 
     return violations
 
-def get_age(birthday_str: str):
+def get_age(birthday_str: str) -> Optional[int]:
+    """
+    Compute OC age using the current calendar date in KST (GMT+9).
+    KST is always UTC+9 with no DST, matching how the birthday loop fires.
+    Using `date.today()` would yield the host's local date (UTC on Render),
+    which is 9 hours behind KST — causing the age to update at the wrong moment.
+    """
     try:
-        bday  = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
-        today = date.today()
-        return (today.year - bday.year
-                - ((today.month, today.day) < (bday.month, bday.day)))
+        bday      = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
+        today_kst = datetime.now(KST).date()   # KST = timezone(timedelta(hours=9))
+        return (today_kst.year - bday.year
+                - ((today_kst.month, today_kst.day) < (bday.month, bday.day)))
     except Exception:
         return None
 
-def days_until_birthday(birthday_str: str, today: date) -> int:
+def days_until_birthday(birthday_str: str, today: Optional[date] = None) -> int:
+    """
+    Return days until the next birthday occurrence.
+    `today` defaults to the current KST calendar date if not provided.
+    All callers that previously passed `date.today()` should migrate to
+    passing `datetime.now(KST).date()` or omitting the argument entirely.
+    """
     try:
+        if today is None:
+            today = datetime.now(KST).date()
         bday = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
         this_year_bday = date(today.year, bday.month, bday.day)
         if this_year_bday >= today:
@@ -4361,8 +4375,14 @@ async def ig_post(
             e.set_image(url=media_item["url"])
             return await channel.send(embed=e, view=view)
         else:
-            content = media_item["url"]
-            return await channel.send(content=content, view=view)
+            # Send the URL as bare content so Discord auto-unfurls the video player,
+            # and include a minimal embed for consistent color theming.
+            # Both must be in the same send() call; the video preview appears beneath.
+            e = discord.Embed(color=embed_base_color)
+            kwargs = {"content": media_item["url"], "embed": e}
+            if view is not None:
+                kwargs["view"] = view
+            return await channel.send(**kwargs)
 
     color = discord.Color.from_rgb(225, 48, 108)
 
@@ -4376,8 +4396,13 @@ async def ig_post(
             embed.set_image(url=m["url"])
             last_msg = await ig_ch.send(embed=embed, view=view)
         else:
-            header = f"**{oc['name']}**  ({handle})\n{caption}"
-            last_msg = await ig_ch.send(content=f"{header}\n{m['url']}", view=view)
+            # For a single video post: embed carries the author + caption metadata;
+            # the bare URL on `content` triggers Discord's native video unfurl/preview.
+            embed = discord.Embed(
+                description=f"**{handle}**  {caption}", color=color
+            )
+            embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
+            last_msg = await ig_ch.send(content=m["url"], embed=embed, view=view)
         data["instagram"][post_id]["message_id"] = last_msg.id
     else:
         first_m = media[0]
@@ -4387,8 +4412,11 @@ async def ig_post(
             embed.set_image(url=first_m["url"])
             first_msg = await ig_ch.send(embed=embed)
         else:
-            header = f"**{oc['name']}**  ({handle})\n{caption}"
-            first_msg = await ig_ch.send(content=f"{header}\n{first_m['url']}")
+            embed = discord.Embed(
+                description=f"**{handle}**  {caption}", color=color
+            )
+            embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
+            first_msg = await ig_ch.send(content=first_m["url"], embed=embed)
         data["instagram"][post_id]["message_id"] = first_msg.id
 
         for m in media[1:-1]:
@@ -7441,6 +7469,40 @@ async def album_inclusions_cmd(interaction: discord.Interaction, item_id: str):
     await interaction.followup.send(embed=view.build_dev_embed(), view=view, ephemeral=True)
 
 
+class InclusionSearchModal(discord.ui.Modal, title="search inclusions"):
+    query = discord.ui.TextInput(
+        label="inclusion name (partial match ok)",
+        placeholder="e.g. photocard, postcard, poster…",
+        max_length=100,
+        required=True,
+    )
+    def __init__(self, browser_view: "InclusionsBrowserView"):
+        super().__init__()
+        self.browser_view = browser_view
+    async def on_submit(self, interaction: discord.Interaction):
+        q = self.query.value.strip().lower()
+        if not q:
+            return await interaction.response.send_message(
+                "❌ search query cannot be empty.", ephemeral=True
+            )
+        results = [
+            inc for inc in self.browser_view.inclusions
+            if q in inc["name"].lower()
+        ]
+        if not results:
+            return await interaction.response.send_message(
+                f"❌ no inclusions matching **{self.query.value}** found in **{self.browser_view.album_name}**.",
+                ephemeral=True,
+            )
+        # Enter search mode on the parent view
+        self.browser_view.search_results  = results
+        self.browser_view.search_index    = 0
+        self.browser_view.search_query    = self.query.value
+        self.browser_view._sync_buttons()
+        await interaction.response.edit_message(
+            embed=self.browser_view._build_embed(), view=self.browser_view
+        )
+
 class InclusionsBrowserView(discord.ui.View):
     PAGE_SIZE = 1
 
@@ -7453,63 +7515,120 @@ class InclusionsBrowserView(discord.ui.View):
         album_price: int = 50_000,
     ):
         super().__init__(timeout=300)
-        self.inclusions     = inclusions
-        self.album_name     = album_name
-        self.album_cover    = album_image_url
-        self.invoker_id     = invoker_id
-        self.album_price    = album_price
-        self.index          = 0
+        self.inclusions      = inclusions
+        self.album_name      = album_name
+        self.album_cover     = album_image_url
+        self.invoker_id      = invoker_id
+        self.album_price     = album_price
+        self.index           = 0
+        # Search state — None means "not in search mode"
+        self.search_results: Optional[list[dict]] = None
+        self.search_index   = 0
+        self.search_query   = ""
         self._sync_buttons()
 
+    # ── helpers ────────────────────────────────────────────────────────────────
+    @property
+    def _active_list(self) -> list[dict]:
+        """Return the currently active list (filtered or full)."""
+        return self.search_results if self.search_results is not None else self.inclusions
+
+    @property
+    def _active_index(self) -> int:
+        return self.search_index if self.search_results is not None else self.index
+
+    @_active_index.setter
+    def _active_index(self, v: int):
+        if self.search_results is not None:
+            self.search_index = v
+        else:
+            self.index = v
+
     def _sync_buttons(self):
-        if not self.inclusions:
-            self.prev_btn.disabled = True
-            self.next_btn.disabled = True
+        lst = self._active_list
+        idx = self._active_index
+        if not lst:
+            self.prev_btn.disabled  = True
+            self.next_btn.disabled  = True
+            self.clear_btn.disabled = True
             return
-        self.prev_btn.disabled = (self.index == 0)
-        self.next_btn.disabled = (self.index >= len(self.inclusions) - 1)
+        self.prev_btn.disabled  = (idx == 0)
+        self.next_btn.disabled  = (idx >= len(lst) - 1)
+        # Show clear button only while in search mode
+        self.clear_btn.disabled = (self.search_results is None)
 
     def _build_embed(self) -> discord.Embed:
-        inc   = self.inclusions[self.index]
-        total = len(self.inclusions)
-        page  = self.index + 1
-
+        lst   = self._active_list
+        idx   = self._active_index
+        total = len(lst)
+        if not lst:
+            return discord.Embed(
+                title="no results",
+                description=f"no inclusions match **{self.search_query}**.",
+                color=discord.Color.red(),
+            )
+        inc          = lst[idx]
+        all_rarities = [i.get("rarity", 0) for i in self.inclusions]  # always use full list for rarity scaling
         rarity_int   = inc.get("rarity", 0)
-        all_rarities = [i.get("rarity", 0) for i in self.inclusions]
         rarity_label = _rarity_label_proportional(rarity_int, all_rarities)
-        sell_price = _inclusion_sell_price(rarity_int, all_rarities, self.album_price)
-        color = _rarity_color(rarity_int, all_rarities)
-
+        sell_price   = _inclusion_sell_price(rarity_int, all_rarities, self.album_price)
+        color        = _rarity_color(rarity_int, all_rarities)
+        # Build description — prepend search context banner when filtering
+        if self.search_results is not None:
+            desc = (
+                f"**album:** {self.album_name}\n"
+                f"🔍 search: **{self.search_query}** — {total} match{'es' if total != 1 else ''}"
+            )
+        else:
+            desc = f"**album:** {self.album_name}"
         embed = discord.Embed(
             title=inc["name"].lower(),
-            description=f"**album:** {self.album_name}",
+            description=desc,
             color=color,
         )
-        embed.add_field(name="rarity",        value=rarity_label,                  inline=True)
-        embed.add_field(name="inclusion id",  value=f"`{inc['inclusion_id']}`",    inline=True)
-        embed.add_field(name="sell price",    value=f"₩{sell_price:,}",            inline=True)
-        embed.set_footer(text=f"inclusion {page} of {total}  •  common → rare")
-
+        embed.add_field(name="rarity",       value=rarity_label,               inline=True)
+        embed.add_field(name="inclusion id", value=f"`{inc['inclusion_id']}`", inline=True)
+        embed.add_field(name="sell price",   value=f"₩{sell_price:,}",         inline=True)
+        footer_mode = "search results" if self.search_results is not None else "common → rare"
+        embed.set_footer(text=f"inclusion {idx + 1} of {total}  •  {footer_mode}")
         img_url = inc.get("image_url") or self.album_cover
         if img_url:
             embed.set_image(url=img_url)
         return embed
 
+    # ── interaction guard ──────────────────────────────────────────────────────
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return True
+        return True  # public browsing — any user may navigate
 
+    # ── navigation buttons ─────────────────────────────────────────────────────
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="inclbr_prev")
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index -= 1
+        self._active_index -= 1
         self._sync_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="inclbr_next")
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index += 1
+        self._active_index += 1
         self._sync_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
+    # ── search button ──────────────────────────────────────────────────────────
+    @discord.ui.button(label="🔍 Search", style=discord.ButtonStyle.primary, custom_id="inclbr_search")
+    async def search_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(InclusionSearchModal(browser_view=self))
+
+    # ── clear search button ────────────────────────────────────────────────────
+    @discord.ui.button(label="✖ Clear Search", style=discord.ButtonStyle.secondary, custom_id="inclbr_clear", disabled=True)
+    async def clear_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Exit search mode; restore full browse at the last global index
+        self.search_results = None
+        self.search_index   = 0
+        self.search_query   = ""
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    # ── timeout ────────────────────────────────────────────────────────────────
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True
