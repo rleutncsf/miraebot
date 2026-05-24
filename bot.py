@@ -3125,6 +3125,433 @@ async def birthday_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=view.get_embed(), view=view)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLOOR & DORM MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="floor_create", description="dev | create a new floor category.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(floor_name="display name for the floor")
+async def floor_create(interaction: discord.Interaction, floor_name: str):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    data = load_data()
+    key  = dorm_key_of(floor_name)
+    if key in data["floors"]: return await interaction.response.send_message("❌ exists.", ephemeral=True)
+
+    data["floors"][key] = {"name": floor_name, "rooms": {}}
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_create"))
+    if not discord.utils.get(guild.categories, name=floor_name): await guild.create_category(floor_name)
+    await interaction.response.send_message(f"✅ floor **{floor_name}** created.", ephemeral=True)
+
+@bot.tree.command(name="floor_rename", description="dev | rename a floor.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(old_name="current name", new_name="new name")
+async def floor_rename(interaction: discord.Interaction, old_name: str, new_name: str):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+
+    old_key = dorm_key_of(old_name)
+    new_key = dorm_key_of(new_name)
+    data    = load_data()
+
+    if old_key not in data["floors"]: return await interaction.response.send_message("❌ not found.", ephemeral=True)
+    if new_key == old_key or new_key in data["floors"]: return await interaction.response.send_message("❌ conflict.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    data["floors"][new_key] = data["floors"].pop(old_key)
+    data["floors"][new_key]["name"] = new_name
+
+    category = discord.utils.get(guild.categories, name=old_name)
+    if category:
+        try: await category.edit(name=new_name)
+        except: pass
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_rename"))
+    await interaction.followup.send(f"✅ renamed **{old_name}** to **{new_name}**.", ephemeral=True)
+
+@bot.tree.command(name="floor_delete", description="dev | permanently delete a floor and its rooms.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(floor_name="floor to delete", confirm="type exact name")
+async def floor_delete(interaction: discord.Interaction, floor_name: str, confirm: str):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    f_key = dorm_key_of(floor_name)
+    data = load_data()
+
+    if f_key not in data["floors"] or confirm != floor_name: return await interaction.response.send_message("❌ invalid.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    floor_data = data["floors"].pop(f_key)
+
+    displaced: dict[str, list[str]] = {}
+    for r_key, room_data in floor_data["rooms"].items():
+        for oc_key in room_data.get("occupants", []):
+            displaced.setdefault(oc_key, []).append(room_data["name"])
+
+    category = discord.utils.get(guild.categories, name=floor_data["name"])
+    if category:
+        for ch in list(category.channels):
+            try: await ch.delete()
+            except: pass
+        try: await category.delete()
+        except: pass
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="floor_delete"))
+    await interaction.followup.send(f"✅ floor **{floor_data['name']}** deleted.", ephemeral=True)
+
+@bot.tree.command(name="dorm_create", description="dev | create a dorm room.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(floor_name="floor name", room_name="room name", capacity="capacity (1, 2, 3, or 4)")
+async def dorm_create(interaction: discord.Interaction, floor_name: str, room_name: str, capacity: int):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if capacity not in DORM_SIZES: return await interaction.response.send_message("❌ invalid capacity.", ephemeral=True)
+
+    data = load_data()
+    f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
+
+    if f_key not in data["floors"]: return await interaction.response.send_message("❌ floor not found.", ephemeral=True)
+    floor = data["floors"][f_key]
+    if r_key in floor["rooms"]: return await interaction.response.send_message("❌ room exists.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    floor["rooms"][r_key] = {"name": room_name, "capacity": capacity, "occupants": []}
+
+    category = discord.utils.get(guild.categories, name=floor["name"])
+    if category is None: category = await guild.create_category(floor["name"])
+
+    if not discord.utils.get(guild.text_channels, name=r_key, category=category):
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True)}
+        await guild.create_text_channel(r_key, category=category, overwrites=overwrites)
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_create"))
+    await interaction.followup.send(f"✅ room **{room_name}** created.")
+
+@bot.tree.command(name="dorm_edit", description="dev | edit a dorm room's name or capacity.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(floor_name="floor name", room_name="current room name", new_room_name="new name", new_capacity="new capacity")
+async def dorm_edit(interaction: discord.Interaction, floor_name: str, room_name: str, new_room_name: Optional[str] = None, new_capacity: Optional[int] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    if new_room_name is None and new_capacity is None: return await interaction.response.send_message("❌ provide at least one edit.", ephemeral=True)
+    if new_capacity is not None and new_capacity not in DORM_SIZES: return await interaction.response.send_message("❌ invalid capacity.", ephemeral=True)
+
+    f_key, old_rkey = dorm_key_of(floor_name), room_key_of(room_name)
+    data = load_data()
+    if f_key not in data["floors"]: return await interaction.response.send_message("❌ floor not found.", ephemeral=True)
+    floor = data["floors"][f_key]
+    if old_rkey not in floor["rooms"]: return await interaction.response.send_message("❌ room not found.", ephemeral=True)
+
+    room_data = floor["rooms"][old_rkey]
+    if new_capacity is not None and new_capacity < len(room_data["occupants"]): return await interaction.response.send_message("❌ capacity cannot be less than current occupants.", ephemeral=True)
+    if new_capacity is not None: room_data["capacity"] = new_capacity
+
+    if new_room_name is not None:
+        new_rkey = room_key_of(new_room_name)
+        if new_rkey in floor["rooms"]: return await interaction.response.send_message("❌ name conflict.", ephemeral=True)
+        floor["rooms"][new_rkey] = floor["rooms"].pop(old_rkey)
+        floor["rooms"][new_rkey]["name"] = new_room_name
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_edit"))
+    await interaction.response.send_message("✅ room updated.", ephemeral=True)
+
+@bot.tree.command(name="dorm_relocate", description="dev | move a dorm room to another floor.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(room_name="room name", source_floor="current floor", target_floor="destination floor")
+async def dorm_relocate(interaction: discord.Interaction, room_name: str, source_floor: str, target_floor: str):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    data = load_data()
+    src_fkey, tgt_fkey, r_key = dorm_key_of(source_floor), dorm_key_of(target_floor), room_key_of(room_name)
+    if src_fkey not in data["floors"] or tgt_fkey not in data["floors"] or r_key not in data["floors"][src_fkey]["rooms"]: return await interaction.response.send_message("❌ invalid target.", ephemeral=True)
+
+    data["floors"][tgt_fkey]["rooms"][r_key] = data["floors"][src_fkey]["rooms"].pop(r_key)
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_relocate"))
+    await interaction.response.send_message("✅ room moved.", ephemeral=True)
+
+@bot.tree.command(name="dorm_delete", description="dev | permanently delete a dorm room.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(floor_name="floor name", room_name="room name", confirm="exact name")
+async def dorm_delete(interaction: discord.Interaction, floor_name: str, room_name: str, confirm: str):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    f_key, r_key = dorm_key_of(floor_name), room_key_of(room_name)
+    data = load_data()
+    if f_key not in data["floors"] or r_key not in data["floors"][f_key]["rooms"] or confirm != room_name: return await interaction.response.send_message("❌ invalid target.", ephemeral=True)
+
+    data["floors"][f_key]["rooms"].pop(r_key)
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_delete"))
+    await interaction.response.send_message("✅ room deleted.", ephemeral=True)
+
+@bot.tree.command(name="dorm_assign", description="assign an oc to a dorm room.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name", floor_name="floor name", room_name="room name")
+async def dorm_assign(interaction: discord.Interaction, oc_name: str, floor_name: str, room_name: str):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    oc_key, f_key, r_key = oc_key_of(oc_name), dorm_key_of(floor_name), room_key_of(room_name)
+    if oc_key not in data["ocs"]: return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+    if f_key not in data["floors"] or r_key not in data["floors"][f_key]["rooms"]: return await interaction.response.send_message("❌ room not found.", ephemeral=True)
+
+    for f_k, f_v in data["floors"].items():
+        for r_k, r_v in f_v["rooms"].items():
+            if oc_key in r_v["occupants"]: return await interaction.response.send_message("❌ already assigned.", ephemeral=True)
+
+    room_data = data["floors"][f_key]["rooms"][r_key]
+    if len(room_data["occupants"]) >= room_data["capacity"]: return await interaction.response.send_message("❌ room full.", ephemeral=True)
+
+    room_data["occupants"].append(oc_key)
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_assign"))
+
+    oc_record = data["ocs"][oc_key]
+    owner_id = oc_record.get("owner_id")
+    if guild and owner_id:
+        member = guild.get_member(int(owner_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(owner_id))
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+
+        if member:
+            floor_display_name = data["floors"][f_key]["name"]
+            category = discord.utils.get(guild.categories, name=floor_display_name)
+            if category:
+                dorm_channel = discord.utils.get(
+                    guild.text_channels,
+                    name=r_key,
+                    category=category,
+                )
+                if dorm_channel:
+                    try:
+                        await dorm_channel.set_permissions(
+                            member,
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as perm_err:
+                        log.warning(
+                            "dorm_assign: failed to set channel perms for %s in #%s — %s",
+                            member, dorm_channel.name, perm_err,
+                        )
+
+    await interaction.response.send_message(f"✅ **{oc_name}** assigned to **{room_name}**.", ephemeral=True)
+
+@bot.tree.command(name="dorm_unassign", description="remove an oc from their room.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name")
+async def dorm_unassign(interaction: discord.Interaction, oc_name: str):
+    data = load_data()
+    oc_key = oc_key_of(oc_name)
+    guild = resolve_guild(interaction)
+
+    oc_record = data["ocs"].get(oc_key)
+    if not oc_record:
+        return await interaction.response.send_message("❌ oc not found.", ephemeral=True)
+
+    if not is_dev(interaction) and oc_record.get("owner_id") != interaction.user.id:
+        return await interaction.response.send_message("❌ you do not own this oc.", ephemeral=True)
+
+    found_f_key = found_r_key = found_room = None
+    for f_key, floor in data["floors"].items():
+        for r_key, room_data in floor["rooms"].items():
+            if oc_key in room_data["occupants"]:
+                found_f_key, found_r_key, found_room = f_key, r_key, room_data
+                break
+        if found_f_key:
+            break
+
+    if not found_f_key:
+        return await interaction.response.send_message("❌ oc not in any dorm.", ephemeral=True)
+
+    room_name = found_room.get("name", found_r_key)
+    balance = oc_record.get("balance", 0)
+
+    if balance < 90_000:
+        return await interaction.response.send_message(
+            f"❌ {oc_record['name']} cannot leave — they need ₩90,000 as a departure fee but only have ₩{balance:,}.",
+            ephemeral=True
+        )
+
+    confirm_embed = discord.Embed(
+        title="⚠️ confirm dorm unassign",
+        description=(
+            f"**{oc_record['name']}** will be removed from **{room_name}**.\n"
+            f"a departure fee of ₩90,000 will be deducted.\n"
+            f"new balance after fee: ₩{balance - 90_000:,}.\n\n"
+            f"this action cannot be undone."
+        ),
+        color=discord.Color.orange()
+    )
+
+    if not await wait_for_confirm(interaction, confirm_embed):
+        return await interaction.followup.send("❌ unassign cancelled.", ephemeral=True)
+
+    data = load_data()
+    oc_record = data["ocs"].get(oc_key)
+    if not oc_record:
+        return await interaction.followup.send("❌ oc no longer exists.", ephemeral=True)
+
+    found_f_key = found_r_key = found_room = None
+    for f_key, floor in data["floors"].items():
+        for r_key, room_data in floor["rooms"].items():
+            if oc_key in room_data["occupants"]:
+                found_f_key, found_r_key, found_room = f_key, r_key, room_data
+                break
+        if found_f_key:
+            break
+
+    if not found_f_key:
+        return await interaction.followup.send("❌ oc is no longer in any dorm.", ephemeral=True)
+
+    room_name = found_room.get("name", found_r_key)
+
+    found_room["occupants"].remove(oc_key)
+    oc_record["balance"] = oc_record.get("balance", 0) - 90_000
+    new_balance = oc_record["balance"]
+
+    owner_id = oc_record.get("owner_id")
+    owner_still_has_oc_in_room = (
+        owner_id is not None and
+        any(
+            data["ocs"].get(k, {}).get("owner_id") == owner_id
+            for k in found_room["occupants"]
+        )
+    )
+
+    if not owner_still_has_oc_in_room and guild and owner_id:
+        member = guild.get_member(int(owner_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(owner_id))
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        if member:
+            floor_display_name = data["floors"][found_f_key]["name"]
+            category = discord.utils.get(guild.categories, name=floor_display_name)
+            if category:
+                dorm_channel = discord.utils.get(
+                    guild.text_channels,
+                    name=found_r_key,
+                    category=category,
+                )
+                if dorm_channel:
+                    try:
+                        await dorm_channel.set_permissions(member, overwrite=None)
+                    except (discord.Forbidden, discord.HTTPException) as perm_err:
+                        log.warning(
+                            "dorm_unassign: failed to remove channel perms for %s — %s",
+                            member, perm_err,
+                        )
+    else:
+        log.debug("dorm_unassign: owner %s still has another oc in %s, keeping channel access.", owner_id, room_name)
+
+    await save_and_backup(data, reason="dorm_unassign")
+    await audit(guild, f"dorm_unassign: {oc_record['name']} removed from {room_name}, fee ₩90,000 deducted by {interaction.user}")
+    await interaction.followup.send(
+        f"✅ **{oc_record['name']}** removed from **{room_name}**. ₩90,000 departure fee deducted. new balance: ₩{new_balance:,}.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="dorm_kick", description="dev | force-remove a user's ocs from dorms.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(user="target user", oc_name="specific oc (optional)")
+async def dorm_kick(interaction: discord.Interaction, user: discord.Member, oc_name: Optional[str] = None):
+    if not is_dev(interaction): return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+    keys = [oc_key_of(oc_name)] if oc_name else [k for k, v in data["ocs"].items() if v.get("owner_id") == user.id]
+
+    removed = False
+    removed_rooms = []
+    for f_key, floor in data["floors"].items():
+        for r_key, room_data in floor["rooms"].items():
+            for k in keys:
+                if k in room_data["occupants"]:
+                    room_data["occupants"].remove(k)
+                    removed = True
+                    removed_rooms.append((f_key, r_key))
+
+    if not removed: return await interaction.followup.send("❌ nothing removed.", ephemeral=True)
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="dorm_kick"))
+
+    guild = resolve_guild(interaction)
+    if guild:
+        for f_key, r_key in removed_rooms:
+            floor_display_name = data["floors"][f_key]["name"]
+            category = discord.utils.get(guild.categories, name=floor_display_name)
+            if category:
+                dorm_channel = discord.utils.get(
+                    guild.text_channels,
+                    name=r_key,
+                    category=category,
+                )
+                if dorm_channel:
+                    try:
+                        await dorm_channel.set_permissions(user, overwrite=None)
+                    except (discord.Forbidden, discord.HTTPException) as perm_err:
+                        log.warning(
+                            "dorm_kick: failed to remove channel perms for %s — %s",
+                            user, perm_err,
+                        )
+
+    await interaction.followup.send("✅ kicked from dorms.", ephemeral=True)
+
+class DormPaginatorView(discord.ui.View):
+    def __init__(self, floors_items: list, ocs: dict):
+        super().__init__(timeout=300)
+        self.floors = floors_items
+        self.ocs = ocs
+        self.current_index = 0
+        options = [discord.SelectOption(label=floor_dict["name"][:100], value=str(i), default=(i == 0)) for i, (floor_key, floor_dict) in enumerate(floors_items[:25])]
+        self.floor_select = discord.ui.Select(options=options)
+        self.floor_select.callback = self._floor_select_callback
+        self.add_item(self.floor_select)
+
+    async def _floor_select_callback(self, interaction):
+        self.current_index = int(self.floor_select.values[0])
+        for opt in self.floor_select.options: opt.default = (opt.value == str(self.current_index))
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    def get_embed(self):
+        if not self.floors: return discord.Embed(description="no floors.")
+        f_key, floor = self.floors[self.current_index]
+        embed = discord.Embed(title=f"floor: {floor['name']}", color=discord.Color.green())
+        for r_key, r_data in floor["rooms"].items():
+            occ = [self.ocs[o]["name"] for o in r_data["occupants"] if o in self.ocs]
+            status = "🔴 full" if len(occ) >= r_data["capacity"] else "🟢 available"
+            embed.add_field(name=f"🚪 {r_data['name']}  [{len(occ)}/{r_data['capacity']}]  {status}", value="🏠 " + ", ".join(occ) if occ else "🪑 empty", inline=False)
+        return embed
+
+@bot.tree.command(name="dorm_view", description="view floors and dorm occupancy.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def dorm_view(interaction: discord.Interaction):
+    data = load_data()
+    if not data["floors"]:
+        return await interaction.response.send_message("❌ no floors.", ephemeral=True)
+    view = DormPaginatorView(list(data["floors"].items()), data["ocs"])
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
+
+
 @bot.tree.command(
     name="balance_edit",
     description="dev | adjust or overwrite an oc's balance."
