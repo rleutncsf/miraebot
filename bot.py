@@ -4283,6 +4283,17 @@ class IGPostView(discord.ui.View):
         await interaction.response.send_message(f"💬 thread created: {thread.mention}", ephemeral=True)
 
 
+def _video_embed_strategy(url: str) -> str:
+    """
+    Return the send strategy for a video URL.
+    "inline"   — URL is on Discord's CDN; set_image(url) will render a playable
+                 video player inside the embed card.
+    "separate" — URL is external; send the embed first, then the raw URL as a
+                 second message so Discord unfurls the video beneath the embed.
+    """
+    return "inline" if _is_cdn_attachment(url) else "separate"
+
+
 @bot.tree.command(name="ig_post", description="post 1–10 photos or videos as your oc.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -4369,20 +4380,46 @@ async def ig_post(
 
     view = IGPostView(post_id, likes=0)
 
-    async def _send_media_item(channel, media_item: dict, embed_base_color, view=None):
+    async def _send_media_item(
+        channel: discord.TextChannel,
+        media_item: dict,
+        embed_base_color: discord.Color,
+        *,
+        embed_meta: Optional[discord.Embed] = None,
+        view: Optional[discord.ui.View] = None,
+    ) -> discord.Message:
+        """
+        Send one media item to *channel* and return the last message sent.
+        embed_meta  — If supplied, this embed (which already has author + description set)
+                      is used as the base; otherwise a colour-only embed is created.
+        view        — IGPostView buttons.  Attached to the *last* message sent so that
+                      message.id is the correct anchor for comment threads and message_id storage.
+        """
+        base_embed = embed_meta or discord.Embed(color=embed_base_color)
         if media_item["type"] == "image":
-            e = discord.Embed(color=embed_base_color)
-            e.set_image(url=media_item["url"])
-            return await channel.send(embed=e, view=view)
-        else:
-            # Send the URL as bare content so Discord auto-unfurls the video player,
-            # and include a minimal embed for consistent color theming.
-            # Both must be in the same send() call; the video preview appears beneath.
-            e = discord.Embed(color=embed_base_color)
-            kwargs = {"content": media_item["url"], "embed": e}
-            if view is not None:
-                kwargs["view"] = view
-            return await channel.send(**kwargs)
+            base_embed.set_image(url=media_item["url"])
+            return await channel.send(embed=base_embed, view=view)
+        # ── Video ──────────────────────────────────────────────────────────────────
+        strategy = _video_embed_strategy(media_item["url"])
+        if strategy == "inline":
+            # Discord CDN URL: set_image renders a native inline video player.
+            base_embed.set_image(url=media_item["url"])
+            return await channel.send(embed=base_embed, view=view)
+        else:  # "separate"
+            # External URL: reconstruct a metadata-only embed as the visual anchor,
+            # then send the raw URL as a second message so Discord unfurls the video below.
+            meta_only = discord.Embed(
+                description=base_embed.description,
+                color=embed_base_color,
+            )
+            if base_embed.author.name:
+                meta_only.set_author(
+                    name=base_embed.author.name,
+                    icon_url=base_embed.author.icon_url,
+                )
+            await channel.send(embed=meta_only)
+            # Raw URL message — view must be here so message_id points to the interactive msg.
+            return await channel.send(content=media_item["url"], view=view)
 
     color = discord.Color.from_rgb(225, 48, 108)
 
@@ -4396,13 +4433,17 @@ async def ig_post(
             embed.set_image(url=m["url"])
             last_msg = await ig_ch.send(embed=embed, view=view)
         else:
-            # For a single video post: embed carries the author + caption metadata;
-            # the bare URL on `content` triggers Discord's native video unfurl/preview.
+            # For a single video post: delegate to _send_media_item which selects
+            # inline (CDN) or separate (external) strategy automatically.
             embed = discord.Embed(
                 description=f"**{handle}**  {caption}", color=color
             )
             embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
-            last_msg = await ig_ch.send(content=m["url"], embed=embed, view=view)
+            last_msg = await _send_media_item(
+                ig_ch, m, color,
+                embed_meta=embed,
+                view=view,
+            )
         data["instagram"][post_id]["message_id"] = last_msg.id
     else:
         first_m = media[0]
@@ -4416,14 +4457,18 @@ async def ig_post(
                 description=f"**{handle}**  {caption}", color=color
             )
             embed.set_author(name=f"{oc['name']}  ({handle})", icon_url=oc.get("profile_picture"))
-            first_msg = await ig_ch.send(content=first_m["url"], embed=embed)
+            first_msg = await _send_media_item(
+                ig_ch, first_m, color,
+                embed_meta=embed,
+                view=None,  # view attaches to last message, never to first in a multi-item post
+            )
         data["instagram"][post_id]["message_id"] = first_msg.id
 
         for m in media[1:-1]:
-            await _send_media_item(ig_ch, m, color)
+            await _send_media_item(ig_ch, m, color, embed_meta=None, view=None)
 
         last_m = media[-1]
-        await _send_media_item(ig_ch, last_m, color, view=view)
+        await _send_media_item(ig_ch, last_m, color, embed_meta=None, view=view)
 
     data["instagram"][post_id]["channel_id"] = ig_ch.id
     save_data(data)
