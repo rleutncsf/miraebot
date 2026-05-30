@@ -4962,6 +4962,8 @@ async def oc_list(interaction: discord.Interaction, filter_by: Optional[str] = N
     view = OCPaginatorView(list(ocs.items()))
     await interaction.response.send_message(embed=view.get_embed(), view=view)
 
+MONTHS_ORDER = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+
 class BirthdayPaginatorView(discord.ui.View):
     PAGE_SIZE = 7
     def __init__(self, ocs_sorted: list, today_kst):
@@ -5020,10 +5022,76 @@ class BirthdayPaginatorView(discord.ui.View):
         self._update_buttons()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-@bot.tree.command(name="birthday_list", description="view upcoming and past oc birthdays, grouped by 7.")
+class BirthdayMonthPaginatorView(discord.ui.View):
+    def __init__(self, ocs: list, today_kst):
+        super().__init__(timeout=300)
+        self.today_kst = today_kst
+        # Index into MONTHS_ORDER; starts on the current KST month.
+        self.current_month_index: int = today_kst.month - 1  # 0-based index, January=0
+        # Build month_map once; O(n) over all OCs.
+        self.month_map: dict = {m: {} for m in range(1, 13)}
+        for oc in ocs:
+            bday_str = oc.get("birthday", "")
+            if not bday_str:
+                continue
+            try:
+                bday = datetime.strptime(bday_str, BIRTHDAY_FORMAT).date()
+            except ValueError:
+                continue
+            self.month_map[bday.month].setdefault(bday.day, []).append(oc["name"])
+
+    def get_embed(self) -> discord.Embed:
+        displayed_month: int = MONTHS_ORDER[self.current_month_index]
+        month_name: str = datetime(2000, displayed_month, 1).strftime("%B")
+
+        day_map: dict = self.month_map[displayed_month]
+        sorted_days: list = sorted(day_map.keys())
+
+        if sorted_days:
+            lines = []
+            for day in sorted_days:
+                names = ", ".join(day_map[day])
+                line = f"{month_name} {day} — {names}"
+                is_today: bool = (displayed_month == self.today_kst.month and day == self.today_kst.day)
+                if is_today:
+                    line = f"**{line}** 🎂"
+                lines.append(line)
+        else:
+            lines = ["*no birthdays this month.*"]
+
+        embed = discord.Embed(
+            title=f"🎂 {month_name} Birthdays",
+            description="\n".join(lines),
+            color=discord.Color.from_rgb(255, 182, 193),
+        )
+        embed.set_footer(text=f"{month_name}  •  use ◀ ▶ to browse months")
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="bday_month_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_month_index = (self.current_month_index - 1) % 12
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="bday_month_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_month_index = (self.current_month_index + 1) % 12
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+@bot.tree.command(name="birthday_list", description="View OC birthdays month by month.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def birthday_list(interaction: discord.Interaction):
+    data = load_data()
+    ocs = list(data["ocs"].values())
+    if not ocs: return await interaction.response.send_message("❌ no ocs registered.", ephemeral=True)
+    today_kst = datetime.now(KST).date()
+    view = BirthdayMonthPaginatorView(ocs, today_kst)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
+
+@bot.tree.command(name="birthday_list_sorted", description="View upcoming and past OC birthdays, sorted by days until.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def birthday_list_sorted(interaction: discord.Interaction):
     data = load_data()
     ocs = list(data["ocs"].values())
     if not ocs: return await interaction.response.send_message("❌ no ocs registered.", ephemeral=True)
