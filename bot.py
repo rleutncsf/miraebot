@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import io
 import json
 import logging
@@ -8,6 +9,7 @@ import re
 import threading
 import signal
 import sys
+import time
 import uuid
 import webserver
 import random
@@ -19,6 +21,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -51,6 +58,7 @@ BIRTHDAY_FORMAT           = "%Y/%m/%d"
 BIRTHDAY_DISPLAY          = "YYYY/MM/DD"
 DORM_SIZES                = [1, 2, 3, 4]
 MAX_PHOTOS                = 10
+TUPPERBOX_BOT_ID          = 431544605209788416   # Tupperbox — must be in every bot-managed channel
 
 # Channels that must exist for the bot to function correctly.
 # Each entry: (name, topic, make_private, category_hint)
@@ -93,7 +101,8 @@ COLORS = {
     "system": discord.Color.blurple(),
     "success": discord.Color.green(),
     "error": discord.Color.red(),
-    "neutral": discord.Color.light_grey()
+    "neutral": discord.Color.light_grey(),
+    "weverse": discord.Color.from_rgb(4, 219, 180),   # Weverse green
 }
 
 # ─── Rarity tier system ────────────────────────────────────────────────────────
@@ -131,6 +140,8 @@ DB_LOADED  = False
 DATA_DIRTY = False
 _VIEWS_REGISTERED = False
 _EVAL_SKIP_FIRST_TICK = False
+
+_BOT_START_TIME: float = time.monotonic()
 
 _http_session: Optional[aiohttp.ClientSession] = None
 
@@ -176,6 +187,26 @@ def find_oc(oc_name: str, data: dict):
     if oc:
         oc["id"] = key
     return oc
+
+def find_oc_fuzzy(name: str, data: dict) -> Optional[dict]:
+    """
+    Exact-key lookup first; falls back to difflib closest match.
+    Returns the OC dict (with 'id' injected) or None.
+    cutoff=0.75 requires ≥75% similarity — tight enough to avoid false positives
+    on short names while still catching one-character typos.
+    """
+    key = oc_key_of(name)
+    if key in data["ocs"]:
+        oc = data["ocs"][key]
+        oc["id"] = key
+        return oc
+    keys = list(data["ocs"].keys())
+    matches = difflib.get_close_matches(key, keys, n=1, cutoff=0.75)
+    if matches:
+        oc = data["ocs"][matches[0]]
+        oc["id"] = matches[0]
+        return oc
+    return None
 
 def get_embed(title: str, description: str, color_key: str = "system", reveal_color_override: int = None) -> discord.Embed:
     if reveal_color_override is not None:
@@ -286,12 +317,14 @@ def _migrate_schema(d: dict) -> dict:
         ("weverse_channel_id", None),
         ("weverse_dm_category_id", None),
         ("weverse_group_category_id", None),
+        ("weverse_group_dm_category_id", None),
         ("guild_id", None),
     ]:
         d["config"].setdefault(key, default)
 
     for oc in d.get("ocs", {}).values():
         oc.setdefault("balance", 500000)
+        oc.setdefault("eval_history", [])
         
     for item in d.get("shop", {}).values():
         for inc in item.get("inclusions", []):
@@ -332,6 +365,9 @@ def _migrate_schema(d: dict) -> dict:
     for gid, grp in d.get("weverse_groups", {}).items():
         if "member_discord_ids" in grp and "member_oc_ids" not in grp:
             grp["member_oc_ids"] = [f"legacy_user_{uid}" for uid in grp.pop("member_discord_ids")]
+        grp.setdefault("member_dm_channels", {oc_k: None for oc_k in grp.get("member_oc_ids", [])})
+        grp.setdefault("member_dm_subscribers", {oc_k: {} for oc_k in grp.get("member_oc_ids", [])})
+        grp.setdefault("archived", False)
 
     d.setdefault("config", {})
     d["config"].pop("voting_scheduler", None)
@@ -519,8 +555,169 @@ def _resolve_weverse_channel(guild: discord.Guild, data: dict) -> Optional[disco
             return ch
     return discord.utils.get(guild.text_channels, name=WEVERSE_CHANNEL_NAME)
 
+def _is_weverse_artist(oc_id: str, data: dict) -> bool:
+    """
+    Return True if oc_id is a Weverse artist under either pathway:
+      1. Explicitly registered via /weverse artist register
+      2. Is a current member of at least one non-archived Weverse group
+    """
+    if oc_id in data.get("weverse_artists", {}):
+        return True
+    for grp in data.get("weverse_groups", {}).values():
+        if grp.get("archived"):
+            continue
+        if oc_id in grp.get("member_oc_ids", []):
+            return True
+    return False
+
+def _weverse_artist_footer_label(oc_id: str, data: dict) -> str:
+    """
+    Return footer text for an artist reply embed.
+    Individual artist → 'Weverse Artist'.
+    Group-only member → 'Weverse Artist · {GroupName}'.
+    """
+    if oc_id in data.get("weverse_artists", {}):
+        return "Weverse Artist"
+    for grp in data.get("weverse_groups", {}).values():
+        if not grp.get("archived") and oc_id in grp.get("member_oc_ids", []):
+            return f"Weverse Artist · {grp.get('name', 'Group')}"
+    return "Weverse Artist"
+
 def _inclusion_sort_key(inc):
     return (inc.get("rarity", 0), inc["name"].lower())
+
+def _find_inclusion_instance(
+    oc_inv: dict,
+    inc_id: str,
+    instance_index: int,
+) -> tuple[Optional[dict], Optional[dict]]:
+    if inc_id in oc_inv:
+        instances = oc_inv[inc_id]
+        if 0 <= instance_index < len(instances):
+            return (instances[instance_index], {"type": "standalone", "inc_id": inc_id, "inst_idx": instance_index})
+
+    occurrence = 0
+    for album_id, album_instances in oc_inv.items():
+        if not album_id.startswith("id_"):
+            continue
+        for album_inst_idx, album_inst in enumerate(album_instances):
+            for pulled_idx, pulled in enumerate(album_inst.get("pulled_inclusions", [])):
+                if pulled.get("inclusion_id") == inc_id:
+                    if occurrence == instance_index:
+                        return (
+                            pulled,
+                            {
+                                "type": "nested",
+                                "album_id": album_id,
+                                "album_inst_idx": album_inst_idx,
+                                "pulled_idx": pulled_idx,
+                            },
+                        )
+                    occurrence += 1
+
+    return (None, None)
+
+def _count_inclusion_instances(oc_inv: dict, inc_id: str) -> int:
+    total = 0
+    if inc_id in oc_inv:
+        total += len(oc_inv[inc_id])
+    for album_id, album_instances in oc_inv.items():
+        if not album_id.startswith("id_"):
+            continue
+        for album_inst in album_instances:
+            for pulled in album_inst.get("pulled_inclusions", []):
+                if pulled.get("inclusion_id") == inc_id:
+                    total += 1
+    return total
+
+def _pop_n_inclusion_instances(d: dict, oc_key: str, inc_id: str, n: int) -> Optional[list[dict]]:
+    oc_inv = d["inventories"].get(oc_key, {})
+    popped = []
+
+    standalone = oc_inv.get(inc_id, [])
+    while standalone and len(popped) < n:
+        popped.append(standalone.pop(0))
+    if not standalone and inc_id in oc_inv:
+        del oc_inv[inc_id]
+
+    if len(popped) < n:
+        for album_id in list(oc_inv.keys()):
+            if not album_id.startswith("id_"):
+                continue
+            for album_inst in oc_inv[album_id]:
+                pulled_list = album_inst.get("pulled_inclusions", [])
+                i = 0
+                while i < len(pulled_list) and len(popped) < n:
+                    if pulled_list[i].get("inclusion_id") == inc_id:
+                        popped.append(pulled_list.pop(i))
+                    else:
+                        i += 1
+            if len(popped) >= n:
+                break
+
+    if len(popped) < n:
+        return None
+    return popped
+
+def _deposit_inclusion_instances(d: dict, oc_key: str, inc_dicts: list[dict]) -> None:
+    for inc_dict in inc_dicts:
+        inc_id = inc_dict.get("inclusion_id") or "unknown"
+        inc_dict.setdefault("acquired_at", now_iso())
+        d["inventories"].setdefault(oc_key, {}).setdefault(inc_id, []).append(inc_dict)
+
+def _apply_birthday_discount(price: int) -> int:
+    """Return price discounted by 30%, rounded to nearest ₩100, floor ₩100."""
+    discounted = price * 0.70
+    rounded = round(discounted / 100) * 100
+    return max(100, rounded)
+
+def _inclusion_sell_price(rarity_int: int, all_rarities: list, album_price: int) -> int:
+    """
+    Compute the sell price for an inclusion using a proportional cubic curve,
+    absolute rarity log bonus, tier multiplier, and price ceiling.
+    Result is rounded to the nearest ₩100 and floored at ₩100.
+    """
+    RARITY_BASE_FLOOR_FRAC   = 0.04
+    RARITY_PROP_RANGE_FRAC   = 0.50
+    RARITY_ABS_BONUS_PER_LOG2_UNIT = 150
+    RARITY_ABS_BONUS_CAP     = 8_000
+    RARITY_TOP_TIER_CEILING_FACTOR = 0.85
+    n_tiers = len(RARITY_TIER_LABELS)
+    _half = n_tiers / 2.0
+    TIER_MULTIPLIERS: list[float] = [
+        1.0 if i < _half else round(1.0 + 0.10 * (i - _half + 1), 2)
+        for i in range(n_tiers)
+    ]
+    if not all_rarities:
+        return 100
+    min_r = min(all_rarities)
+    max_r = max(all_rarities)
+    if max_r == min_r:
+        prop_score = 0.0
+    else:
+        prop_score = (rarity_int - min_r) / (max_r - min_r)
+    prop_score = max(0.0, min(1.0, prop_score))
+    cubic_score = prop_score ** 3
+    prop_price = album_price * (RARITY_BASE_FLOOR_FRAC + RARITY_PROP_RANGE_FRAC * cubic_score)
+    abs_bonus = min(
+        math.log2(max(rarity_int, 1) + 1) * RARITY_ABS_BONUS_PER_LOG2_UNIT,
+        RARITY_ABS_BONUS_CAP
+    )
+    if max_r == min_r:
+        tier_bucket = 0
+    else:
+        tier_bucket = int((rarity_int - min_r) / ((max_r - min_r) / n_tiers))
+    tier_bucket = max(0, min(n_tiers - 1, tier_bucket))
+    tier_mult = TIER_MULTIPLIERS[tier_bucket]
+    raw_price = (prop_price + abs_bonus) * tier_mult
+    if tier_bucket >= n_tiers - 2:
+        ceiling = album_price * RARITY_TOP_TIER_CEILING_FACTOR
+    else:
+        ceiling = album_price * (RARITY_BASE_FLOOR_FRAC + RARITY_PROP_RANGE_FRAC)
+    raw_price = min(raw_price, ceiling)
+    rounded = round(raw_price / 100) * 100
+    return max(100, rounded)
+
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
@@ -577,6 +774,7 @@ def load_data() -> dict:
         ("weverse_channel_id", None),
         ("weverse_dm_category_id", None),
         ("weverse_group_category_id", None),
+        ("weverse_group_dm_category_id", None),
         ("guild_id", None)
     ]:
         if key not in d["config"]:
@@ -925,12 +1123,125 @@ def now_utc() -> datetime:
 def now_iso() -> str:
     return now_utc().isoformat()
 
+def _safe_int(value) -> Optional[int]:
+    """
+    Coerce *value* to int, returning None on failure.
+    Used to normalize owner_id comparisons regardless of whether the JSON
+    round-trip preserved the value as int or str.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 def _safe_fmt(template: str, **kwargs) -> str:
     """Format a template string, ignoring unknown placeholders gracefully."""
     try:
         return template.format(**kwargs)
     except (KeyError, IndexError):
         return template
+
+def _is_cdn_attachment(url: str) -> bool:
+    """Return True if the URL is a Discord CDN attachment URL."""
+    return bool(url and "cdn.discordapp.com/attachments/" in url)
+
+def _oc_birthday_is_today_kst(oc: dict) -> bool:
+    """
+    Return True if today's KST calendar date matches the OC's birthday
+    (month and day only — year is not considered).
+    """
+    birthday_str = oc.get("birthday")
+    if not birthday_str:
+        return False
+    try:
+        bday = datetime.strptime(birthday_str, BIRTHDAY_FORMAT).date()
+        today_kst = datetime.now(KST).date()
+        return bday.month == today_kst.month and bday.day == today_kst.day
+    except Exception:
+        return False
+
+def _is_bot_managed_channel(channel: discord.TextChannel) -> bool:
+    """
+    Return True if the channel is one the bot is responsible for managing.
+    """
+    static_names = {
+        LOG_CHANNEL_NAME, AUDIT_CHANNEL_NAME, DEBUT_CHANNEL_NAME,
+        NEWS_CHANNEL_NAME, DEV_RESPONSE_CHANNEL_NAME,
+        INSTAGRAM_CHANNEL_NAME, TWITTER_CHANNEL_NAME,
+        DB_BACKUP_CHANNEL_NAME, ASSET_CHANNEL_NAME,
+        WEVERSE_CHANNEL_NAME,
+    }
+    if channel.name in static_names:
+        return True
+    if channel.name.startswith("dm-"):
+        return True
+    if channel.name.startswith("gc-"):
+        return True
+    if channel.name.startswith(WEVERSE_DM_CHANNEL_PREFIX):
+        return True
+    return False
+
+async def _add_tupperbox_to_channel(
+    channel: discord.TextChannel,
+    *,
+    reason: str = "bot-managed channel: ensuring Tupperbox access",
+) -> bool:
+    """
+    Grant Tupperbox the minimum permissions it needs to operate in `channel`.
+    Returns True if permissions were successfully set, False otherwise.
+    """
+    guild = channel.guild
+    tupperbox_member = guild.get_member(TUPPERBOX_BOT_ID)
+    if tupperbox_member is None:
+        log.warning(
+            "_add_tupperbox_to_channel: Tupperbox (id=%s) is not a member of guild '%s'. "
+            "Cannot add it to #%s.",
+            TUPPERBOX_BOT_ID, guild.name, channel.name,
+        )
+        return False
+    existing = channel.overwrites_for(tupperbox_member)
+    if existing.read_messages and existing.send_messages and existing.read_message_history:
+        return True
+    try:
+        await channel.set_permissions(
+            tupperbox_member,
+            read_messages=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=False,
+            reason=reason,
+        )
+        return True
+    except discord.Forbidden:
+        log.error("_add_tupperbox_to_channel: Missing 'Manage Permissions' on #%s.", channel.name)
+        return False
+    except discord.HTTPException as exc:
+        log.error("_add_tupperbox_to_channel: HTTP error on #%s: %s", channel.name, exc)
+        return False
+
+
+async def _delete_asset_message(msg_id: Optional[int]) -> None:
+    """Attempt to delete a message from the asset channel by its stored message ID."""
+    if not msg_id:
+        return
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=ASSET_CHANNEL_NAME)
+        if not ch:
+            continue
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.delete()
+            log.debug("_delete_asset_message: deleted asset msg %s from #%s", msg_id, ch.name)
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning("_delete_asset_message: no permission to delete msg %s in #%s", msg_id, ch.name)
+        except discord.HTTPException as exc:
+            log.warning("_delete_asset_message: HTTP error deleting msg %s — %s", msg_id, exc)
+        break
+
 
 # ─── Audit helper ──────────────────────────────────────────────────────────────
 async def audit(guild: discord.Guild, message: str) -> None:
@@ -1195,112 +1506,339 @@ class PurchaseRevealViewPersistent(discord.ui.View):
             view=self,
         )
 
+# ─── Weverse Post & Reply Views ───────────────────────────────────────────────
+
 class WeversePostView(discord.ui.View):
+    """
+    Attached to every Weverse feed post.
+    Anyone can reply via the open-reply modal (artist tier determined by OC ownership).
+    """
     def __init__(self, post_id: str):
         super().__init__(timeout=None)
         self.post_id = post_id
-        for child in self.children:
-            if child.custom_id == "weverse_reply:placeholder":
-                child.custom_id = f"weverse_reply:{post_id}"
 
-    @discord.ui.button(label="💜 Artist Reply", style=discord.ButtonStyle.primary, custom_id="weverse_reply:placeholder")
-    async def artist_reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        owned_artist_ocs = [
-            data["ocs"][oc_id]
-            for oc_id in data["weverse_artists"]
-            if oc_id in data["ocs"] and data["ocs"][oc_id].get("owner_id") == interaction.user.id
-        ]
-        is_dev_user = is_dev(interaction)
-        if is_dev_user:
-            owned_artist_ocs = [data["ocs"][oc_id] for oc_id in data["weverse_artists"] if oc_id in data["ocs"]]
-        if not owned_artist_ocs:
-            return await interaction.response.send_message(
-                embed=get_embed("Not an Artist", "Only registered Weverse artists can reply via this button. Use `/weverse reply` directly.", "error"),
-                ephemeral=True
-            )
-        await interaction.response.send_modal(WeverseReplyModal(self.post_id, owned_artist_ocs[0]["name"]))
+    @discord.ui.button(label="💬 Reply", style=discord.ButtonStyle.secondary, custom_id="weverse_open_reply")
+    async def open_reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WeverseOpenReplyModal(self.post_id))
 
-class WeverseReplyModal(discord.ui.Modal, title="Weverse Artist Reply"):
+
+class WeverseOpenReplyModal(discord.ui.Modal, title="Reply on Weverse"):
+    """
+    Open reply modal — any user can reply to a Weverse post.
+    Artist tier is automatically determined from OC ownership.
+    Blank 'replying_as' field results in an anonymous reply.
+    """
     reply_content = discord.ui.TextInput(
         label="Reply",
         style=discord.TextStyle.paragraph,
         placeholder="Write your reply here…",
         min_length=1,
-        max_length=500
+        max_length=500,
     )
-    artist_oc_name_input = discord.ui.TextInput(
-        label="Your Artist OC Name",
-        placeholder="e.g. Soyeon",
-        min_length=1,
-        max_length=50
+    replying_as = discord.ui.TextInput(
+        label="Replying as (OC name or any username)",
+        placeholder="OC name, artist name, or any username — leave blank for anonymous",
+        min_length=0,
+        max_length=60,
+        required=False,
     )
 
-    def __init__(self, post_id: str, default_artist_name: str):
+    def __init__(self, post_id: str):
         super().__init__()
         self.post_id = post_id
-        self.artist_oc_name_input.default = default_artist_name
 
     async def on_submit(self, interaction: discord.Interaction):
-        content = self.reply_content.value
-        artist_oc_name = self.artist_oc_name_input.value
-        data = load_data()
-        post = next((p for p in data.get("weverse_posts", []) if p["post_id"] == self.post_id), None)
+        content  = self.reply_content.value.strip()
+        raw_name = self.replying_as.value.strip()
+        data     = load_data()
+
+        post = next(
+            (p for p in data.get("weverse_posts", []) if p["post_id"] == self.post_id),
+            None,
+        )
         if not post:
             return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
-        oc = find_oc(artist_oc_name, data)
-        if not oc:
-            return await interaction.response.send_message(f"❌ Artist OC **{artist_oc_name}** not found.", ephemeral=True)
-        if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-            return await interaction.response.send_message("❌ You do not own this OC.", ephemeral=True)
-        if oc["id"] not in data.get("weverse_artists", {}):
-            return await interaction.response.send_message(f"❌ **{artist_oc_name}** is not registered as a Weverse artist.", ephemeral=True)
 
-        guild = resolve_guild(interaction)
+        await interaction.response.defer(ephemeral=True)
+
+        # Resolve reply tier
+        oc          = find_oc(raw_name, data) if raw_name else None
+        is_dev_user = is_dev(interaction)
+
+        if oc:
+            owns_oc = (oc.get("owner_id") == interaction.user.id) or is_dev_user
+            if not owns_oc:
+                oc             = None
+                display_name   = raw_name
+                avatar_url     = None
+                is_artist_tier = False
+            else:
+                display_name   = oc["name"]
+                avatar_url     = oc.get("profile_picture") or interaction.user.display_avatar.url
+                is_artist_tier = _is_weverse_artist(oc["id"], data)
+        elif raw_name:
+            display_name   = raw_name
+            avatar_url     = None
+            is_artist_tier = False
+        else:
+            display_name   = "anonymous"
+            avatar_url     = None
+            is_artist_tier = False
+
+        color = COLORS["weverse"] if is_artist_tier else COLORS["neutral"]
+        if is_artist_tier:
+            embed_title = f"💜 {display_name} replied"
+            footer_text = _weverse_artist_footer_label(oc["id"], data)
+        elif oc:
+            embed_title = f"💬 {display_name} replied"
+            footer_text = "Weverse"
+        else:
+            embed_title = f"💬 {display_name} replied"
+            footer_text = "Weverse · anonymous"
+
+        reply_embed = discord.Embed(
+            title=embed_title,
+            description=content,
+            color=color,
+            timestamp=now(),
+        )
+        if avatar_url:
+            reply_embed.set_thumbnail(url=avatar_url)
+        reply_embed.set_footer(text=footer_text)
+
+        guild           = interaction.guild or resolve_guild(interaction)
         weverse_channel = _resolve_weverse_channel(guild, data)
         if not weverse_channel:
-            return await interaction.response.send_message(
-                embed=get_embed("Error",
-                    f"Weverse channel not found. Create a channel named `{WEVERSE_CHANNEL_NAME}` "
-                    f"or use `/weverse config setchannel` to configure it.", "error"),
-                ephemeral=True
+            return await interaction.followup.send(
+                embed=get_embed(
+                    "Error",
+                    f"Weverse channel not configured. Use `/weverse config setchannel`.",
+                    "error",
+                ),
+                ephemeral=True,
             )
 
         try:
             original_msg = await weverse_channel.fetch_message(int(post["message_id"]))
         except Exception:
-            return await interaction.response.send_message("❌ Original message not found.", ephemeral=True)
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Original post message not found.", "error"),
+                ephemeral=True,
+            )
 
         try:
             thread = original_msg.thread
             if not thread:
-                poster_name = post["author_display_name"]
-                thread = await original_msg.create_thread(name=f"💬 {poster_name} · Artist Reply", auto_archive_duration=10080)
-            
-            reply_embed = discord.Embed(title=f"💜 {oc['name']} replied", description=content, color=COLORS["system"], timestamp=now())
-            if oc.get("profile_picture"):
-                reply_embed.set_thumbnail(url=oc["profile_picture"])
-            reply_embed.set_footer(text="Weverse Artist")
-            
-            await thread.send(embed=reply_embed)
-            
-            reply_record = {
-                "reply_id": str(uuid.uuid4()),
-                "artist_oc_id": oc["id"],
-                "artist_name": oc["name"],
-                "content": content,
-                "replied_at": now().isoformat(),
-                "message_id": str(original_msg.id)
-            }
-            post.setdefault("replies", []).append(reply_record)
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_reply"))
-            
-            await interaction.response.send_message("✅ Reply posted successfully.", ephemeral=True)
-        except Exception as e:
-            log.error(f"Weverse reply failed: {e}")
-            await interaction.response.send_message("❌ Failed to create reply.", ephemeral=True)
+                poster_name = post.get("author_display_name", "post")
+                thread = await original_msg.create_thread(
+                    name=f"💬 {poster_name} · replies",
+                    auto_archive_duration=10080,
+                )
+            reply_msg = await thread.send(embed=reply_embed)
+            reply_view = WeverseReplyMessageView(self.post_id, str(reply_msg.id))
+            await reply_msg.edit(view=reply_view)
+        except Exception as exc:
+            log.error("WeverseOpenReplyModal: thread/send failed: %s", exc)
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Failed to post reply.", "error"),
+                ephemeral=True,
+            )
 
+        reply_record = {
+            "reply_id":               str(uuid.uuid4()),
+            "display_name":           display_name,
+            "oc_id":                  oc["id"] if oc else None,
+            "is_artist":              is_artist_tier,
+            "is_anonymous":           (oc is None),
+            "is_group_artist": (
+                is_artist_tier and oc is not None
+                and oc["id"] not in data.get("weverse_artists", {})
+            ),
+            "content":                content,
+            "replied_at":             now().isoformat(),
+            "replied_by_discord_id":  str(interaction.user.id),
+            "message_id":             str(original_msg.id),
+        }
+        post.setdefault("replies", []).append(reply_record)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_reply"))
+
+        await interaction.followup.send(
+            embed=get_embed("Success", "Reply posted.", "success"),
+            ephemeral=True,
+        )
+
+
+class WeverseReplyMessageView(discord.ui.View):
+    """
+    Attached to each reply inside a Weverse thread.
+    Allows sub-replies, enabling arbitrarily deep reply chains.
+    """
+    def __init__(self, post_id: str, reply_message_id: str):
+        super().__init__(timeout=None)
+        self.post_id = post_id
+        self.reply_message_id = reply_message_id
+
+    @discord.ui.button(
+        label="💬 Reply",
+        style=discord.ButtonStyle.secondary,
+        custom_id="weverse_sub_reply",
+    )
+    async def sub_reply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            WeverseReplyToReplyModal(self.post_id, self.reply_message_id)
+        )
+
+
+class WeverseReplyToReplyModal(discord.ui.Modal, title="Reply on Weverse"):
+    """Sub-reply modal — replies to a specific reply message in a Weverse thread."""
+    reply_content = discord.ui.TextInput(
+        label="Reply",
+        style=discord.TextStyle.paragraph,
+        placeholder="Write your reply here…",
+        min_length=1,
+        max_length=500,
+    )
+    replying_as = discord.ui.TextInput(
+        label="Replying as (OC name or any username)",
+        placeholder="OC name, artist name, or any username — leave blank for anonymous",
+        min_length=0,
+        max_length=60,
+        required=False,
+    )
+
+    def __init__(self, post_id: str, reply_message_id: str):
+        super().__init__()
+        self.post_id = post_id
+        self.reply_message_id = reply_message_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        content  = self.reply_content.value.strip()
+        raw_name = self.replying_as.value.strip()
+        data     = load_data()
+
+        post = next(
+            (p for p in data.get("weverse_posts", []) if p["post_id"] == self.post_id),
+            None,
+        )
+        if not post:
+            return await interaction.response.send_message("❌ Post not found.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        oc          = find_oc(raw_name, data) if raw_name else None
+        is_dev_user = is_dev(interaction)
+
+        if oc:
+            owns_oc = (oc.get("owner_id") == interaction.user.id) or is_dev_user
+            if not owns_oc:
+                oc             = None
+                display_name   = raw_name
+                avatar_url     = None
+                is_artist_tier = False
+            else:
+                display_name   = oc["name"]
+                avatar_url     = oc.get("profile_picture") or interaction.user.display_avatar.url
+                is_artist_tier = _is_weverse_artist(oc["id"], data)
+        elif raw_name:
+            display_name   = raw_name
+            avatar_url     = None
+            is_artist_tier = False
+        else:
+            display_name   = "anonymous"
+            avatar_url     = None
+            is_artist_tier = False
+
+        color = COLORS["weverse"] if is_artist_tier else COLORS["neutral"]
+        if is_artist_tier:
+            embed_title = f"💜 {display_name} replied"
+            footer_text = _weverse_artist_footer_label(oc["id"], data)
+        elif oc:
+            embed_title = f"💬 {display_name} replied"
+            footer_text = "Weverse"
+        else:
+            embed_title = f"💬 {display_name} replied"
+            footer_text = "Weverse · anonymous"
+
+        reply_embed = discord.Embed(
+            title=embed_title,
+            description=content,
+            color=color,
+            timestamp=now(),
+        )
+        if avatar_url:
+            reply_embed.set_thumbnail(url=avatar_url)
+        reply_embed.set_footer(text=footer_text)
+
+        guild           = interaction.guild or resolve_guild(interaction)
+        weverse_channel = _resolve_weverse_channel(guild, data)
+        if not weverse_channel:
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Weverse channel not configured.", "error"),
+                ephemeral=True,
+            )
+
+        try:
+            original_msg = await weverse_channel.fetch_message(int(post["message_id"]))
+        except Exception:
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Original post message not found.", "error"),
+                ephemeral=True,
+            )
+
+        thread = original_msg.thread
+        if not thread:
+            thread = await original_msg.create_thread(
+                name=f"💬 {post.get('author_display_name', 'post')} · replies",
+                auto_archive_duration=10080,
+            )
+
+        reference: Optional[discord.MessageReference] = None
+        try:
+            parent_reply_msg = await thread.fetch_message(int(self.reply_message_id))
+            reference = parent_reply_msg.to_reference(fail_if_not_exists=False)
+        except Exception:
+            pass
+
+        try:
+            sub_reply_msg = await thread.send(
+                embed=reply_embed,
+                reference=reference,
+                mention_author=False,
+            )
+            sub_view = WeverseReplyMessageView(self.post_id, str(sub_reply_msg.id))
+            await sub_reply_msg.edit(view=sub_view)
+        except Exception as exc:
+            log.error("WeverseReplyToReplyModal: thread send failed: %s", exc)
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Failed to post reply.", "error"),
+                ephemeral=True,
+            )
+
+        sub_reply_record = {
+            "reply_id":               str(uuid.uuid4()),
+            "display_name":           display_name,
+            "oc_id":                  oc["id"] if oc else None,
+            "is_artist":              is_artist_tier,
+            "is_anonymous":           (oc is None),
+            "is_group_artist": (
+                is_artist_tier and oc is not None
+                and oc["id"] not in data.get("weverse_artists", {})
+            ),
+            "content":                content,
+            "replied_at":             now().isoformat(),
+            "replied_by_discord_id":  str(interaction.user.id),
+            "parent_reply_message_id": self.reply_message_id,
+            "message_id":             str(original_msg.id),
+        }
+        post.setdefault("replies", []).append(sub_reply_record)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_sub_reply"))
+
+        await interaction.followup.send(
+            embed=get_embed("Success", "Reply posted.", "success"),
+            ephemeral=True,
+        )
 
 
 # ─── Persistent Views ──────────────────────────────────────────────────────────
@@ -1636,656 +2174,1597 @@ class GCInviteView(discord.ui.View):
 
 # ─── WeverseCog ────────────────────────────────────────────────────────────────
 
-class WeverseCog(commands.GroupCog, group_name="weverse", group_description="Weverse artist & fan community system"):
+class WeverseCog(commands.GroupCog, group_name="weverse", group_description="weverse social platform commands"):
     def __init__(self, bot):
         self.bot = bot
 
-    # ── config subgroup ──────────────────────────────────────────────────────
+    weverse_config = app_commands.Group(name="config", description="[dev] weverse configuration")
+    weverse_artist = app_commands.Group(name="artist", description="[dev] manage weverse artists")
+    weverse_dm     = app_commands.Group(name="dm", description="weverse dm subscriptions")
+    weverse_group  = app_commands.Group(name="group", description="weverse group dms")
+    weverse_dev    = app_commands.Group(name="dev", description="[dev] consolidated weverse utilities")
 
-    config_group = app_commands.Group(name="config", description="Weverse configuration (dev)")
-
-    @config_group.command(name="setchannel", description="dev | set the Weverse feed channel by ID or mention")
-    @app_commands.describe(channel="the text channel to use as the Weverse feed")
-    async def config_setchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        try:
-            data = load_data()
-            data["config"]["weverse_channel_id"] = channel.id
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_config_setchannel"))
-            await interaction.response.send_message(f"✅ Weverse feed channel set to {channel.mention}.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse config setchannel error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    @config_group.command(name="setdmcategory", description="dev | set the category for artist DM channels")
-    @app_commands.describe(category_id="the category ID to use for Weverse DM channels")
-    async def config_setdmcategory(self, interaction: discord.Interaction, category_id: str):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        try:
-            guild = resolve_guild(interaction)
-            cat_id = int(category_id.strip())
-            cat = guild.get_channel(cat_id) if guild else None
-            if not isinstance(cat, discord.CategoryChannel):
-                return await interaction.response.send_message("❌ category not found.", ephemeral=True)
-            data = load_data()
-            data["config"]["weverse_dm_category_id"] = cat_id
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_config_setdmcategory"))
-            await interaction.response.send_message(f"✅ Weverse DM category set to **{cat.name}**.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse config setdmcategory error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    @config_group.command(name="setgroupcategory", description="dev | set the category for Weverse group channels")
-    @app_commands.describe(category_id="the category ID to use for Weverse group channels")
-    async def config_setgroupcategory(self, interaction: discord.Interaction, category_id: str):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        try:
-            guild = resolve_guild(interaction)
-            cat_id = int(category_id.strip())
-            cat = guild.get_channel(cat_id) if guild else None
-            if not isinstance(cat, discord.CategoryChannel):
-                return await interaction.response.send_message("❌ category not found.", ephemeral=True)
-            data = load_data()
-            data["config"]["weverse_group_category_id"] = cat_id
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_config_setgroupcategory"))
-            await interaction.response.send_message(f"✅ Weverse group category set to **{cat.name}**.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse config setgroupcategory error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    # ── artist subgroup ──────────────────────────────────────────────────────
-
-    artist_group = app_commands.Group(name="artist", description="Weverse artist management")
-
-    @artist_group.command(name="add", description="dev | register an OC as a Weverse artist (creates DM channel)")
-    @app_commands.describe(oc_name="the OC to register as a Weverse artist")
-    async def artist_add(self, interaction: discord.Interaction, oc_name: str):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            oc_id = oc["id"]
-            if oc_id in data.get("weverse_artists", {}):
-                return await interaction.followup.send(f"❌ **{oc['name']}** is already a registered Weverse artist.", ephemeral=True)
-
-            dm_channel = None
-            cat_id = data["config"].get("weverse_dm_category_id")
-            if guild and cat_id:
-                cat = guild.get_channel(int(cat_id))
-                if isinstance(cat, discord.CategoryChannel):
-                    ch_name = f"{WEVERSE_DM_CHANNEL_PREFIX}-{oc_name.lower().replace(' ', '-')}"
-                    try:
-                        dm_channel = await guild.create_text_channel(
-                            ch_name,
-                            category=cat,
-                            overwrites={
-                                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                            },
-                            topic=f"💜 Weverse DM channel for {oc['name']}",
-                        )
-                    except Exception as e:
-                        log.warning("Failed to create Weverse DM channel: %s", e)
-
-            data.setdefault("weverse_artists", {})[oc_id] = {
-                "oc_name": oc["name"],
-                "dm_channel_id": dm_channel.id if dm_channel else None,
-                "dm_subscribers": {},
-                "registered_at": now_iso(),
-            }
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_artist_add"))
-            ch_note = f" DM channel: {dm_channel.mention}" if dm_channel else " (no DM channel created)"
-            await interaction.followup.send(f"✅ **{oc['name']}** registered as a Weverse artist.{ch_note}", ephemeral=True)
-            if guild:
-                await audit(guild, f"Weverse artist added: {oc['name']} by {interaction.user}")
-        except Exception as e:
-            log.error("weverse artist add error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
-
-    @artist_group.command(name="remove", description="dev | unregister a Weverse artist OC")
-    @app_commands.describe(oc_name="the OC to unregister")
-    async def artist_remove(self, interaction: discord.Interaction, oc_name: str):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            oc_id = oc["id"]
-            if oc_id not in data.get("weverse_artists", {}):
-                return await interaction.followup.send(f"❌ **{oc['name']}** is not a registered Weverse artist.", ephemeral=True)
-            del data["weverse_artists"][oc_id]
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_artist_remove"))
-            await interaction.followup.send(f"✅ **{oc['name']}** removed from Weverse artists.", ephemeral=True)
-            if guild:
-                await audit(guild, f"Weverse artist removed: {oc['name']} by {interaction.user}")
-        except Exception as e:
-            log.error("weverse artist remove error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
-
-    @artist_group.command(name="list", description="list all registered Weverse artists")
-    async def artist_list(self, interaction: discord.Interaction):
-        try:
-            data = load_data()
-            artists = data.get("weverse_artists", {})
-            if not artists:
-                return await interaction.response.send_message("No Weverse artists registered.", ephemeral=True)
-            lines = []
-            for oc_id, rec in artists.items():
-                sub_count = sum(1 for s in rec.get("dm_subscribers", {}).values() if s.get("active"))
-                lines.append(f"• **{rec.get('oc_name', oc_id)}** — {sub_count} active subscriber(s)")
-            embed = discord.Embed(title="💜 Weverse Artists", description="\n".join(lines), color=COLORS["system"])
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        except Exception as e:
-            log.error("weverse artist list error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    # ── post / reply ──────────────────────────────────────────────────────────
-
-    @app_commands.command(name="post", description="post a Weverse update as an artist OC (text + up to 2 image URLs)")
-    @app_commands.describe(
-        oc_name="your artist OC name",
-        content="the post content",
-        image1="optional image URL",
-        image2="optional second image URL",
-    )
-    async def weverse_post(self, interaction: discord.Interaction, oc_name: str, content: str,
-                           image1: Optional[str] = None, image2: Optional[str] = None):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-                return await interaction.followup.send("❌ You do not own this OC.", ephemeral=True)
-            if oc["id"] not in data.get("weverse_artists", {}):
-                return await interaction.followup.send(f"❌ **{oc['name']}** is not a registered Weverse artist.", ephemeral=True)
-
-            weverse_channel = _resolve_weverse_channel(guild, data)
-            if not weverse_channel:
-                return await interaction.followup.send(
-                    f"❌ Weverse channel not found. Create `#{WEVERSE_CHANNEL_NAME}` or configure it.", ephemeral=True
-                )
-
-            post_id = str(uuid.uuid4())
-            embed = discord.Embed(
-                title=f"💜 {oc['name']}",
-                description=content,
-                color=COLORS["system"],
-                timestamp=now(),
+    @weverse_config.command(name="setchannel", description="[dev] set the public weverse feed channel")
+    @is_dev_dec()
+    async def weverse_setchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        data = load_data()
+        data["config"]["weverse_channel_id"] = str(channel.id)
+        if channel.name != WEVERSE_CHANNEL_NAME:
+            log.warning(
+                "weverse_setchannel: configured channel name '%s' does not match canonical name '%s'. "
+                "Consider renaming the Discord channel for consistency.",
+                channel.name, WEVERSE_CHANNEL_NAME
             )
-            if oc.get("profile_picture"):
-                embed.set_thumbnail(url=oc["profile_picture"])
-            if image1 and valid_image_url(image1):
-                embed.set_image(url=image1)
-            if image2 and valid_image_url(image2):
-                embed.add_field(name="\u200b", value=f"[Image 2]({image2})", inline=False)
-            embed.set_footer(text="Weverse")
+        await save_and_backup(data, reason="weverse_setchannel")
+        await interaction.response.send_message(embed=get_embed("Success", f"Weverse channel set to {channel.mention}.", "success"), ephemeral=True)
 
-            view = WeversePostView(post_id)
-            msg = await weverse_channel.send(embed=embed, view=view)
+    @weverse_config.command(name="setdmcategory", description="[dev] set the discord category for artist dm channels")
+    @is_dev_dec()
+    async def weverse_setdmcategory(self, interaction: discord.Interaction, category: discord.CategoryChannel):
+        data = load_data()
+        data["config"]["weverse_dm_category_id"] = str(category.id)
+        await save_and_backup(data, reason="weverse_setdmcategory")
+        await interaction.response.send_message(embed=get_embed("Success", f"Weverse DM category set to **{category.name}**.", "success"), ephemeral=True)
 
-            post_record = {
-                "post_id": post_id,
-                "author_oc_id": oc["id"],
-                "author_display_name": oc["name"],
-                "content": content,
-                "posted_at": now().isoformat(),
-                "message_id": str(msg.id),
-                "replies": [],
-            }
-            data.setdefault("weverse_posts", []).append(post_record)
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_post"))
-            bot.add_view(view)
-            await interaction.followup.send("✅ Weverse post published.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse post error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+    @weverse_config.command(name="setgroupcategory", description="[dev] set the discord category for group dm channels")
+    @is_dev_dec()
+    async def weverse_setgroupcategory(self, interaction: discord.Interaction, category: discord.CategoryChannel):
+        data = load_data()
+        data["config"]["weverse_group_category_id"] = str(category.id)
+        await save_and_backup(data, reason="weverse_setgrpcategory")
+        await interaction.response.send_message(embed=get_embed("Success", f"Weverse Group category set to **{category.name}**.", "success"), ephemeral=True)
 
-    @app_commands.command(name="reply", description="reply to a Weverse post as an artist OC")
-    @app_commands.describe(post_id="the post ID to reply to", oc_name="your artist OC name", content="your reply")
-    async def weverse_reply(self, interaction: discord.Interaction, post_id: str, oc_name: str, content: str):
-        await interaction.response.defer(ephemeral=True)
+    @weverse_config.command(name="setgroupdmcategory", description="[dev] set the discord category for group member dm channels")
+    @is_dev_dec()
+    async def weverse_setgroupdmcategory(self, interaction: discord.Interaction, category: discord.CategoryChannel):
+        data = load_data()
+        data["config"]["weverse_group_dm_category_id"] = str(category.id)
+        await save_and_backup(data, reason="weverse_setgrpdmcategory")
+        await interaction.response.send_message(embed=get_embed("Success", f"Weverse Group Member DM category set to **{category.name}**.", "success"), ephemeral=True)
+
+    @weverse_artist.command(name="register", description="[dev] designate an oc as a weverse artist")
+    @is_dev_dec()
+    async def weverse_artist_register(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc:
+            return await interaction.response.send_message(embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if oc["id"] in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC is already a registered artist.", "error"), ephemeral=True)
+        
+        data.setdefault("weverse_artists", {})[oc["id"]] = {
+            "oc_id": oc["id"],
+            "dm_channel_id": None,
+            "dm_subscribers": {},
+            "dm_message_count": 0
+        }
+        await save_and_backup(data, reason="weverse_art_reg")
+        await interaction.response.send_message(embed=get_embed("Success", f"**{oc['name']}** is now a registered Weverse artist. Use /weverse artist provisiondm to create their DM channel.", "success"), ephemeral=True)
+
+    @weverse_artist.command(name="unregister", description="[dev] remove an oc's artist designation")
+    @is_dev_dec()
+    async def weverse_artist_unregister(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC is not a registered artist.", "error"), ephemeral=True)
+        
+        artist = data["weverse_artists"][oc["id"]]
+        active_subs = sum(1 for s in artist["dm_subscribers"].values() if s["active"])
+        if active_subs > 0:
+            return await interaction.response.send_message(embed=get_embed("Error", f"Cannot unregister: **{active_subs}** active subscriber(s) still exist. Cancel all subscriptions first.", "error"), ephemeral=True)
+            
+        del data["weverse_artists"][oc["id"]]
+        await save_and_backup(data, reason="weverse_art_unreg")
+        await interaction.response.send_message(embed=get_embed("Success", f"**{oc['name']}** is no longer a Weverse artist.", "success"), ephemeral=True)
+
+    @weverse_artist.command(name="provisiondm", description="[dev] create the private dm channel for an artist")
+    @is_dev_dec()
+    async def weverse_artist_provisiondm(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC is not a registered artist.", "error"), ephemeral=True)
+            
+        artist = data["weverse_artists"][oc["id"]]
+        if artist.get("dm_channel_id"):
+            return await interaction.response.send_message(embed=get_embed("Error", f"A DM channel already exists: <#{artist['dm_channel_id']}>.", "error"), ephemeral=True)
+            
+        cat_id = data["config"].get("weverse_dm_category_id")
+        if not cat_id:
+            return await interaction.response.send_message(embed=get_embed("Error", "DM category not set. Use /weverse config setdmcategory.", "error"), ephemeral=True)
+            
+        guild = interaction.guild
+        cat = guild.get_channel(int(cat_id))
+        if not cat:
+            return await interaction.response.send_message(embed=get_embed("Error", "Configured category no longer exists.", "error"), ephemeral=True)
+            
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
+        }
+        oc_slug = re.sub(r'[^a-z0-9]', '-', oc['name'].lower()).strip('-')
+        oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+        safe_name = f"➾．weverse．dm．{oc_slug}"
+        topic = f"Private Weverse DM channel for {oc['name']}. Subscribers only."
+        
         try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
+            channel = await guild.create_text_channel(name=safe_name, category=cat, topic=topic, overwrites=overwrites)
+            await _add_tupperbox_to_channel(channel, reason=f"weverse provisiondm: {oc['name']}")
+            artist["dm_channel_id"] = str(channel.id)
+            save_data(data)
+            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_provision"))
+            await interaction.response.send_message(embed=get_embed("Success", f"DM channel provisioned: {channel.mention}", "success"), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(embed=get_embed("Error", f"Failed to create channel: {e}", "error"), ephemeral=True)
+
+    @weverse_artist.command(name="deprovisiondm", description="[dev] delete an artist's dm channel (subscriptions remain in data)")
+    @is_dev_dec()
+    async def weverse_artist_deprovisiondm(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC is not a registered artist.", "error"), ephemeral=True)
+            
+        artist = data["weverse_artists"][oc["id"]]
+        if not artist.get("dm_channel_id"):
+            return await interaction.response.send_message(embed=get_embed("Error", "Artist does not have a provisioned DM channel.", "error"), ephemeral=True)
+            
+        guild = interaction.guild
+        channel = guild.get_channel(int(artist["dm_channel_id"]))
+        if channel:
+            try:
+                await channel.delete()
+            except discord.Forbidden:
+                return await interaction.response.send_message(embed=get_embed("Error", "Missing permissions to delete the channel.", "error"), ephemeral=True)
+                
+        artist["dm_channel_id"] = None
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_deprovision"))
+        await interaction.response.send_message(embed=get_embed("Success", "DM channel deprovisioned.", "success"), ephemeral=True)
+
+    @weverse_artist.command(name="subscribers", description="[dev] list all subscribers for an artist's dm")
+    @is_dev_dec()
+    async def weverse_artist_subscribers(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC is not a registered artist.", "error"), ephemeral=True)
+            
+        subs = list(data["weverse_artists"][oc["id"]]["dm_subscribers"].values())
+        if not subs:
+            return await interaction.response.send_message(embed=get_embed("Subscribers", f"No subscribers for **{oc['name']}**.", "neutral"), ephemeral=True)
+            
+        pages = []
+        for i in range(0, len(subs), 10):
+            chunk = subs[i:i+10]
+            embed = get_embed(f"Subscribers: {oc['name']}", f"Page {i//10 + 1}")
+            for s in chunk:
+                oc_nm  = s.get("oc_name", s.get("oc_id", "Unknown OC"))
+                owner  = s.get("owner_discord_id", "?")
+                plan_label = WEVERSE_PLANS.get(s.get("plan", ""), {}).get("label", s.get("plan", "Unknown"))
+                active_str = "✅ active" if s.get("active") else "❌ inactive"
+                cancelled_str = "⚠️ cancelled (runs to end of period)" if s.get("cancelled") else "—"
+                val = (
+                    f"Owner: <@{owner}>\n"
+                    f"Plan: {plan_label}\n"
+                    f"Status: {active_str}\n"
+                    f"Cancelled: {cancelled_str}\n"
+                    f"Next Billing: {s['next_billing'][:10]}"
+                )
+                embed.add_field(name=f"OC: {oc_nm}", value=val, inline=False)
+            pages.append(embed)
+            
+        view = RankingPaginationView(pages)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+
+    @weverse_artist.command(name="migratedmnames", description="[dev] rename all artist dm channels to the canonical format")
+    @is_dev_dec()
+    async def weverse_artist_migratedmnames(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        data = load_data()
+        guild = interaction.guild
+        renamed, skipped, failed = 0, 0, 0
+        lines = []
+
+        for artist_id, artist_rec in data.get("weverse_artists", {}).items():
+            ch_id = artist_rec.get("dm_channel_id")
+            if not ch_id:
+                skipped += 1
+                continue
+            oc = data["ocs"].get(artist_id)
             if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-                return await interaction.followup.send("❌ You do not own this OC.", ephemeral=True)
-            if oc["id"] not in data.get("weverse_artists", {}):
-                return await interaction.followup.send(f"❌ **{oc['name']}** is not a registered Weverse artist.", ephemeral=True)
+                skipped += 1
+                continue
 
-            post = next((p for p in data.get("weverse_posts", []) if p["post_id"] == post_id), None)
-            if not post:
-                return await interaction.followup.send("❌ Post not found.", ephemeral=True)
+            ch = guild.get_channel(int(ch_id))
+            if not ch:
+                skipped += 1
+                lines.append(f"⚠️ **{oc['name']}** — channel `{ch_id}` not found in guild.")
+                continue
 
+            oc_slug = re.sub(r'[^a-z0-9]', '-', oc['name'].lower()).strip('-')
+            oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+            canonical_name = f"➾．weverse．dm．{oc_slug}"
+
+            if ch.name == canonical_name:
+                skipped += 1
+                continue
+
+            try:
+                await ch.edit(name=canonical_name)
+                renamed += 1
+                lines.append(f"✅ **{oc['name']}** — renamed to `{canonical_name}`.")
+            except Exception as exc:
+                failed += 1
+                lines.append(f"❌ **{oc['name']}** — rename failed: {exc}")
+
+        summary = f"**Renamed:** {renamed} | **Skipped:** {skipped} | **Failed:** {failed}"
+        desc = summary + ("\n\n" + "\n".join(lines) if lines else "")
+        embed = get_embed("DM Channel Name Migration", desc[:4096], "success" if not failed else "error")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="post", description="post a message to the public weverse feed (free for all)")
+    async def weverse_post(self, interaction: discord.Interaction, content: str, oc_name: str = None, media1: discord.Attachment = None, media2: discord.Attachment = None, media3: discord.Attachment = None):
+        if len(content) > 1000:
+            return await interaction.response.send_message(embed=get_embed("Error", "Content must be <= 1000 characters.", "error"), ephemeral=True)
+            
+        data = load_data()
+        guild = interaction.guild or resolve_guild(interaction)
+        weverse_channel = _resolve_weverse_channel(guild, data)
+        if not weverse_channel:
+            return await interaction.response.send_message(
+                embed=get_embed("Error",
+                    f"Weverse channel not found. Create a channel named `{WEVERSE_CHANNEL_NAME}` "
+                    f"or use `/weverse config setchannel` to configure it.", "error"),
+                ephemeral=True
+            )
+            
+        oc = None
+        if oc_name:
+            oc = find_oc(oc_name, data)
+            if not oc or (oc.get("owner_id") != interaction.user.id and not is_dev(interaction)):
+                return await interaction.response.send_message(embed=get_embed("Error", "OC not found or you don't own it.", "error"), ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        
+        media_urls = []
+        for media in [media1, media2, media3]:
+            if media:
+                if not media.content_type or not (media.content_type.startswith("image/") or media.content_type.startswith("video/")):
+                    return await interaction.followup.send(embed=get_embed("Error", "Media must be images or videos.", "error"))
+                res = await persist_media_attachment(media)
+                if res:
+                    media_urls.append(res[0])
+                else:
+                    media_urls.append(media.url)
+                    
+        # ── Derive display name and avatar ──────────────────────────────────────────
+        author_name = oc["name"] if oc else interaction.user.display_name
+        author_icon = oc.get("profile_picture") if oc else interaction.user.display_avatar.url
+        color       = COLORS["weverse"]
+        # ── Build primary embed (mirrors ig_post layout, no handle) ─────────────────
+        embed = discord.Embed(
+            description=content,
+            color=color,
+            timestamp=now(),
+        )
+        embed.set_author(
+            name=author_name,
+            icon_url=author_icon,
+        )
+        # No set_thumbnail — mirrors Instagram; no footer on embed (lives in view row)
+        if media_urls and valid_media_url(media_urls[0])[1] == "image":
+            embed.set_image(url=media_urls[0])
+        post_id = str(uuid.uuid4())
+        view = WeversePostView(post_id)
+        # Send the primary embed (always carries the view / like button)
+        if media_urls and valid_media_url(media_urls[0])[1] == "video":
+            # First item is a video — send URL as content + a companion embed
+            # so Discord renders an inline player instead of a bare link
+            msg = await weverse_channel.send(
+                content=media_urls[0],
+                embed=embed,
+                view=view,
+            )
+        else:
+            msg = await weverse_channel.send(embed=embed, view=view)
+        # Additional media items (indices 1+)
+        for m in media_urls[1:]:
+            mtype = valid_media_url(m)[1]
+            if mtype == "image":
+                e = discord.Embed(color=COLORS["weverse"]).set_image(url=m)
+                await weverse_channel.send(embed=e)
+            else:
+                # Video continuation: use a minimal labeled embed + URL content
+                ve = discord.Embed(color=COLORS["weverse"], url=m)
+                ve.set_footer(text="▶ video")
+                await weverse_channel.send(content=m, embed=ve)
+                
+        post_record = {
+            "post_id": post_id,
+            "author_discord_id": str(interaction.user.id),
+            "author_display_name": interaction.user.display_name,
+            "oc_id": oc["id"] if oc else None,
+            "content": content,
+            "media_urls": media_urls,
+            "message_id": str(msg.id),
+            "replies": [],
+            "posted_at": now().isoformat(),
+            "weverse_color": color.value,
+        }
+        data.setdefault("weverse_posts", []).append(post_record)
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_post"))
+        await interaction.followup.send(embed=get_embed("Success", "Weverse post sent.", "success"), ephemeral=True)
+
+    @app_commands.command(name="reply", description="reply to a weverse post as your oc or as yourself")
+    async def weverse_reply(self, interaction: discord.Interaction, post_id: str, oc_name: str, content: str):
+        if len(content) > 500:
+            return await interaction.response.send_message(embed=get_embed("Error", "Reply must be <= 500 characters.", "error"), ephemeral=True)
+
+        data = load_data()
+        post = next((p for p in data.get("weverse_posts", []) if p["post_id"] == post_id), None)
+        if not post:
+            return await interaction.response.send_message(embed=get_embed("Error", "Post not found.", "error"), ephemeral=True)
+
+        oc = find_oc(oc_name, data)
+        if not oc or (oc.get("owner_id") != interaction.user.id and not is_dev(interaction)):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC not found or you don't own it.", "error"), ephemeral=True)
+
+        if not _is_weverse_artist(oc["id"], data):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{oc['name']}** is not a Weverse artist or group member.", "error"),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        await self._execute_weverse_reply(interaction, data, post, oc, content)
+
+    async def _execute_weverse_reply(
+        self,
+        interaction: discord.Interaction,
+        data: dict,
+        post: dict,
+        oc: dict,
+        content: str,
+    ) -> None:
+        """
+        Shared implementation for replying to a Weverse post.
+        Assumes interaction has already been deferred (ephemeral=True).
+        Mutates `data` in-place (appends to post["replies"]), saves, and backs up.
+        Sends a followup on success or error.
+        """
+        try:
+            guild = interaction.guild or resolve_guild(interaction)
             weverse_channel = _resolve_weverse_channel(guild, data)
             if not weverse_channel:
-                return await interaction.followup.send("❌ Weverse channel not found.", ephemeral=True)
+                await interaction.followup.send(
+                    embed=get_embed("Error",
+                        f"Weverse channel not found. Create a channel named `{WEVERSE_CHANNEL_NAME}` "
+                        f"or use `/weverse config setchannel` to configure it.", "error"),
+                    ephemeral=True
+                )
+                return
 
             try:
                 original_msg = await weverse_channel.fetch_message(int(post["message_id"]))
             except Exception:
-                return await interaction.followup.send("❌ Original message not found.", ephemeral=True)
+                await interaction.followup.send(embed=get_embed("Error", "Original message not found.", "error"), ephemeral=True)
+                return
 
             thread = original_msg.thread
             if not thread:
-                thread = await original_msg.create_thread(name=f"💬 {oc['name']} · Reply", auto_archive_duration=10080)
+                thread = await original_msg.create_thread(name=f"💬 {post.get('author_display_name', 'post')} · replies", auto_archive_duration=10080)
 
-            reply_embed = discord.Embed(
-                title=f"💜 {oc['name']} replied",
-                description=content,
-                color=COLORS["system"],
-                timestamp=now(),
-            )
+            footer_label = _weverse_artist_footer_label(oc["id"], data)
+            reply_embed = discord.Embed(title=f"💜 {oc['name']} replied", description=content, color=COLORS["weverse"], timestamp=now())
             if oc.get("profile_picture"):
                 reply_embed.set_thumbnail(url=oc["profile_picture"])
-            reply_embed.set_footer(text="Weverse Artist")
-            await thread.send(embed=reply_embed)
+            reply_embed.set_footer(text=footer_label)
+
+            reply_msg = await thread.send(embed=reply_embed)
+            reply_view = WeverseReplyMessageView(post["post_id"], str(reply_msg.id))
+            await reply_msg.edit(view=reply_view)
 
             post.setdefault("replies", []).append({
-                "reply_id": str(uuid.uuid4()),
-                "artist_oc_id": oc["id"],
-                "artist_name": oc["name"],
-                "content": content,
-                "replied_at": now().isoformat(),
-                "message_id": str(original_msg.id),
+                "reply_id":               str(uuid.uuid4()),
+                "display_name":           oc["name"],
+                "oc_id":                  oc["id"],
+                "is_artist":              True,
+                "is_anonymous":           False,
+                "is_group_artist": (
+                    oc["id"] not in data.get("weverse_artists", {})
+                ),
+                "content":                content,
+                "replied_at":             now().isoformat(),
+                "replied_by_discord_id":  str(interaction.user.id),
+                "message_id":             str(original_msg.id),
             })
             save_data(data)
             asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_reply"))
-            await interaction.followup.send("✅ Reply posted.", ephemeral=True)
+            await interaction.followup.send(embed=get_embed("Success", "Reply posted.", "success"), ephemeral=True)
         except Exception as e:
-            log.error("weverse reply error: %s", e)
+            log.error(f"Weverse reply error: {e}")
+            await interaction.followup.send(embed=get_embed("Error", "Failed to create thread/reply.", "error"), ephemeral=True)
+
+    @weverse_dev.command(
+        name="reply",
+        description="[dev] reply to a weverse post as any artist oc — locate post by recency index, not uuid"
+    )
+    @app_commands.describe(
+        artist_oc_name = "name of the artist oc sending the reply",
+        content        = "reply body (max 500 chars)",
+        post_index     = "1 = most recent post, 2 = second most recent, etc. (default: 1)"
+    )
+    @is_dev_dec()
+    async def weverse_dev_reply(
+        self,
+        interaction: discord.Interaction,
+        artist_oc_name: str,
+        content: str,
+        post_index: int = 1,
+    ):
+        if len(content) > 500:
+            return await interaction.response.send_message(embed=get_embed("Error", "Reply must be <= 500 characters.", "error"), ephemeral=True)
+        if post_index < 1:
+            return await interaction.response.send_message("❌ post_index must be 1 or greater.", ephemeral=True)
+
+        data = load_data()
+        oc = find_oc(artist_oc_name, data)
+        if not oc or not _is_weverse_artist(oc["id"], data):
+            return await interaction.response.send_message(embed=get_embed("Error", "OC not found or not a Weverse artist/group member.", "error"), ephemeral=True)
+
+        posts = data.get("weverse_posts", [])
+        if not posts or post_index > len(posts):
+            n = len(posts)
+            return await interaction.response.send_message(
+                f"❌ no post found at that index (only {n} post{'s' if n != 1 else ''} exist).",
+                ephemeral=True
+            )
+
+        def _post_sort_key(p: dict) -> float:
+            """Parse ISO posted_at to a float epoch for robust chronological ordering."""
+            try:
+                return datetime.fromisoformat(p["posted_at"]).timestamp()
+            except (ValueError, KeyError):
+                return 0.0
+        sorted_posts = sorted(posts, key=_post_sort_key)
+        target = sorted_posts[-post_index]
+
+        await interaction.response.defer(ephemeral=True)
+        await self._execute_weverse_reply(interaction, data, target, oc, content)
+
+    @weverse_dev.command(
+        name="setup",
+        description="[dev] register an oc as a weverse artist and immediately provision their dm channel"
+    )
+    @app_commands.describe(oc_name="name of the oc to fully set up as a weverse artist")
+    @is_dev_dec()
+    async def weverse_dev_setup(
+        self,
+        interaction: discord.Interaction,
+        oc_name: str,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = load_data()
+            oc = find_oc(oc_name, data)
+            if not oc:
+                return await interaction.followup.send(embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+
+            # Registration step
+            if oc["id"] in data.get("weverse_artists", {}):
+                already_registered = True
+            else:
+                data.setdefault("weverse_artists", {})[oc["id"]] = {
+                    "oc_id": oc["id"],
+                    "dm_channel_id": None,
+                    "dm_subscribers": {},
+                    "dm_message_count": 0
+                }
+                already_registered = False
+
+            artist = data["weverse_artists"][oc["id"]]
+
+            # Provision step
+            existing_dm_channel_id = artist.get("dm_channel_id")
+            if existing_dm_channel_id:
+                dm_channel_report = f"⚠️ already existed — <#{existing_dm_channel_id}>"
+                channel = None
+            else:
+                cat_id = data["config"].get("weverse_dm_category_id")
+                if not cat_id:
+                    return await interaction.followup.send(embed=get_embed("Error", "DM category not set. Use /weverse config setdmcategory.", "error"), ephemeral=True)
+
+                guild = interaction.guild or resolve_guild(interaction)
+                cat = guild.get_channel(int(cat_id))
+                if not cat:
+                    return await interaction.followup.send(embed=get_embed("Error", "Configured category no longer exists.", "error"), ephemeral=True)
+
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True)
+                }
+                oc_slug = re.sub(r'[^a-z0-9]', '-', oc['name'].lower()).strip('-')
+                oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+                safe_name = f"➾．weverse．dm．{oc_slug}"
+                topic = f"Private Weverse DM channel for {oc['name']}. Subscribers only."
+
+                channel = await guild.create_text_channel(name=safe_name, category=cat, topic=topic, overwrites=overwrites)
+                await _add_tupperbox_to_channel(channel, reason=f"weverse dev_setup provisiondm: {oc['name']}")
+                artist["dm_channel_id"] = str(channel.id)
+                dm_channel_report = f"✅ provisioned — {channel.mention}"
+
+            save_data(data)
+            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_dev_setup"))
+
+            reg_report = "⚠️ was already registered" if already_registered else "✅ registered"
+            embed = discord.Embed(
+                title=f"**{oc['name']}** Weverse Setup Complete",
+                description=(
+                    f"Registration: {reg_report}\n"
+                    f"DM Channel:   {dm_channel_report}"
+                ),
+                color=COLORS["success"]
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            log.error(f"weverse_dev_setup error: {e}")
             await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
 
-    # ── dm subgroup ────────────────────────────────────────────────────────────
+    @weverse_dm.command(name="subscribe", description="subscribe to an artist's private weverse dm")
+    @app_commands.describe(subscribing_oc_name="your oc that is subscribing")
+    @app_commands.choices(plan=[
+        app_commands.Choice(name="Monthly — ₩8,000", value="monthly"),
+        app_commands.Choice(name="6 Months — ₩40,000", value="biannual"),
+        app_commands.Choice(name="Annual — ₩80,000", value="annual"),
+    ])
+    async def weverse_dm_subscribe(self, interaction: discord.Interaction, artist_oc_name: str, subscribing_oc_name: str, plan: str):
+        data = load_data()
+        oc = find_oc(artist_oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "Artist not found.", "error"), ephemeral=True)
+            
+        artist = data["weverse_artists"][oc["id"]]
+        if not artist.get("dm_channel_id"):
+            return await interaction.response.send_message(embed=get_embed("Error", "This artist's DM channel has not been provisioned yet.", "error"), ephemeral=True)
+            
+        # Resolve subscribing OC
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "Subscribing OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
 
-    dm_group = app_commands.Group(name="dm", description="Weverse DM subscriptions")
+        sub_oc_key = sub_oc["id"]
 
-    @dm_group.command(name="subscribe", description="subscribe an OC to an artist's DM channel (choose plan)")
+        # Check existing subscription for this OC
+        if sub_oc_key in artist.get("dm_subscribers", {}) and artist["dm_subscribers"][sub_oc_key].get("active"):
+            return await interaction.response.send_message(
+                embed=get_embed("Error",
+                    f"**{sub_oc['name']}** already has an active subscription to **{oc['name']}**'s DM.",
+                    "error"), ephemeral=True)
+
+        # Funds check — deduct from OC balance
+        plan_data = WEVERSE_PLANS.get(plan)
+        cost = plan_data["won"]
+        oc_balance = sub_oc.get("balance", 0)
+        
+        if oc_balance < cost:
+            return await interaction.response.send_message(
+                embed=get_embed("Insufficient Funds",
+                    f"**{sub_oc['name']}** needs ₩{cost:,} but only has ₩{oc_balance:,}.",
+                    "error"), ephemeral=True)
+            
+        next_dt = now() + timedelta(days=plan_data["days"])
+        embed = get_embed("Confirm Subscription", f"Plan: **{plan_data['label']}**\nCost: **{cost:,} ₩**\nNext Billing: **{next_dt.strftime('%Y-%m-%d')}**", "neutral")
+        
+        if await wait_for_confirm(interaction, embed):
+            d = load_data()
+            d_sub_oc = d["ocs"].get(sub_oc_key)
+            
+            if d_sub_oc and d_sub_oc.get("balance", 0) >= cost:
+                d_sub_oc["balance"] -= cost
+
+                d["weverse_artists"][oc["id"]].setdefault("dm_subscribers", {})[sub_oc_key] = {
+                    "oc_id": sub_oc_key,
+                    "oc_name": sub_oc["name"],
+                    "owner_discord_id": str(interaction.user.id),
+                    "plan": plan,
+                    "started_at": now().isoformat(),
+                    "next_billing": next_dt.isoformat(),
+                    "active": True,
+                    "cancelled": False,
+                    "cancelled_at": None,
+                }
+                save_data(d)
+                asyncio.ensure_future(push_backup_to_discord(d, reason="weverse_subscribe"))
+                
+                guild = interaction.guild
+                channel = guild.get_channel(int(artist["dm_channel_id"]))
+                if channel:
+                    try:
+                        await channel.set_permissions(interaction.user, read_messages=True, send_messages=True, view_channel=True)
+                        await channel.send(f"💌 **{interaction.user.display_name}** has joined {oc['name']}'s Weverse DM!")
+                    except Exception as e:
+                        log.error(f"Permission grant error: {e}")
+                        
+                new_bal = d_sub_oc.get("balance", 0)
+                await interaction.followup.send(embed=get_embed("Success", f"Welcome to **{oc['name']}**'s Weverse DM! Your {plan_data['label']} subscription is now active. Next billing: {next_dt.strftime('%Y-%m-%d')}. Remaining balance: {new_bal:,} ₩.", "success"), ephemeral=True)
+            else:
+                await interaction.followup.send(embed=get_embed("Error", "Insufficient OC balance (changed since confirmation).", "error"), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=get_embed("Cancelled", "Subscription cancelled. No charge was made.", "neutral"), ephemeral=True)
+
+    @weverse_dm.command(name="cancel", description="cancel your subscription to an artist's weverse dm")
+    @app_commands.describe(subscribing_oc_name="your oc to cancel the subscription for")
+    async def weverse_dm_cancel(self, interaction: discord.Interaction, artist_oc_name: str, subscribing_oc_name: str):
+        data = load_data()
+        oc = find_oc(artist_oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "Artist not found.", "error"), ephemeral=True)
+            
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
+
+        sub_oc_key = sub_oc["id"]
+        artist = data["weverse_artists"][oc["id"]]
+        if sub_oc_key not in artist.get("dm_subscribers", {}) or not artist["dm_subscribers"][sub_oc_key].get("active"):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{sub_oc['name']}** does not have an active subscription.", "error"), ephemeral=True)
+        sub = artist["dm_subscribers"][sub_oc_key]
+
+        sub["cancelled"] = True
+        sub["cancelled_at"] = now().isoformat()
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_cancel"))
+        
+        next_dt = datetime.fromisoformat(sub["next_billing"]).astimezone(get_tz()).strftime("%Y-%m-%d")
+        await interaction.response.send_message(embed=get_embed("Success", f"Your subscription to **{oc['name']}**'s Weverse DM has been marked for cancellation. You will retain access until **{next_dt}**, after which you will not be charged and your access will be removed.", "success"), ephemeral=True)
+
+    @weverse_dm.command(name="status", description="check your subscription status for an artist's weverse dm")
+    @app_commands.describe(subscribing_oc_name="your oc to check the subscription for")
+    async def weverse_dm_status(self, interaction: discord.Interaction, artist_oc_name: str, subscribing_oc_name: str):
+        data = load_data()
+        oc = find_oc(artist_oc_name, data)
+        if not oc or oc["id"] not in data.get("weverse_artists", {}):
+            return await interaction.response.send_message(embed=get_embed("Error", "Artist not found.", "error"), ephemeral=True)
+            
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
+
+        sub_oc_key = sub_oc["id"]
+        artist = data["weverse_artists"][oc["id"]]
+        if sub_oc_key not in artist.get("dm_subscribers", {}):
+            return await interaction.response.send_message(embed=get_embed("Status", f"You do not have a subscription to **{oc['name']}**'s Weverse DM.", "neutral"), ephemeral=True)
+            
+        sub = artist["dm_subscribers"][sub_oc_key]
+        plan = sub["plan"]
+        active = sub["active"]
+        next_dt = datetime.fromisoformat(sub["next_billing"]).astimezone(get_tz())
+        days_rem = (next_dt - now()).days
+        canc = sub["cancelled"]
+        
+        embed = get_embed(
+            f"Subscription Status — {sub_oc['name']} → {oc['name']}",
+            (
+                f"**Plan:** {WEVERSE_PLANS.get(plan, {}).get('label', plan)}\n"
+                f"**Active:** {active}\n"
+                f"**Cancelled:** {canc}\n"
+                f"**Next Billing:** {next_dt.strftime('%Y-%m-%d')} ({days_rem} days remaining)"
+            ), "system"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @weverse_group.command(name="create", description="[dev] create a weverse dm group")
+    @app_commands.describe(initial_members="comma-separated oc names")
+    @is_dev_dec()
+    async def weverse_group_create(self, interaction: discord.Interaction, name: str, initial_members: str = None):
+        data = load_data()
+        if any(g.get("name", "").lower() == name.lower() and not g.get("archived") for g in data.get("weverse_groups", {}).values()):
+            return await interaction.response.send_message(embed=get_embed("Error", "An active group with that name exists.", "error"), ephemeral=True)
+            
+        cat_id = data["config"].get("weverse_group_category_id")
+        if not cat_id:
+            return await interaction.response.send_message(embed=get_embed("Error", "Group category not configured.", "error"), ephemeral=True)
+            
+        guild = interaction.guild
+        cat = guild.get_channel(int(cat_id))
+        if not cat:
+            return await interaction.response.send_message(embed=get_embed("Error", "Configured category not found.", "error"), ephemeral=True)
+            
+        await interaction.response.defer(ephemeral=True)
+        valid_oc_keys = []
+        resolved_members: list[str] = []
+        skipped_members: list[str] = []
+        skipped = []
+        if initial_members:
+            oc_name_list = [n.strip() for n in initial_members.split(",") if n.strip()]
+            for oc_nm in oc_name_list:
+                oc_obj = find_oc(oc_nm, data)
+                if not oc_obj or not oc_obj.get("owner_id"):
+                    skipped.append(oc_nm)
+                    skipped_members.append(oc_nm)
+                    continue
+                oc_key = oc_obj["id"]
+                if oc_key in valid_oc_keys:
+                    skipped.append(oc_nm)  # duplicate
+                    skipped_members.append(oc_nm)
+                    continue
+                valid_oc_keys.append(oc_key)
+                resolved_members.append(oc_obj["name"])
+        
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True,
+                                                   manage_channels=True, manage_permissions=True)
+        }
+        already_granted: set[int] = set()
+        for oc_k in valid_oc_keys:
+            owner_id = data["ocs"].get(oc_k, {}).get("owner_id")
+            if not owner_id or owner_id in already_granted:
+                continue
+            mem = guild.get_member(int(owner_id))
+            if mem:
+                # Shared group channel: read-only for all members. They post in their own DM channel.
+                overwrites[mem] = discord.PermissionOverwrite(read_messages=True, send_messages=False, view_channel=True)
+                already_granted.add(owner_id)
+            
+        safe_name = f"💬-{re.sub(r'[^a-zA-Z0-9]', '-', name.lower())}"
+        try:
+            channel = await guild.create_text_channel(name=safe_name, category=cat, topic=f"Weverse Group DM: {name}", overwrites=overwrites)
+            await _add_tupperbox_to_channel(channel, reason=f"weverse_group create: {name}")
+            gid = str(uuid.uuid4())
+            data.setdefault("weverse_groups", {})[gid] = {
+                "group_id": gid,
+                "name": name,
+                "channel_id": str(channel.id),
+                "member_oc_ids": valid_oc_keys,
+                "member_dm_channels": {oc_k: None for oc_k in valid_oc_keys},
+                "member_dm_subscribers": {oc_k: {} for oc_k in valid_oc_keys},
+                "created_at": now().isoformat(),
+                "created_by": str(interaction.user.id),
+                "archived": False
+            }
+            save_data(data)
+            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_grp_create"))
+
+            skip_str = f"\nSkipped {len(skipped)} invalid OC names." if skipped else ""
+            embed = get_embed("Success", f"Group **{name}** created: {channel.mention}\nMembers added: {len(valid_oc_keys)}{skip_str}", "success")
+            if initial_members:
+                resolved_text = (
+                    "\n".join(f"✅ {n}" for n in resolved_members)
+                    or "none"
+                )
+                skipped_text = (
+                    "\n".join(f"❌ {n}" for n in skipped_members)
+                    or "none"
+                )
+                field_value = f"**Added ({len(resolved_members)}):**\n{resolved_text}\n\n**Skipped ({len(skipped_members)}):**\n{skipped_text}"
+                if len(field_value) > 1024:
+                    # Truncate to fit Discord embed field limit
+                    half = 500
+                    if len(resolved_text) > half:
+                        resolved_text = resolved_text[:half] + "… (truncated)"
+                    skipped_text_trimmed = skipped_text[:1024 - len(resolved_text) - 60]
+                    if len(skipped_text_trimmed) < len(skipped_text):
+                        skipped_text = skipped_text_trimmed + "… (truncated)"
+                    field_value = f"**Added ({len(resolved_members)}):**\n{resolved_text}\n\n**Skipped ({len(skipped_members)}):**\n{skipped_text}"
+                    field_value = field_value[:1024]
+                embed.add_field(
+                    name="Member Resolution",
+                    value=field_value,
+                    inline=False,
+                )
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(embed=get_embed("Error", f"Failed: {e}", "error"))
+
+    @weverse_group.command(name="addmember", description="[dev] add an oc member to a weverse group dm")
+    @app_commands.describe(oc_name="oc name to add to the group")
+    @is_dev_dec()
+    async def weverse_group_addmember(self, interaction: discord.Interaction, group_name: str, oc_name: str):
+        data = load_data()
+        group = next((g for g in data.get("weverse_groups", {}).values() if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Active group not found.", "error"), ephemeral=True)
+            
+        oc_obj = find_oc(oc_name, data)
+        if not oc_obj:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        oc_key = oc_obj["id"]
+        member_list = group.setdefault("member_oc_ids", [])
+        if oc_key in member_list:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{oc_obj['name']}** is already in this group.", "error"), ephemeral=True)
+
+        member_list.append(oc_key)
+        group.setdefault("member_dm_channels", {})[oc_key] = group["member_dm_channels"].get(oc_key, None)
+        group.setdefault("member_dm_subscribers", {}).setdefault(oc_key, {})
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_grp_add"))
+
+        owner_id = oc_obj.get("owner_id")
+        member = interaction.guild.get_member(int(owner_id)) if owner_id else None
+        
+        if group.get("channel_id"):
+            channel = interaction.guild.get_channel(int(group["channel_id"]))
+            if channel and member:
+                await channel.set_permissions(member, read_messages=True, send_messages=False, view_channel=True)
+                
+        await interaction.response.send_message(
+            embed=get_embed("Success", f"**{oc_obj['name']}** added to **{group['name']}**.", "success"), ephemeral=True)
+
+    @weverse_group.command(name="bulkadd", description="[dev] bulk-add existing oc owners to a weverse group")
+    @is_dev_dec()
+    async def weverse_group_bulkadd(self, interaction: discord.Interaction, group_name: str, oc_names: str):
+        data = load_data()
+        group = next((g for g in data.get("weverse_groups", {}).values() if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Active group not found.", "error"), ephemeral=True)
+            
+        await interaction.response.defer(ephemeral=True)
+        added, skipped = 0, 0
+        names = [n.strip() for n in oc_names.split(",")]
+        
+        channel = interaction.guild.get_channel(int(group["channel_id"])) if group.get("channel_id") else None
+        
+        already_granted: set[int] = set()
+        
+        for n in names:
+            oc = find_oc(n, data)
+            if not oc or not oc.get("owner_id"):
+                skipped += 1
+                continue
+            
+            oc_key = oc["id"]
+            if oc_key in group.setdefault("member_oc_ids", []):
+                skipped += 1
+                continue
+            
+            owner_id = oc["owner_id"]
+            member = interaction.guild.get_member(int(owner_id))
+            if member:
+                group["member_oc_ids"].append(oc_key)
+                group.setdefault("member_dm_channels", {})[oc_key] = group["member_dm_channels"].get(oc_key, None)
+                group.setdefault("member_dm_subscribers", {}).setdefault(oc_key, {})
+                added += 1
+                if channel and owner_id not in already_granted:
+                    try:
+                        await channel.set_permissions(member, read_messages=True, send_messages=False, view_channel=True)
+                        already_granted.add(owner_id)
+                    except: pass
+            else:
+                skipped += 1
+                
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_bulkadd"))
+        await interaction.followup.send(embed=get_embed("Bulk Add", f"Added: {added} new members.\nSkipped: {skipped} (Not found/Already in group).", "success"))
+
+    @weverse_group.command(name="removemember", description="[dev] remove a member from a weverse group dm")
+    @app_commands.describe(oc_name="oc name to remove from the group")
+    @is_dev_dec()
+    async def weverse_group_removemember(self, interaction: discord.Interaction, group_name: str, oc_name: str):
+        data = load_data()
+        group = next((g for g in data.get("weverse_groups", {}).values() if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Active group not found.", "error"), ephemeral=True)
+            
+        oc_obj = find_oc(oc_name, data)
+        if not oc_obj:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        oc_key = oc_obj["id"]
+        member_list = group.get("member_oc_ids", [])
+        if oc_key not in member_list:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{oc_obj['name']}** is not a member of this group.", "error"), ephemeral=True)
+
+        member_list.remove(oc_key)
+
+        # Only revoke Discord channel access if the owner has no *other* OCs still in this group
+        owner_id = oc_obj.get("owner_id")
+        if owner_id:
+            owner_still_has_oc_in_group = any(
+                data["ocs"].get(k, {}).get("owner_id") == owner_id
+                for k in member_list
+            )
+            if not owner_still_has_oc_in_group and group.get("channel_id"):
+                channel = interaction.guild.get_channel(int(group["channel_id"]))
+                member = interaction.guild.get_member(int(owner_id))
+                if channel and member:
+                    await channel.set_permissions(member, overwrite=None)
+
+        # CS1.7 — cascade: revoke member's own DM channel access for owner and all subscribers
+        member_dm_ch_id = group.get("member_dm_channels", {}).get(oc_key)
+        if member_dm_ch_id:
+            member_dm_ch = interaction.guild.get_channel(int(member_dm_ch_id))
+            if member_dm_ch:
+                # Revoke owner's send access
+                oc_owner_id = oc_obj.get("owner_id")
+                if oc_owner_id:
+                    oc_owner_member = interaction.guild.get_member(int(oc_owner_id))
+                    if oc_owner_member:
+                        try:
+                            await member_dm_ch.set_permissions(oc_owner_member, overwrite=None)
+                        except Exception:
+                            pass
+                # Revoke all subscriber read access
+                subs_for_member = group.get("member_dm_subscribers", {}).get(oc_key, {})
+                revoked_discord_ids: set[int] = set()
+                for sub_rec in subs_for_member.values():
+                    d_id = sub_rec.get("owner_discord_id")
+                    if d_id and int(d_id) not in revoked_discord_ids:
+                        sub_member = interaction.guild.get_member(int(d_id))
+                        if sub_member:
+                            try:
+                                await member_dm_ch.set_permissions(sub_member, overwrite=None)
+                                revoked_discord_ids.add(int(d_id))
+                            except Exception:
+                                pass
+                # Mark all subscriptions inactive
+                for sub_rec in subs_for_member.values():
+                    sub_rec["active"] = False
+            # Null out channel reference
+            group["member_dm_channels"][oc_key] = None
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_grp_rem"))
+
+        await interaction.response.send_message(
+            embed=get_embed("Success", f"**{oc_obj['name']}** removed from **{group['name']}**.", "success"), ephemeral=True)
+
+    @weverse_group.command(name="archive", description="[dev] archive a weverse group (channel is not deleted)")
+    @is_dev_dec()
+    async def weverse_group_archive(self, interaction: discord.Interaction, group_name: str):
+        data = load_data()
+        group = next((g for g in data.get("weverse_groups", {}).values() if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Active group not found.", "error"), ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        guild = resolve_guild(interaction)
+
+        # CS1.8 — cascade: deactivate all member DM subscriptions and revoke channel permissions
+        cascade_sub_count = 0
+        cascade_ch_count = 0
+        for member_oc_id, subs in group.get("member_dm_subscribers", {}).items():
+            for sub_rec in subs.values():
+                if sub_rec.get("active"):
+                    sub_rec["active"] = False
+                    cascade_sub_count += 1
+            ch_id = group.get("member_dm_channels", {}).get(member_oc_id)
+            if ch_id and guild:
+                ch = guild.get_channel(int(ch_id))
+                if ch:
+                    cascade_ch_count += 1
+                    revoked_ids: set[int] = set()
+                    for sub_rec in subs.values():
+                        d_id = sub_rec.get("owner_discord_id")
+                        if d_id and int(d_id) not in revoked_ids:
+                            sub_member = guild.get_member(int(d_id))
+                            if sub_member:
+                                try:
+                                    await ch.set_permissions(sub_member, overwrite=None)
+                                    revoked_ids.add(int(d_id))
+                                except Exception as e:
+                                    log.error("archive cascade: revoke perm error: %s", e)
+
+        group["archived"] = True
+        save_data(data)
+        asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_grp_arch"))
+        await audit(guild, f"weverse_grp_archive: {group['name']} archived, deactivated {cascade_sub_count} sub(s) across {cascade_ch_count} member DM channel(s) by {interaction.user}")
+        await interaction.followup.send(embed=get_embed("Success", f"Group **{group['name']}** archived. {cascade_sub_count} subscription(s) deactivated, permissions revoked on {cascade_ch_count} member DM channel(s).", "success"), ephemeral=True)
+
+    @weverse_group.command(name="list", description="[dev] list all active weverse groups and their members")
+    @is_dev_dec()
+    async def weverse_group_list(self, interaction: discord.Interaction):
+        data = load_data()
+        groups = [g for g in data.get("weverse_groups", {}).values() if not g.get("archived")]
+        if not groups:
+            return await interaction.response.send_message(embed=get_embed("Groups", "No active groups found.", "neutral"), ephemeral=True)
+            
+        pages = []
+        for i in range(0, len(groups), 5):
+            chunk = groups[i:i+5]
+            embed = get_embed("Active Weverse Groups", f"Page {i//5 + 1}")
+            for g in chunk:
+                oc_lines = []
+                for oc_k in g.get("member_oc_ids", []):
+                    oc_rec = data.get("ocs", {}).get(oc_k)
+                    if oc_rec:
+                        oc_lines.append(f"• {oc_rec['name']} (<@{oc_rec.get('owner_id', '?')}>)")
+                    else:
+                        oc_lines.append(f"• `{oc_k}` (OC not found)")
+                members_str = "\n".join(oc_lines)[:1000] or "None"
+                
+                ch_str = f"<#{g['channel_id']}>" if g.get("channel_id") else "None"
+                embed.add_field(
+                    name=f"{g['name']} ({len(g.get('member_oc_ids', []))} OC slots)",
+                    value=f"Channel: {ch_str}\n{members_str}",
+                    inline=False
+                )
+            pages.append(embed)
+            
+        view = RankingPaginationView(pages)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+
+    # ── Helper: resolve category for group member DM (CS5.2 fallback) ──────────
+    def _resolve_group_dm_category(self, guild: discord.Guild, data: dict):
+        """Return (category, used_fallback). Falls back to weverse_dm_category_id if group dm cat not set."""
+        cat_id = data["config"].get("weverse_group_dm_category_id")
+        if cat_id:
+            cat = guild.get_channel(int(cat_id))
+            if cat:
+                return cat, False
+        # Fallback to artist DM category
+        fallback_id = data["config"].get("weverse_dm_category_id")
+        if fallback_id:
+            cat = guild.get_channel(int(fallback_id))
+            if cat:
+                log.warning("_resolve_group_dm_category: weverse_group_dm_category_id not set; falling back to weverse_dm_category_id.")
+                return cat, True
+        return None, False
+
+    # ── Helper: resolve group and member OC by name ─────────────────────────────
+    def _resolve_group_and_member(self, group_name: str, member_oc_name: str, data: dict):
+        """Returns (group, member_oc, error_str). error_str is None on success."""
+        group = next((g for g in data.get("weverse_groups", {}).values()
+                      if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return None, None, "Active group not found."
+        member_oc = find_oc(member_oc_name, data)
+        if not member_oc:
+            return group, None, "Member OC not found."
+        if member_oc["id"] not in group.get("member_oc_ids", []):
+            return group, None, f"**{member_oc['name']}** is not a member of this group."
+        return group, member_oc, None
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  CS1.3 / CS2 — GROUP DEV COMMANDS
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    @weverse_group.command(name="provisionmemberdm", description="[dev] create a member oc's private subscriber dm channel within a group")
+    @app_commands.describe(group_name="name of the weverse group", oc_name="name of the group member oc")
+    @is_dev_dec()
+    async def weverse_group_provisionmemberdm(self, interaction: discord.Interaction, group_name: str, oc_name: str):
+        data = load_data()
+        group, member_oc, err = self._resolve_group_and_member(group_name, oc_name, data)
+        if err:
+            return await interaction.response.send_message(embed=get_embed("Error", err, "error"), ephemeral=True)
+
+        oc_id = member_oc["id"]
+        if group.get("member_dm_channels", {}).get(oc_id):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"A DM channel already exists for **{member_oc['name']}**: <#{group['member_dm_channels'][oc_id]}>.", "error"), ephemeral=True)
+
+        guild = resolve_guild(interaction)
+        cat, used_fallback = self._resolve_group_dm_category(guild, data)
+        if not cat:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "Group member DM category not configured. Use /weverse config setgroupdmcategory (or setdmcategory as fallback).", "error"), ephemeral=True)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True),
+        }
+        owner_id = member_oc.get("owner_id")
+        if owner_id:
+            owner_member = guild.get_member(int(owner_id))
+            if owner_member:
+                overwrites[owner_member] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
+
+        group_slug = re.sub(r'[^a-z0-9]', '-', group["name"].lower()).strip('-')
+        group_slug = re.sub(r'-{2,}', '-', group_slug)
+        oc_slug = re.sub(r'[^a-z0-9]', '-', member_oc["name"].lower()).strip('-')
+        oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+        channel_name = f"➾．weverse．dm．{group_slug}．{oc_slug}"
+        topic = f"Private Weverse DM — {group['name']} · {member_oc['name']}. Subscribers only."
+
+        try:
+            channel = await guild.create_text_channel(name=channel_name, category=cat, topic=topic, overwrites=overwrites)
+            await _add_tupperbox_to_channel(channel, reason=f"weverse_group member DM: {member_oc['name']}")
+            group.setdefault("member_dm_channels", {})[oc_id] = str(channel.id)
+            await save_and_backup(data, reason="weverse_grp_provision_member_dm")
+            await audit(guild, f"weverse_grp_provision_member_dm: {member_oc['name']} in {group['name']} ch={channel.id} by {interaction.user}")
+            fallback_note = "\n⚠️ Used artist DM category as fallback (no group DM category set)." if used_fallback else ""
+            await interaction.response.send_message(
+                embed=get_embed("Success", f"DM channel provisioned for **{member_oc['name']}**: {channel.mention}{fallback_note}", "success"), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(embed=get_embed("Error", f"Failed to create channel: {e}", "error"), ephemeral=True)
+
+    @weverse_group.command(name="deprovisionmemberdm", description="[dev] delete a group member's dm channel (subscriber data preserved)")
+    @app_commands.describe(group_name="name of the weverse group", oc_name="name of the group member oc")
+    @is_dev_dec()
+    async def weverse_group_deprovisionmemberdm(self, interaction: discord.Interaction, group_name: str, oc_name: str):
+        data = load_data()
+        group, member_oc, err = self._resolve_group_and_member(group_name, oc_name, data)
+        if err:
+            return await interaction.response.send_message(embed=get_embed("Error", err, "error"), ephemeral=True)
+
+        oc_id = member_oc["id"]
+        ch_id = group.get("member_dm_channels", {}).get(oc_id)
+        if not ch_id:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{member_oc['name']}** does not have a provisioned DM channel.", "error"), ephemeral=True)
+
+        guild = resolve_guild(interaction)
+        channel = guild.get_channel(int(ch_id))
+        if channel:
+            try:
+                await channel.delete()
+            except discord.Forbidden:
+                return await interaction.response.send_message(
+                    embed=get_embed("Error", "Missing permissions to delete the channel.", "error"), ephemeral=True)
+
+        group["member_dm_channels"][oc_id] = None
+        await save_and_backup(data, reason="weverse_grp_deprovision_member_dm")
+        await audit(guild, f"weverse_grp_deprovision_member_dm: {member_oc['name']} in {group['name']} by {interaction.user}")
+        await interaction.response.send_message(embed=get_embed("Success", f"DM channel for **{member_oc['name']}** deprovisioned. Subscriber records preserved.", "success"), ephemeral=True)
+
+    @weverse_group.command(name="membersubscribers", description="[dev] list all dm subscribers for a specific group member")
+    @app_commands.describe(group_name="name of the weverse group", oc_name="name of the group member oc")
+    @is_dev_dec()
+    async def weverse_group_membersubscribers(self, interaction: discord.Interaction, group_name: str, oc_name: str):
+        data = load_data()
+        group, member_oc, err = self._resolve_group_and_member(group_name, oc_name, data)
+        if err:
+            return await interaction.response.send_message(embed=get_embed("Error", err, "error"), ephemeral=True)
+
+        oc_id = member_oc["id"]
+        subs = list(group.get("member_dm_subscribers", {}).get(oc_id, {}).values())
+        if not subs:
+            return await interaction.response.send_message(
+                embed=get_embed("Subscribers", f"No subscribers for **{member_oc['name']}** in **{group['name']}**.", "neutral"), ephemeral=True)
+
+        pages = []
+        for i in range(0, len(subs), 10):
+            chunk = subs[i:i+10]
+            embed = get_embed(f"Subscribers: {member_oc['name']} ({group['name']})", f"Page {i//10 + 1}")
+            for s in chunk:
+                oc_nm = s.get("oc_name", s.get("oc_id", "Unknown OC"))
+                owner = s.get("owner_discord_id", "?")
+                plan_label = WEVERSE_PLANS.get(s.get("plan", ""), {}).get("label", s.get("plan", "Unknown"))
+                active_str = "✅ active" if s.get("active") else "❌ inactive"
+                cancelled_str = "⚠️ cancelled (runs to end of period)" if s.get("cancelled") else "—"
+                val = (
+                    f"Owner: <@{owner}>\n"
+                    f"Plan: {plan_label}\n"
+                    f"Status: {active_str}\n"
+                    f"Cancelled: {cancelled_str}\n"
+                    f"Next Billing: {s['next_billing'][:10]}"
+                )
+                embed.add_field(name=f"OC: {oc_nm}", value=val, inline=False)
+            pages.append(embed)
+
+        view = RankingPaginationView(pages)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+
+    @weverse_group.command(name="migratememberchannelnames", description="[dev] rename all group member dm channels to canonical format")
+    @is_dev_dec()
+    async def weverse_group_migratememberchannelnames(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        data = load_data()
+        guild = resolve_guild(interaction)
+        renamed, skipped, failed = 0, 0, 0
+        lines = []
+
+        for gid, grp in data.get("weverse_groups", {}).items():
+            if grp.get("archived"):
+                continue
+            group_slug = re.sub(r'[^a-z0-9]', '-', grp.get("name", "").lower()).strip('-')
+            group_slug = re.sub(r'-{2,}', '-', group_slug)
+            for member_oc_id, ch_id in grp.get("member_dm_channels", {}).items():
+                if not ch_id:
+                    skipped += 1
+                    continue
+                oc = data["ocs"].get(member_oc_id)
+                if not oc:
+                    skipped += 1
+                    continue
+                ch = guild.get_channel(int(ch_id))
+                if not ch:
+                    skipped += 1
+                    lines.append(f"⚠️ **{grp['name']} / {oc['name']}** — channel `{ch_id}` not found.")
+                    continue
+                oc_slug = re.sub(r'[^a-z0-9]', '-', oc["name"].lower()).strip('-')
+                oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+                canonical_name = f"➾．weverse．dm．{group_slug}．{oc_slug}"
+                if ch.name == canonical_name:
+                    skipped += 1
+                    continue
+                try:
+                    await ch.edit(name=canonical_name)
+                    renamed += 1
+                    lines.append(f"✅ **{grp['name']} / {oc['name']}** — renamed to `{canonical_name}`.")
+                except Exception as exc:
+                    failed += 1
+                    lines.append(f"❌ **{grp['name']} / {oc['name']}** — rename failed: {exc}")
+
+        summary = f"**Renamed:** {renamed} | **Skipped:** {skipped} | **Failed:** {failed}"
+        desc = summary + ("\n\n" + "\n".join(lines) if lines else "")
+        embed = get_embed("Group Member DM Channel Name Migration", desc[:4096], "success" if not failed else "error")
+        await audit(guild, f"weverse_grp_migratenames: renamed={renamed} skipped={skipped} failed={failed} by {interaction.user}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @weverse_group.command(name="devsetup", description="[dev] provision dm channels for all unprovisioned members of a group in one step")
+    @app_commands.describe(group_name="name of the weverse group")
+    @is_dev_dec()
+    async def weverse_group_devsetup(self, interaction: discord.Interaction, group_name: str):
+        await interaction.response.defer(ephemeral=True)
+        data = load_data()
+        group = next((g for g in data.get("weverse_groups", {}).values()
+                      if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+        if not group:
+            return await interaction.followup.send(embed=get_embed("Error", "Active group not found.", "error"), ephemeral=True)
+
+        guild = resolve_guild(interaction)
+        cat, used_fallback = self._resolve_group_dm_category(guild, data)
+        if not cat:
+            return await interaction.followup.send(
+                embed=get_embed("Error", "Group member DM category not configured. Use /weverse config setgroupdmcategory.", "error"), ephemeral=True)
+
+        group_slug = re.sub(r'[^a-z0-9]', '-', group["name"].lower()).strip('-')
+        group_slug = re.sub(r'-{2,}', '-', group_slug)
+
+        provisioned_count, skipped_count, failed_count = 0, 0, 0
+        result_lines = []
+
+        for oc_id in group.get("member_oc_ids", []):
+            if group.get("member_dm_channels", {}).get(oc_id) is not None:
+                skipped_count += 1
+                oc_name = data["ocs"].get(oc_id, {}).get("name", oc_id)
+                result_lines.append(f"⚠️ **{oc_name}** — already provisioned.")
+                continue
+            oc = data["ocs"].get(oc_id)
+            if not oc:
+                failed_count += 1
+                result_lines.append(f"❌ `{oc_id}` — OC record not found.")
+                continue
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_permissions=True),
+            }
+            owner_id = oc.get("owner_id")
+            if owner_id:
+                owner_member = guild.get_member(int(owner_id))
+                if owner_member:
+                    overwrites[owner_member] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
+
+            oc_slug = re.sub(r'[^a-z0-9]', '-', oc["name"].lower()).strip('-')
+            oc_slug = re.sub(r'-{2,}', '-', oc_slug)
+            channel_name = f"➾．weverse．dm．{group_slug}．{oc_slug}"
+            topic = f"Private Weverse DM — {group['name']} · {oc['name']}. Subscribers only."
+
+            try:
+                channel = await guild.create_text_channel(name=channel_name, category=cat, topic=topic, overwrites=overwrites)
+                group.setdefault("member_dm_channels", {})[oc_id] = str(channel.id)
+                provisioned_count += 1
+                result_lines.append(f"✅ **{oc['name']}** — {channel.mention}")
+            except Exception as exc:
+                failed_count += 1
+                result_lines.append(f"❌ **{oc['name']}** — failed: {exc}")
+
+        await save_and_backup(data, reason="weverse_grp_devsetup")
+        await audit(guild, f"weverse_grp_devsetup: {group['name']} provisioned={provisioned_count} failed={failed_count} by {interaction.user}")
+
+        fallback_note = "\n⚠️ Used artist DM category as fallback." if used_fallback else ""
+        desc = f"**Provisioned:** {provisioned_count} | **Skipped:** {skipped_count} | **Failed:** {failed_count}{fallback_note}"
+        if result_lines:
+            desc += "\n\n" + "\n".join(result_lines)
+        embed = get_embed(f"Group Devsetup: {group['name']}", desc[:4096], "success" if not failed_count else "error")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @weverse_group.command(name="devreply", description="[dev] post or reply in a group member's dm channel by recency index")
     @app_commands.describe(
-        oc_name="your OC subscribing",
-        artist_oc_name="the artist OC to subscribe to",
+        group_name="name of the weverse group",
+        member_oc_name="name of the group member oc",
+        content="message content (max 500 chars)",
+        post_index="0 = new message; 1 = reply to most recent non-bot message, etc.",
+    )
+    @is_dev_dec()
+    async def weverse_group_devreply(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+        member_oc_name: str,
+        content: str,
+        post_index: int = 0,
+    ):
+        if len(content) > 500:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "Content must be <= 500 characters.", "error"), ephemeral=True)
+
+        data = load_data()
+        group, member_oc, err = self._resolve_group_and_member(group_name, member_oc_name, data)
+        if err:
+            return await interaction.response.send_message(embed=get_embed("Error", err, "error"), ephemeral=True)
+
+        oc_id = member_oc["id"]
+        ch_id = group.get("member_dm_channels", {}).get(oc_id)
+        if not ch_id:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{member_oc['name']}** does not have a provisioned DM channel.", "error"), ephemeral=True)
+
+        guild = resolve_guild(interaction)
+        channel = guild.get_channel(int(ch_id))
+        if not channel:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "DM channel not found in guild.", "error"), ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        if post_index == 0:
+            # Send a new message prefixed with OC name
+            await channel.send(f"**[{member_oc['name']}]** {content}")
+        else:
+            # Fetch recent messages and find target
+            fetch_limit = max(post_index, 20)
+            messages = [m async for m in channel.history(limit=fetch_limit) if not m.author.bot and m.content]
+            if post_index > len(messages):
+                return await interaction.followup.send(
+                    f"❌ no non-bot message found at index {post_index} (only {len(messages)} found).", ephemeral=True)
+            target_msg = messages[post_index - 1]
+            await channel.send(f"**[{member_oc['name']}]** {content}", reference=target_msg)
+
+        await audit(guild, f"weverse_grp_devreply: {group['name']}/{member_oc['name']} post_index={post_index} by {interaction.user}")
+        await interaction.followup.send(embed=get_embed("Success", "Message sent.", "success"), ephemeral=True)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    #  CS1.4 — GROUP PUBLIC COMMANDS
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    @weverse_group.command(name="subscribe", description="subscribe to a group member's private weverse dm")
+    @app_commands.describe(
+        group_name="name of the weverse group",
+        member_oc_name="name of the group member oc to subscribe to",
+        subscribing_oc_name="your oc that is subscribing",
         plan="subscription plan",
     )
     @app_commands.choices(plan=[
-        app_commands.Choice(name="Monthly (₩8,000 / 30 days)", value="monthly"),
-        app_commands.Choice(name="6 Months (₩40,000 / 183 days)", value="biannual"),
-        app_commands.Choice(name="Annual (₩80,000 / 365 days)", value="annual"),
+        app_commands.Choice(name="Monthly — ₩8,000", value="monthly"),
+        app_commands.Choice(name="6 Months — ₩40,000", value="biannual"),
+        app_commands.Choice(name="Annual — ₩80,000", value="annual"),
     ])
-    async def dm_subscribe(self, interaction: discord.Interaction, oc_name: str, artist_oc_name: str, plan: str):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-                return await interaction.followup.send("❌ You do not own this OC.", ephemeral=True)
+    async def weverse_group_subscribe(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+        member_oc_name: str,
+        subscribing_oc_name: str,
+        plan: str,
+    ):
+        data = load_data()
+        # CS5.3 — archived guard
+        group = next((g for g in data.get("weverse_groups", {}).values()
+                      if g.get("name", "").lower() == group_name.lower()), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Group not found.", "error"), ephemeral=True)
+        if group.get("archived"):
+            return await interaction.response.send_message(embed=get_embed("Error", "This group is no longer active.", "error"), ephemeral=True)
 
-            artist_oc = find_oc(artist_oc_name, data)
-            if not artist_oc:
-                return await interaction.followup.send("❌ Artist OC not found.", ephemeral=True)
-            artist_id = artist_oc["id"]
-            if artist_id not in data.get("weverse_artists", {}):
-                return await interaction.followup.send(f"❌ **{artist_oc['name']}** is not a registered Weverse artist.", ephemeral=True)
+        member_oc = find_oc(member_oc_name, data)
+        if not member_oc or member_oc["id"] not in group.get("member_oc_ids", []):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "Member OC not found in this group.", "error"), ephemeral=True)
 
-            plan_data = WEVERSE_PLANS.get(plan)
-            if not plan_data:
-                return await interaction.followup.send("❌ Invalid plan.", ephemeral=True)
+        member_oc_id = member_oc["id"]
+        ch_id = group.get("member_dm_channels", {}).get(member_oc_id)
+        if not ch_id:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "This member's DM channel has not been provisioned yet.", "error"), ephemeral=True)
 
-            cost = plan_data["won"]
-            if oc.get("balance", 0) < cost:
-                return await interaction.followup.send(
-                    f"❌ Insufficient balance. **{oc['name']}** has ₩{oc.get('balance',0):,} but needs ₩{cost:,}.", ephemeral=True
-                )
+        # CS5.4 — non-existent channel guard
+        guild = resolve_guild(interaction)
+        channel = guild.get_channel(int(ch_id))
+        if not channel:
+            return await interaction.response.send_message(
+                embed=get_embed("Error", "This member's DM channel no longer exists. Contact an admin to re-provision it.", "error"), ephemeral=True)
 
-            artist_record = data["weverse_artists"][artist_id]
-            existing = artist_record.get("dm_subscribers", {}).get(oc["id"])
-            if existing and existing.get("active"):
-                return await interaction.followup.send(f"❌ **{oc['name']}** already has an active subscription.", ephemeral=True)
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(embed=get_embed("Error", "Subscribing OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
 
-            oc["balance"] -= cost
-            next_billing = (now() + timedelta(days=plan_data["days"])).isoformat()
-            artist_record.setdefault("dm_subscribers", {})[oc["id"]] = {
-                "oc_id": oc["id"],
-                "oc_name": oc["name"],
-                "owner_discord_id": interaction.user.id,
-                "plan": plan,
-                "active": True,
-                "cancelled": False,
-                "subscribed_at": now().isoformat(),
-                "next_billing": next_billing,
-            }
+        sub_oc_key = sub_oc["id"]
+        existing_subs = group.get("member_dm_subscribers", {}).get(member_oc_id, {})
+        if sub_oc_key in existing_subs and existing_subs[sub_oc_key].get("active"):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{sub_oc['name']}** already has an active subscription to **{member_oc['name']}**'s DM.", "error"), ephemeral=True)
 
-            dm_channel_id = artist_record.get("dm_channel_id")
-            if guild and dm_channel_id:
-                ch = guild.get_channel(int(dm_channel_id))
-                member = guild.get_member(interaction.user.id)
-                if ch and isinstance(ch, discord.TextChannel) and member:
+        plan_data = WEVERSE_PLANS.get(plan)
+        cost = plan_data["won"]
+        if sub_oc.get("balance", 0) < cost:
+            return await interaction.response.send_message(
+                embed=get_embed("Insufficient Funds", f"**{sub_oc['name']}** needs ₩{cost:,} but only has ₩{sub_oc.get('balance', 0):,}.", "error"), ephemeral=True)
+
+        next_dt = now() + timedelta(days=plan_data["days"])
+        confirm_embed = get_embed(
+            "Confirm Subscription",
+            f"Group: **{group['name']}**\nMember: **{member_oc['name']}**\nPlan: **{plan_data['label']}**\nCost: **₩{cost:,}**\nNext Billing: **{next_dt.strftime('%Y-%m-%d')}**\n\n⚠️ Note: you will have **read-only** access to this channel.",
+            "neutral"
+        )
+        if await wait_for_confirm(interaction, confirm_embed):
+            d = load_data()
+            d_sub_oc = d["ocs"].get(sub_oc_key)
+            if d_sub_oc and d_sub_oc.get("balance", 0) >= cost:
+                d_sub_oc["balance"] -= cost
+                d_group = next((g for g in d.get("weverse_groups", {}).values()
+                                if g.get("name", "").lower() == group_name.lower() and not g.get("archived")), None)
+                if not d_group:
+                    return await interaction.followup.send(embed=get_embed("Error", "Group no longer available.", "error"), ephemeral=True)
+
+                d_group.setdefault("member_dm_subscribers", {}).setdefault(member_oc_id, {})[sub_oc_key] = {
+                    "oc_id": sub_oc_key,
+                    "oc_name": sub_oc["name"],
+                    "owner_discord_id": str(interaction.user.id),
+                    "plan": plan,
+                    "started_at": now().isoformat(),
+                    "next_billing": next_dt.isoformat(),
+                    "active": True,
+                    "cancelled": False,
+                    "cancelled_at": None,
+                }
+                await save_and_backup(d, reason="weverse_grp_subscribe")
+
+                # Re-resolve channel in case it changed
+                real_ch_id = d_group.get("member_dm_channels", {}).get(member_oc_id)
+                real_channel = guild.get_channel(int(real_ch_id)) if real_ch_id else None
+                if real_channel:
                     try:
-                        await ch.set_permissions(member, read_messages=True, send_messages=True)
-                    except Exception:
-                        pass
-
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_dm_subscribe"))
-            await interaction.followup.send(
-                f"✅ **{oc['name']}** subscribed to **{artist_oc['name']}**'s DM on the **{plan_data['label']}** plan. ₩{cost:,} deducted.", ephemeral=True
-            )
-        except Exception as e:
-            log.error("weverse dm subscribe error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
-
-    @dm_group.command(name="unsubscribe", description="cancel an OC's DM subscription")
-    @app_commands.describe(oc_name="your OC", artist_oc_name="the artist OC to unsubscribe from")
-    async def dm_unsubscribe(self, interaction: discord.Interaction, oc_name: str, artist_oc_name: str):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-                return await interaction.followup.send("❌ You do not own this OC.", ephemeral=True)
-
-            artist_oc = find_oc(artist_oc_name, data)
-            if not artist_oc or artist_oc["id"] not in data.get("weverse_artists", {}):
-                return await interaction.followup.send("❌ Artist OC not found or not a Weverse artist.", ephemeral=True)
-
-            artist_record = data["weverse_artists"][artist_oc["id"]]
-            sub = artist_record.get("dm_subscribers", {}).get(oc["id"])
-            if not sub or not sub.get("active"):
-                return await interaction.followup.send("❌ No active subscription found.", ephemeral=True)
-
-            sub["cancelled"] = True
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_dm_unsubscribe"))
-            await interaction.followup.send(
-                f"✅ **{oc['name']}**'s subscription to **{artist_oc['name']}** will end at the next billing date.", ephemeral=True
-            )
-        except Exception as e:
-            log.error("weverse dm unsubscribe error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
-
-    @dm_group.command(name="status", description="view subscription status for an OC")
-    @app_commands.describe(oc_name="the OC to check")
-    async def dm_status(self, interaction: discord.Interaction, oc_name: str):
-        try:
-            data = load_data()
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.response.send_message("❌ OC not found.", ephemeral=True)
-            lines = []
-            for artist_id, artist_record in data.get("weverse_artists", {}).items():
-                sub = artist_record.get("dm_subscribers", {}).get(oc["id"])
-                if sub:
-                    status = "✅ active" if sub.get("active") else "❌ inactive"
-                    cancelled = " (cancels at next billing)" if sub.get("cancelled") and sub.get("active") else ""
-                    lines.append(
-                        f"**{artist_record.get('oc_name', artist_id)}** — {sub['plan']} — {status}{cancelled}\n"
-                        f"  next billing: {sub.get('next_billing', 'N/A')[:10]}"
-                    )
-            if not lines:
-                return await interaction.response.send_message(f"**{oc['name']}** has no Weverse DM subscriptions.", ephemeral=True)
-            embed = discord.Embed(title=f"💜 {oc['name']} — Weverse DM Status", description="\n".join(lines), color=COLORS["system"])
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        except Exception as e:
-            log.error("weverse dm status error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    # ── group subgroup ─────────────────────────────────────────────────────────
-
-    group_grp = app_commands.Group(name="group", description="Weverse fan groups")
-
-    @group_grp.command(name="create", description="dev | create a Weverse fan group with a dedicated channel")
-    @app_commands.describe(group_name="name of the fan group")
-    async def group_create(self, interaction: discord.Interaction, group_name: str):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            group_key = group_name.lower().replace(" ", "_")
-            if group_key in data.get("weverse_groups", {}):
-                return await interaction.followup.send("❌ A group with that name already exists.", ephemeral=True)
-
-            ch = None
-            cat_id = data["config"].get("weverse_group_category_id")
-            if guild and cat_id:
-                cat = guild.get_channel(int(cat_id))
-                if isinstance(cat, discord.CategoryChannel):
-                    try:
-                        ch = await guild.create_text_channel(
-                            f"wv-{group_name.lower().replace(' ', '-')}",
-                            category=cat,
-                            overwrites={
-                                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                            },
-                            topic=f"💜 Weverse fan group: {group_name}",
+                        # CS1.4 critical: subscribers are READ-ONLY; do not overwrite owner's send_messages
+                        await real_channel.set_permissions(
+                            interaction.user,
+                            read_messages=True, send_messages=False, view_channel=True
                         )
+                        await real_channel.send(f"💌 **{sub_oc['name']}** subscribed to **{member_oc['name']}**'s channel!")
                     except Exception as e:
-                        log.warning("Failed to create Weverse group channel: %s", e)
+                        log.error("weverse_group_subscribe: permission grant error: %s", e)
 
-            data.setdefault("weverse_groups", {})[group_key] = {
-                "name": group_name,
-                "channel_id": ch.id if ch else None,
-                "member_oc_ids": [],
-                "created_at": now_iso(),
-            }
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_group_create"))
-            ch_note = f" Channel: {ch.mention}" if ch else " (no channel created)"
-            await interaction.followup.send(f"✅ Fan group **{group_name}** created.{ch_note}", ephemeral=True)
-            if guild:
-                await audit(guild, f"Weverse group created: {group_name} by {interaction.user}")
-        except Exception as e:
-            log.error("weverse group create error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+                await audit(guild, f"weverse_grp_subscribe: {sub_oc['name']} → {member_oc['name']} ({group['name']}) plan={plan} by {interaction.user}")
+                new_bal = d_sub_oc.get("balance", 0)
+                await interaction.followup.send(
+                    embed=get_embed("Success",
+                        f"Welcome to **{member_oc['name']}**'s Weverse DM in **{group['name']}**! "
+                        f"Your {plan_data['label']} subscription is now active. "
+                        f"Next billing: {next_dt.strftime('%Y-%m-%d')}. "
+                        f"Remaining balance: ₩{new_bal:,}.\n"
+                        f"Note: you have read-only access to the channel.",
+                        "success"), ephemeral=True)
+            else:
+                await interaction.followup.send(embed=get_embed("Error", "Insufficient OC balance (changed since confirmation).", "error"), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=get_embed("Cancelled", "Subscription cancelled. No charge was made.", "neutral"), ephemeral=True)
 
-    @group_grp.command(name="invite", description="invite an OC to a Weverse fan group")
-    @app_commands.describe(oc_name="the OC to invite", group_name="the group name")
-    async def group_invite(self, interaction: discord.Interaction, oc_name: str, group_name: str):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
+    @weverse_group.command(name="cancel", description="cancel your subscription to a group member's weverse dm")
+    @app_commands.describe(
+        group_name="name of the weverse group",
+        member_oc_name="name of the group member oc",
+        subscribing_oc_name="your oc to cancel the subscription for",
+    )
+    async def weverse_group_cancel(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+        member_oc_name: str,
+        subscribing_oc_name: str,
+    ):
+        data = load_data()
+        # CS5.3
+        group = next((g for g in data.get("weverse_groups", {}).values()
+                      if g.get("name", "").lower() == group_name.lower()), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Group not found.", "error"), ephemeral=True)
+        if group.get("archived"):
+            return await interaction.response.send_message(embed=get_embed("Error", "This group is no longer active.", "error"), ephemeral=True)
 
-            group_key = group_name.lower().replace(" ", "_")
-            grp = data.get("weverse_groups", {}).get(group_key)
-            if not grp:
-                return await interaction.followup.send("❌ Group not found.", ephemeral=True)
+        member_oc = find_oc(member_oc_name, data)
+        if not member_oc or member_oc["id"] not in group.get("member_oc_ids", []):
+            return await interaction.response.send_message(embed=get_embed("Error", "Member OC not found in this group.", "error"), ephemeral=True)
 
-            if oc["id"] in grp.get("member_oc_ids", []):
-                return await interaction.followup.send("❌ That OC is already in this group.", ephemeral=True)
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
 
-            ch_id = grp.get("channel_id")
-            owner_id = oc.get("owner_id")
-            dev_ids = []
-            if guild:
-                dev_ids = [m.id for m in guild.members if guild.owner_id == m.id or m.guild_permissions.administrator]
+        member_oc_id = member_oc["id"]
+        sub_oc_key = sub_oc["id"]
+        subs = group.get("member_dm_subscribers", {}).get(member_oc_id, {})
+        if sub_oc_key not in subs or not subs[sub_oc_key].get("active"):
+            return await interaction.response.send_message(
+                embed=get_embed("Error", f"**{sub_oc['name']}** does not have an active subscription to **{member_oc['name']}**'s DM.", "error"), ephemeral=True)
 
-            view = GCInviteView(
-                guild_id=guild.id if guild else 0,
-                invitee_user_id=owner_id or 0,
-                oc_key=oc["id"],
-                oc_name=oc["name"],
-                group_name=grp["name"],
-                target_channel_id=ch_id or 0,
-                dev_ids=dev_ids,
-            )
-            embed = discord.Embed(
-                title="💜 Weverse Group Invite",
-                description=f"**{oc['name']}** has been invited to join **{grp['name']}**!",
-                color=COLORS["system"],
-            )
+        sub = subs[sub_oc_key]
+        sub["cancelled"] = True
+        sub["cancelled_at"] = now().isoformat()
+        await save_and_backup(data, reason="weverse_grp_cancel")
 
-            sent = False
-            if owner_id and guild:
-                member = guild.get_member(owner_id)
-                if member:
-                    try:
-                        await member.send(embed=embed, view=view)
-                        sent = True
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
-            if not sent:
-                weverse_ch = _resolve_weverse_channel(guild, data)
-                if weverse_ch:
-                    await weverse_ch.send(embed=embed, view=view)
+        guild = resolve_guild(interaction)
+        await audit(guild, f"weverse_grp_cancel: {sub_oc['name']} → {member_oc['name']} ({group['name']}) by {interaction.user}")
+        next_dt = datetime.fromisoformat(sub["next_billing"]).astimezone(get_tz()).strftime("%Y-%m-%d")
+        await interaction.response.send_message(
+            embed=get_embed("Success",
+                f"Your subscription to **{member_oc['name']}**'s Weverse DM in **{group['name']}** has been marked for cancellation. "
+                f"You will retain access until **{next_dt}**, after which access will be removed.",
+                "success"), ephemeral=True)
 
-            grp.setdefault("member_oc_ids", []).append(oc["id"])
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_group_invite"))
-            await interaction.followup.send(f"✅ Invite sent to **{oc['name']}** for group **{grp['name']}**.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse group invite error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
+    @weverse_group.command(name="dmstatus", description="check your subscription status for a group member's weverse dm")
+    @app_commands.describe(
+        group_name="name of the weverse group",
+        member_oc_name="name of the group member oc",
+        subscribing_oc_name="your oc to check the subscription for",
+    )
+    async def weverse_group_dmstatus(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+        member_oc_name: str,
+        subscribing_oc_name: str,
+    ):
+        data = load_data()
+        # CS5.3
+        group = next((g for g in data.get("weverse_groups", {}).values()
+                      if g.get("name", "").lower() == group_name.lower()), None)
+        if not group:
+            return await interaction.response.send_message(embed=get_embed("Error", "Group not found.", "error"), ephemeral=True)
+        if group.get("archived"):
+            return await interaction.response.send_message(embed=get_embed("Error", "This group is no longer active.", "error"), ephemeral=True)
 
-    @group_grp.command(name="leave", description="remove an OC from a Weverse fan group")
-    @app_commands.describe(oc_name="the OC leaving", group_name="the group name")
-    async def group_leave(self, interaction: discord.Interaction, oc_name: str, group_name: str):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
-                return await interaction.followup.send("❌ You do not own this OC.", ephemeral=True)
+        member_oc = find_oc(member_oc_name, data)
+        if not member_oc or member_oc["id"] not in group.get("member_oc_ids", []):
+            return await interaction.response.send_message(embed=get_embed("Error", "Member OC not found in this group.", "error"), ephemeral=True)
 
-            group_key = group_name.lower().replace(" ", "_")
-            grp = data.get("weverse_groups", {}).get(group_key)
-            if not grp:
-                return await interaction.followup.send("❌ Group not found.", ephemeral=True)
+        sub_oc = find_oc(subscribing_oc_name, data)
+        if not sub_oc:
+            return await interaction.response.send_message(embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if sub_oc.get("owner_id") != interaction.user.id and not is_dev(interaction):
+            return await interaction.response.send_message(embed=get_embed("Error", "You do not own that OC.", "error"), ephemeral=True)
 
-            if oc["id"] not in grp.get("member_oc_ids", []):
-                return await interaction.followup.send("❌ That OC is not in this group.", ephemeral=True)
+        member_oc_id = member_oc["id"]
+        sub_oc_key = sub_oc["id"]
+        subs = group.get("member_dm_subscribers", {}).get(member_oc_id, {})
+        if sub_oc_key not in subs:
+            return await interaction.response.send_message(
+                embed=get_embed("Status", f"**{sub_oc['name']}** does not have a subscription to **{member_oc['name']}**'s DM in **{group['name']}**.", "neutral"), ephemeral=True)
 
-            grp["member_oc_ids"].remove(oc["id"])
+        sub = subs[sub_oc_key]
+        plan = sub["plan"]
+        active = sub["active"]
+        next_dt = datetime.fromisoformat(sub["next_billing"]).astimezone(get_tz())
+        days_rem = (next_dt - now()).days
+        canc = sub["cancelled"]
 
-            ch_id = grp.get("channel_id")
-            if guild and ch_id:
-                ch = guild.get_channel(int(ch_id))
-                owner_id = oc.get("owner_id")
-                member = guild.get_member(owner_id) if owner_id else None
-                if ch and isinstance(ch, discord.TextChannel) and member:
-                    try:
-                        await ch.set_permissions(member, overwrite=None)
-                    except Exception:
-                        pass
+        embed = get_embed(
+            f"Subscription Status — {sub_oc['name']} → {member_oc['name']} ({group['name']})",
+            (
+                f"**Plan:** {WEVERSE_PLANS.get(plan, {}).get('label', plan)}\n"
+                f"**Active:** {active}\n"
+                f"**Cancelled:** {canc}\n"
+                f"**Next Billing:** {next_dt.strftime('%Y-%m-%d')} ({days_rem} days remaining)"
+            ), "system"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_group_leave"))
-            await interaction.followup.send(f"✅ **{oc['name']}** has left **{grp['name']}**.", ephemeral=True)
-        except Exception as e:
-            log.error("weverse group leave error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
 
-    @group_grp.command(name="list", description="list all Weverse groups and their members")
-    async def group_list(self, interaction: discord.Interaction):
-        try:
-            data = load_data()
-            groups = data.get("weverse_groups", {})
-            if not groups:
-                return await interaction.response.send_message("No Weverse groups exist yet.", ephemeral=True)
-            embed = discord.Embed(title="💜 Weverse Fan Groups", color=COLORS["system"])
-            for gkey, grp in groups.items():
-                member_names = []
-                for oc_id in grp.get("member_oc_ids", []):
-                    oc_rec = data["ocs"].get(oc_id)
-                    member_names.append(oc_rec["name"] if oc_rec else oc_id)
-                embed.add_field(
-                    name=grp.get("name", gkey),
-                    value=", ".join(member_names) if member_names else "No members yet.",
-                    inline=False,
-                )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        except Exception as e:
-            log.error("weverse group list error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
-    # ── won subgroup ───────────────────────────────────────────────────────────
-
-    won_group = app_commands.Group(name="won", description="Weverse Won management")
-
-    @won_group.command(name="add", description="dev | credit Weverse Won to an OC")
-    @app_commands.describe(oc_name="the OC to credit", amount="amount of Weverse Won to add")
-    async def won_add(self, interaction: discord.Interaction, oc_name: str, amount: int):
-        if not is_dev(interaction):
-            return await interaction.response.send_message("❌ denied.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        try:
-            data = load_data()
-            guild = resolve_guild(interaction)
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.followup.send("❌ OC not found.", ephemeral=True)
-            if amount <= 0:
-                return await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
-
-            won = data.setdefault("weverse_won", {})
-            won[oc["id"]] = won.get(oc["id"], 0) + amount
-            save_data(data)
-            asyncio.ensure_future(push_backup_to_discord(data, reason="weverse_won_add"))
-            await interaction.followup.send(
-                f"✅ Added 💜 {amount:,} Weverse Won to **{oc['name']}**. New balance: {won[oc['id']]:,}.", ephemeral=True
-            )
-            if guild:
-                await audit(guild, f"Weverse Won added: {amount:,} to {oc['name']} by {interaction.user}")
-        except Exception as e:
-            log.error("weverse won add error: %s", e)
-            await interaction.followup.send("❌ an unexpected error occurred.", ephemeral=True)
-
-    @won_group.command(name="balance", description="view an OC's Weverse Won balance")
-    @app_commands.describe(oc_name="the OC to check")
-    async def won_balance(self, interaction: discord.Interaction, oc_name: str):
-        try:
-            data = load_data()
-            oc = find_oc(oc_name, data)
-            if not oc:
-                return await interaction.response.send_message("❌ OC not found.", ephemeral=True)
-            balance = data.get("weverse_won", {}).get(oc["id"], 0)
-            embed = discord.Embed(
-                title=f"💜 {oc['name']} — Weverse Won",
-                description=f"**{balance:,}** Weverse Won",
-                color=COLORS["system"],
-            )
-            if oc.get("profile_picture"):
-                embed.set_thumbnail(url=oc["profile_picture"])
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        except Exception as e:
-            log.error("weverse won balance error: %s", e)
-            await interaction.response.send_message("❌ an unexpected error occurred.", ephemeral=True)
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELP & SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ─── Cogs Setup ───────────────────────────────────────────────────────────────
 async def setup_hook():
@@ -2331,6 +3810,7 @@ async def on_ready():
             lambda: InclusionsBrowserView([], "", None, 0),
             lambda: TwitterPostView(tweet_id="", likes=0, retweets=0),
             lambda: IGPostView(post_id=""),
+            lambda: WeverseReplyMessageView(post_id="", reply_message_id=""),
         ]
 
         for view_factory in _persistent_views:
@@ -2707,6 +4187,58 @@ async def _process_weverse_subscriptions():
     if modified:
         save_data(data)
 
+    # ── Group member DM billing ──────────────────────────────────────────────
+    data = load_data()
+    dirty = False
+    guild_id = data["config"].get("guild_id")
+    guild_obj = bot.get_guild(int(guild_id)) if guild_id else None
+
+    if guild_obj:
+        for gid, grp in data.get("weverse_groups", {}).items():
+            if grp.get("archived"):
+                continue
+            for member_oc_id, subs in grp.get("member_dm_subscribers", {}).items():
+                ch_id = grp.get("member_dm_channels", {}).get(member_oc_id)
+                channel = guild_obj.get_channel(int(ch_id)) if ch_id else None
+                for sub_oc_id, sub in list(subs.items()):
+                    if not sub.get("active"):
+                        continue
+                    next_dt = datetime.fromisoformat(sub["next_billing"])
+                    if now() < next_dt:
+                        continue
+                    # Billing is due.
+                    plan_data = WEVERSE_PLANS.get(sub["plan"], {})
+                    cost = plan_data.get("won", 0)
+                    sub_oc = data["ocs"].get(sub_oc_id)
+                    if sub.get("cancelled") or not sub_oc or sub_oc.get("balance", 0) < cost:
+                        # Expire: deactivate + revoke channel access
+                        sub["active"] = False
+                        sub["next_billing"] = now().isoformat()
+                        if channel:
+                            owner_discord_id = sub.get("owner_discord_id")
+                            if owner_discord_id:
+                                member = guild_obj.get_member(int(owner_discord_id))
+                                if member:
+                                    has_other_active_sub = any(
+                                        s.get("active") and s.get("owner_discord_id") == owner_discord_id
+                                        and k != sub_oc_id
+                                        for k, s in subs.items()
+                                    )
+                                    if not has_other_active_sub:
+                                        try:
+                                            await channel.set_permissions(member, overwrite=None)
+                                        except Exception as e:
+                                            log.error("grp billing: revoke perms error: %s", e)
+                        dirty = True
+                    else:
+                        # Renew: deduct balance, extend next_billing
+                        sub_oc["balance"] -= cost
+                        sub["next_billing"] = (datetime.fromisoformat(sub["next_billing"]) + timedelta(days=plan_data["days"])).isoformat()
+                        dirty = True
+
+        if dirty:
+            save_data(data)
+
 @tasks.loop(minutes=1)
 async def weverse_billing_loop():
     await _process_weverse_subscriptions()
@@ -2753,6 +4285,17 @@ async def _execute_evaluations():
             else: rating = "outstanding"
             
             oc["balance"] += amount
+            # Record eval history on the OC for /eval_history command
+            oc.setdefault("eval_history", []).append({
+                "evaluated_at": now_iso(),
+                "rating": rating,
+                "score": amount,
+                "earned": amount,
+                "new_balance": oc["balance"],
+            })
+            # Cap history to last 52 entries (one year of weekly evals)
+            if len(oc["eval_history"]) > 52:
+                oc["eval_history"] = oc["eval_history"][-52:]
             user_results.append({
                 "oc_name": oc["name"],
                 "rating": rating,
@@ -3252,6 +4795,119 @@ async def oc_fix_image(interaction: discord.Interaction, oc_name: str, new_image
     embed.add_field(name="oc", value=oc["name"], inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
     await audit(guild, f"oc image fixed: '{oc['name']}' by {interaction.user}")
+
+
+@bot.tree.command(name="oc_register", description="register a new oc (no limits on how many you can own).")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    name="oc's full name", birthday=f"birthday in {BIRTHDAY_DISPLAY}", gender="oc's gender",
+    pronouns="pronouns (e.g. she/her)", face_claim="face claim", main_skill="primary skill",
+    ethnicity="ethnicity", nationality="nationality",
+    profile_picture_url="direct image url (required if no file is attached)",
+    profile_picture_file="upload image file (required if no url is provided)",
+    form_link="link to oc form (optional)"
+)
+async def oc_register(
+    interaction: discord.Interaction, name: str, birthday: str,
+    gender: str, pronouns: str, face_claim: str, main_skill: str,
+    ethnicity: str, nationality: str,
+    profile_picture_url: Optional[str] = None, profile_picture_file: Optional[discord.Attachment] = None,
+    form_link: Optional[str] = None
+):
+    guild = resolve_guild(interaction)
+    if not guild: return await interaction.response.send_message("❌ could not resolve server context.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try: datetime.strptime(birthday, BIRTHDAY_FORMAT)
+    except ValueError: return await interaction.followup.send(f"❌ birthday must be in **{BIRTHDAY_DISPLAY}** format.", ephemeral=True)
+
+    pic_url = None
+    pic_msg_id = None
+    if profile_picture_file:
+        if not profile_picture_file.content_type or not profile_picture_file.content_type.startswith("image/"):
+            return await interaction.followup.send("❌ attached file must be an image.", ephemeral=True)
+        persisted = await persist_image_attachment(profile_picture_file, store_msg_id=True)
+        if persisted: pic_url, pic_msg_id = persisted
+        else: pic_url = profile_picture_file.url
+    elif profile_picture_url:
+        if not valid_image_url(profile_picture_url): return await interaction.followup.send("❌ profile picture must be a direct image url.", ephemeral=True)
+        pic_url = profile_picture_url
+    else: return await interaction.followup.send("❌ profile picture required.", ephemeral=True)
+
+    if form_link and not valid_url(form_link): return await interaction.followup.send("❌ form link must start with http.", ephemeral=True)
+
+    data = load_data()
+    key  = oc_key_of(name)
+    if key in data["ocs"]: return await interaction.followup.send(f"❌ an oc named **{name}** already exists.", ephemeral=True)
+
+    data["ocs"][key] = {
+        "name": name, "profile_picture": pic_url, "birthday": birthday,
+        "gender": gender, "pronouns": pronouns, "face_claim": face_claim,
+        "main_skill": main_skill, "ethnicity": ethnicity, "nationality": nationality,
+        "form_link": form_link, "owner_id": interaction.user.id,
+        "registered_at": now_iso(),
+        "balance": 500000,
+        "eval_history": [],
+    }
+    if pic_msg_id: data["ocs"][key]["profile_picture_msg_id"] = pic_msg_id
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_register"))
+
+    embed = build_oc_embed(data["ocs"][key], key)
+    await interaction.followup.send(f"**{name}** registered successfully.", embed=embed, ephemeral=True)
+
+    log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_ch:
+        log_embed = discord.Embed(
+            title="✨ new oc logged",
+            description=f"**{name}** has been registered by {interaction.user.mention}.",
+            color=discord.Color.green(),
+            timestamp=now_utc(),
+        )
+        if pic_url: log_embed.set_thumbnail(url=pic_url)
+        log_embed.add_field(name="registered by", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="oc id", value=f"`{key}`", inline=True)
+        await log_ch.send(embed=log_embed)
+
+    await audit(guild, f"oc registered: '{name}' by {interaction.user}")
+
+
+@bot.tree.command(name="oc_delete", description="permanently delete an oc.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="name of the oc to delete")
+async def oc_delete(interaction: discord.Interaction, oc_name: str):
+    guild = resolve_guild(interaction)
+    data = load_data()
+    key  = oc_key_of(oc_name)
+    if key not in data["ocs"]: return await interaction.response.send_message(f"❌ no oc named **{oc_name}** found.", ephemeral=True)
+
+    oc = data["ocs"][key]
+    if not is_dev(interaction) and interaction.user.id != oc.get("owner_id"): return await interaction.response.send_message("❌ you do not have permission.", ephemeral=True)
+
+    # Capture asset IDs before deletion
+    profile_pic_msg_id: Optional[int] = oc.get("profile_picture_msg_id")
+    del data["ocs"][key]
+    data["inventories"].pop(key, None)
+
+    for floor in data["floors"].values():
+        for room in floor.get("rooms", {}).values():
+            if key in room.get("occupants", []): room["occupants"].remove(key)
+    for gc in data["groupchats"].values():
+        if key in gc.get("participants", []): gc["participants"].remove(key)
+    for dm in data["dms"].values():
+        if key in dm.get("participants", []): dm["participants"].remove(key)
+
+    save_data(data)
+    asyncio.ensure_future(push_backup_to_discord(data, reason="oc_delete"))
+    # Clean up orphaned asset-channel message
+    asyncio.ensure_future(_delete_asset_message(profile_pic_msg_id))
+
+    await interaction.response.send_message(f"✅ **{oc['name']}** deleted.", ephemeral=True)
+    await audit(guild, f"oc deleted: '{oc['name']}' by {interaction.user}")
 
 
 # ─── OC List paginator ─────────────────────────────────────────────────────────
@@ -8784,6 +10440,579 @@ async def refresh_assets_cmd(interaction: discord.Interaction):
     embed.add_field(name="❌ Failed", value=str(failed), inline=True)
     embed.set_footer(text=f"Run by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE MANAGEMENT (restore / export / import_data)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="restore", description="dev | pull the latest DB backup from Discord and reload it.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def restore_cmd(interaction: discord.Interaction):
+    """Scans #bot-db-backup for the last 10 bot-sent data.json attachments, validates each,
+    then restores from the most recent valid file."""
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    BACKUP_WINDOW = 10
+    candidates: list[dict] = []
+    for g in bot.guilds:
+        ch = discord.utils.get(g.text_channels, name=DB_BACKUP_CHANNEL_NAME)
+        if not ch:
+            continue
+        try:
+            async for message in ch.history(limit=200):
+                if len(candidates) >= BACKUP_WINDOW:
+                    break
+                if message.author != bot.user or not message.attachments:
+                    continue
+                att = next((a for a in message.attachments if a.filename == "data.json"), None)
+                if att is None:
+                    continue
+                timestamp_str = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                try:
+                    file_bytes = await att.read()
+                    parsed     = json.loads(file_bytes)
+                    valid      = _validate_backup(parsed)
+                except json.JSONDecodeError as je:
+                    candidates.append({"message": message, "parsed": None, "timestamp_str": timestamp_str,
+                                       "valid": False, "error": f"malformed JSON: {je}"})
+                    continue
+                except Exception as read_exc:
+                    candidates.append({"message": message, "parsed": None, "timestamp_str": timestamp_str,
+                                       "valid": False, "error": str(read_exc)})
+                    continue
+                candidates.append({"message": message, "parsed": parsed, "timestamp_str": timestamp_str,
+                                   "valid": valid, "error": None})
+        except Exception as exc:
+            return await interaction.followup.send(f"❌ error reading backup channel: {exc}", ephemeral=True)
+        break
+    if not candidates:
+        return await interaction.followup.send(f"❌ no backup found in `#{DB_BACKUP_CHANNEL_NAME}`.", ephemeral=True)
+    embed = discord.Embed(
+        title=f"🔍 restore — scanned {len(candidates)} backup snapshot(s)",
+        color=COLORS["system"], timestamp=now_utc(),
+    )
+    lines: list[str] = []
+    for i, c in enumerate(candidates, start=1):
+        status = "✅ valid" if c["valid"] else f"❌ invalid ({c.get('error', 'schema fail')})"
+        marker = " ← **restoring this one**" if (i == 1 and c["valid"]) else ""
+        lines.append(f"`{i:>2}.` {c['timestamp_str']}  —  {status}{marker}")
+    embed.description = "\n".join(lines)
+    restore_target = next((c for c in candidates if c["valid"]), None)
+    if restore_target is None:
+        embed.color = COLORS["error"]
+        embed.add_field(name="result",
+                        value="❌ none of the scanned backups passed schema validation — aborting restore.",
+                        inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+    parsed = restore_target["parsed"]
+    _migrate_schema(parsed)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(parsed, f, indent=2, ensure_ascii=False)
+    oc_count  = len(parsed.get("ocs", {}))
+    ig_count  = len(parsed.get("instagram", {}))
+    tw_count  = len(parsed.get("twitter", {}))
+    embed.color = COLORS["success"]
+    embed.add_field(name="✅ restored from",   value=restore_target["timestamp_str"],       inline=False)
+    embed.add_field(name="ocs loaded",         value=str(oc_count),                         inline=True)
+    embed.add_field(name="ig posts loaded",    value=str(ig_count),                         inline=True)
+    embed.add_field(name="tweets loaded",      value=str(tw_count),                         inline=True)
+    embed.add_field(name="source message id",  value=str(restore_target["message"].id),     inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await audit(
+        guild,
+        f"manual DB restore by {interaction.user} from backup msg "
+        f"{restore_target['message'].id} ({restore_target['timestamp_str']}); "
+        f"scanned {len(candidates)} candidate(s).",
+    )
+
+
+@bot.tree.command(name="export", description="dev | export the current database as a downloadable JSON file.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    key="optional: export only this top-level data key (e.g. 'ocs', 'shop'). leave blank for full export."
+)
+async def export_cmd(interaction: discord.Interaction, key: Optional[str] = None):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = load_data()
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ failed to load data: {exc}", ephemeral=True)
+    timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
+    if key:
+        key = key.strip().lower()
+        if key not in data:
+            valid_keys = ", ".join(f"`{k}`" for k in sorted(data.keys()))
+            return await interaction.followup.send(
+                f"❌ key `{key}` not found in data.\n**valid keys:** {valid_keys}", ephemeral=True,
+            )
+        payload     = {key: data[key]}
+        filename    = f"export_{key}_{timestamp}.json"
+        description = f"partial export — key: `{key}`"
+    else:
+        payload     = data
+        filename    = f"export_full_{timestamp}.json"
+        description = "full database export"
+    try:
+        payload_bytes = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ serialisation error: {exc}", ephemeral=True)
+    if len(payload_bytes) > 8_000_000:
+        return await interaction.followup.send(
+            f"❌ export payload too large ({len(payload_bytes):,} bytes). "
+            "use the `key` parameter to export a subset.", ephemeral=True,
+        )
+    file = discord.File(io.BytesIO(payload_bytes), filename=filename)
+    embed = discord.Embed(title="📤 data export", description=description, color=COLORS["system"], timestamp=now_utc())
+    embed.add_field(name="filename",     value=filename,                     inline=True)
+    embed.add_field(name="size",         value=f"{len(payload_bytes):,} B",  inline=True)
+    embed.add_field(name="requested by", value=interaction.user.mention,     inline=True)
+    await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    log.info("export_cmd: %s exported by %s", filename, interaction.user)
+
+
+@bot.tree.command(name="import_data", description="dev | import a JSON file to replace the current database.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(attachment="the data.json file to import. must pass schema validation.")
+async def import_data_cmd(interaction: discord.Interaction, attachment: discord.Attachment):
+    guild = resolve_guild(interaction)
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if attachment.size > 8_000_000:
+        return await interaction.followup.send(
+            f"❌ attachment too large ({attachment.size:,} bytes, limit 8 MB).", ephemeral=True
+        )
+    try:
+        file_bytes = await attachment.read()
+        parsed     = json.loads(file_bytes)
+    except json.JSONDecodeError as je:
+        return await interaction.followup.send(f"❌ attachment is not valid JSON: {je}", ephemeral=True)
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ failed to read attachment: {exc}", ephemeral=True)
+    if not _validate_backup(parsed):
+        return await interaction.followup.send(
+            "❌ import file failed schema validation — required top-level keys are missing or wrong type.",
+            ephemeral=True,
+        )
+    oc_count  = len(parsed.get("ocs", {}))
+    ig_count  = len(parsed.get("instagram", {}))
+    tw_count  = len(parsed.get("twitter", {}))
+    confirm_embed = discord.Embed(
+        title="⚠️ confirm import — this will overwrite the current database",
+        color=COLORS["error"], timestamp=now_utc(),
+    )
+    confirm_embed.add_field(name="file",          value=attachment.filename,       inline=True)
+    confirm_embed.add_field(name="size",          value=f"{attachment.size:,} B",  inline=True)
+    confirm_embed.add_field(name="ocs in import", value=str(oc_count),             inline=True)
+    confirm_embed.add_field(name="ig posts",      value=str(ig_count),             inline=True)
+    confirm_embed.add_field(name="tweets",        value=str(tw_count),             inline=True)
+    confirm_embed.set_footer(text="this action cannot be undone. confirm to proceed.")
+    confirmed = await wait_for_confirm(interaction, confirm_embed)
+    if not confirmed:
+        return await interaction.followup.send("↩️ import cancelled.", ephemeral=True)
+    _migrate_schema(parsed)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(parsed, f, indent=2, ensure_ascii=False)
+    except OSError as ose:
+        return await interaction.followup.send(f"❌ failed to write to disk: {ose}", ephemeral=True)
+    try:
+        await push_backup_to_discord(parsed, reason=f"manual import by {interaction.user}")
+    except Exception as backup_exc:
+        log.error("import_data_cmd: backup push failed after successful import — %s", backup_exc)
+        await interaction.followup.send(
+            f"⚠️ data written to disk successfully, but backup push failed: {backup_exc}\n"
+            "run `/restore` or check #bot-db-backup manually if needed.", ephemeral=True,
+        )
+    result_embed = discord.Embed(title="✅ import complete", color=COLORS["success"], timestamp=now_utc())
+    result_embed.add_field(name="source file",   value=attachment.filename, inline=False)
+    result_embed.add_field(name="ocs loaded",    value=str(oc_count),       inline=True)
+    result_embed.add_field(name="ig posts",      value=str(ig_count),       inline=True)
+    result_embed.add_field(name="tweets",        value=str(tw_count),       inline=True)
+    result_embed.add_field(name="migration",     value="applied ✅",         inline=True)
+    await interaction.followup.send(embed=result_embed, ephemeral=True)
+    await audit(
+        guild,
+        f"manual DB import by {interaction.user} from file '{attachment.filename}' "
+        f"({attachment.size:,} B); {oc_count} OCs, {ig_count} IG posts, {tw_count} tweets loaded.",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BOT HEALTH DASHBOARD (/stats)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="stats", description="dev | bot health dashboard.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def stats_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction):
+        return await interaction.response.send_message("❌ denied.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    elapsed = int(time.monotonic() - _BOT_START_TIME)
+    days, rem = divmod(elapsed, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+    # ── Data file ─────────────────────────────────────────────────────────────
+    try:
+        file_size_bytes = os.path.getsize(DATA_FILE)
+        file_size_str   = f"{file_size_bytes:,} B  ({file_size_bytes / 1024:.1f} KB)"
+    except OSError:
+        file_size_str = "unavailable"
+    # ── Data counts ───────────────────────────────────────────────────────────
+    try:
+        data = load_data()
+        oc_count   = len(data.get("ocs", {}))
+        ig_count   = len(data.get("instagram", {}))
+        tw_count   = len(data.get("twitter", {}))
+        eval_last  = data.get("evaluation_config", {}).get("last_run") or "never"
+        eval_state = "▶ running" if data.get("evaluation_config", {}).get("running") else "⏸ stopped"
+    except Exception as exc:
+        oc_count = ig_count = tw_count = 0
+        eval_last = eval_state = f"error: {exc}"
+    # ── Task health ───────────────────────────────────────────────────────────
+    task_status_lines = []
+    for task_obj, label in [
+        (check_birthdays,        "check_birthdays"),
+        (check_scheduled,        "check_scheduled"),
+        (check_reminders,        "check_reminders"),
+        (auto_backup_db,         "auto_backup_db"),
+        (run_weekly_evaluations, "run_weekly_evaluations"),
+        (weverse_billing_loop,   "weverse_billing_loop"),
+    ]:
+        icon = "✅" if task_obj.is_running() else "❌"
+        task_status_lines.append(f"{icon} `{label}`")
+    # ── Memory ────────────────────────────────────────────────────────────────
+    try:
+        if psutil:
+            proc     = psutil.Process(os.getpid())
+            mem_info = proc.memory_info()
+            mem_str  = f"{mem_info.rss / 1024 / 1024:.1f} MB RSS"
+        else:
+            mem_str = "unavailable (psutil not installed)"
+    except Exception:
+        mem_str = "unavailable"
+    # ── Build embed ───────────────────────────────────────────────────────────
+    embed = discord.Embed(title="🤖 bot stats", color=COLORS["system"], timestamp=now_utc())
+    embed.add_field(name="⏱ uptime",        value=uptime_str,                    inline=True)
+    embed.add_field(name="💾 memory",        value=mem_str,                       inline=True)
+    embed.add_field(name="📁 data file",     value=file_size_str,                 inline=False)
+    embed.add_field(name="🧑 ocs",           value=str(oc_count),                 inline=True)
+    embed.add_field(name="📸 ig posts",      value=str(ig_count),                 inline=True)
+    embed.add_field(name="🐦 tweets",        value=str(tw_count),                 inline=True)
+    embed.add_field(name="📊 evaluations",   value=f"{eval_state}\nlast: {eval_last}", inline=False)
+    embed.add_field(name="🔄 tasks",         value="\n".join(task_status_lines),  inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALBUM PROGRESS & EVAL HISTORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AlbumProgressPaginatorView(discord.ui.View):
+    """
+    Paginated view for /album_progress.
+    Pages are built lazily from two pre-sorted flat lists:
+      - missing_lines  : ❌ entries, sorted by rarity desc then alpha
+      - received_lines : ✅ entries, sorted by rarity desc then alpha
+    Missing items always occupy the first pages; received items follow.
+    """
+    PAGE_SIZE = 10
+
+    def __init__(
+        self,
+        *,
+        oc_name: str,
+        album_name: str,
+        embed_color: discord.Color,
+        thumbnail_url: Optional[str],
+        bar_value: str,
+        copies_value: str,
+        missing_lines: list[str],
+        received_lines: list[str],
+        invoker_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.oc_name        = oc_name
+        self.album_name     = album_name
+        self.embed_color    = embed_color
+        self.thumbnail_url  = thumbnail_url
+        self.bar_value      = bar_value
+        self.copies_value   = copies_value
+        self.missing_lines  = missing_lines
+        self.received_lines = received_lines
+        self.invoker_id     = invoker_id
+        self._pages: list[tuple[str, list[str]]] = []
+        for i in range(0, max(len(missing_lines), 1), self.PAGE_SIZE):
+            chunk = missing_lines[i: i + self.PAGE_SIZE]
+            if chunk:
+                self._pages.append((f"❌ missing ({len(missing_lines)})", chunk))
+        for i in range(0, max(len(received_lines), 1), self.PAGE_SIZE):
+            chunk = received_lines[i: i + self.PAGE_SIZE]
+            if chunk:
+                self._pages.append((f"✅ received ({len(received_lines)})", chunk))
+        if not self._pages:
+            self._pages = [("inclusions", ["*(no data)*"])]
+        self.index = 0
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("❌ this panel belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = (self.index == 0)
+        self.next_btn.disabled = (self.index >= len(self._pages) - 1)
+
+    def build_embed(self) -> discord.Embed:
+        section_label, lines = self._pages[self.index]
+        total_pages = len(self._pages)
+        embed = discord.Embed(
+            title=f"📀 album progress — {self.oc_name} · {self.album_name}",
+            color=self.embed_color,
+        )
+        embed.add_field(name="📊 completion",    value=self.bar_value,    inline=False)
+        embed.add_field(name="📦 copies owned",  value=self.copies_value, inline=True)
+        embed.add_field(name="\u200b",           value="\u200b",          inline=True)
+        embed.add_field(
+            name=f"{section_label}  •  page {self.index + 1}/{total_pages}",
+            value="\n".join(lines),
+            inline=False,
+        )
+        if self.thumbnail_url:
+            embed.set_thumbnail(url=self.thumbnail_url)
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="alb_prog_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="alb_prog_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+@bot.tree.command(name="album_progress", description="view an oc's inclusion progress for a specific album.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(
+    oc_name="name of the oc to check",
+    album_name="name of the album to inspect (supports partial/fuzzy match)",
+)
+async def album_progress_cmd(
+    interaction: discord.Interaction,
+    oc_name: str,
+    album_name: str,
+):
+    data   = load_data()
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]:
+        return await interaction.response.send_message(f"❌ oc **{oc_name}** not found.", ephemeral=True)
+    oc = data["ocs"][oc_key]
+
+    shop      = data.get("shop", {})
+    inventory = data.get("inventories", {}).get(oc_key, {})
+
+    # ── Resolve album_name → item_id via fuzzy match ──────────────────────────
+    album_shop_items = {iid: itm for iid, itm in shop.items() if itm.get("type") == "album"}
+    name_to_id: dict[str, str] = {
+        itm.get("name", iid).strip().lower(): iid
+        for iid, itm in album_shop_items.items()
+    }
+    query_key = album_name.strip().lower()
+    resolved_item_id: Optional[str] = name_to_id.get(query_key)
+
+    if resolved_item_id is None:
+        close = difflib.get_close_matches(query_key, list(name_to_id.keys()), n=3, cutoff=0.6)
+        if len(close) == 1:
+            resolved_item_id = name_to_id[close[0]]
+        elif len(close) > 1:
+            candidates = ", ".join(f"**{c}**" for c in close)
+            return await interaction.response.send_message(
+                f"❌ multiple albums match **{album_name}**: {candidates}\nplease be more specific.",
+                ephemeral=True,
+            )
+
+    if resolved_item_id is None:
+        known_names = sorted(itm.get("name", iid) for iid, itm in album_shop_items.items())[:5]
+        suggestion_str = (
+            "\n**known albums include:** " + ", ".join(f"`{n}`" for n in known_names)
+            if known_names else ""
+        )
+        return await interaction.response.send_message(
+            f"❌ no album matching **{album_name}** was found.{suggestion_str}", ephemeral=True,
+        )
+
+    resolved_item = shop.get(resolved_item_id)
+    if resolved_item is None:
+        return await interaction.response.send_message(
+            f"❌ album data for **{album_name}** could not be loaded from the shop.", ephemeral=True,
+        )
+
+    instances = inventory.get(resolved_item_id, [])
+    if not instances:
+        return await interaction.response.send_message(
+            f"❌ **{oc['name']}** does not own any copy of **{resolved_item.get('name', album_name)}**.",
+            ephemeral=True,
+        )
+
+    all_inclusions = resolved_item.get("inclusions", [])
+    if not all_inclusions:
+        return await interaction.response.send_message(
+            f"❌ **{resolved_item.get('name', album_name)}** has no inclusions configured.", ephemeral=True,
+        )
+
+    # ── Aggregate pulled inclusion IDs across ALL copies ──────────────────────
+    canonical_ids: set[str] = {inc.get("inclusion_id", "") for inc in all_inclusions}
+    canonical_ids.discard("")
+    received_qty: dict[str, int] = {}
+    for inst in instances:
+        for p in inst.get("pulled_inclusions", []):
+            inc_id_p = p.get("inclusion_id")
+            if inc_id_p and inc_id_p in canonical_ids:
+                received_qty[inc_id_p] = received_qty.get(inc_id_p, 0) + 1
+    received_ids = set(received_qty.keys())
+
+    # ── Build received / missing named lists ──────────────────────────────────
+    received_named: list[tuple[str, int, int, str]] = []
+    missing_named:  list[tuple[str, int, int, str]] = []
+    for inc in all_inclusions:
+        inc_id       = inc.get("inclusion_id", "")
+        inc_name     = inc.get("name", inc_id)
+        rarity       = inc.get("rarity", 0)
+        rarity_label = _rarity_label(rarity) if rarity else ""
+        qty          = received_qty.get(inc_id, 0)
+        if inc_id in received_ids:
+            qty_suffix = f" ×{qty}" if qty > 1 else ""
+            display    = f"✅ {inc_name}{qty_suffix}" + (f"  {rarity_label}" if rarity_label else "")
+            received_named.append((display, rarity, qty, inc_name.lower()))
+        else:
+            display = f"❌ {inc_name}" + (f"  {rarity_label}" if rarity_label else "")
+            missing_named.append((display, rarity, 0, inc_name.lower()))
+
+    received_named.sort(key=lambda t: (-t[1], t[3]))
+    missing_named.sort(key=lambda t: (-t[1], t[3]))
+    received_display = [t[0] for t in received_named]
+    missing_flat     = [t[0] for t in missing_named]
+
+    # ── Progress metrics ──────────────────────────────────────────────────────
+    total   = len(all_inclusions)
+    pulled  = len(received_display)
+    pct     = pulled / total if total else 0.0
+    bar_len = 20
+    filled  = round(pct * bar_len)
+    bar     = "█" * filled + "░" * (bar_len - filled)
+    complete = pulled >= total
+
+    if complete:
+        embed_color = RARITY_TIER_COLORS[min(4, len(RARITY_TIER_COLORS) - 1)]
+    elif pct >= 0.5:
+        embed_color = RARITY_TIER_COLORS[min(2, len(RARITY_TIER_COLORS) - 1)]
+    else:
+        embed_color = RARITY_TIER_COLORS[0]
+
+    album_display_name = resolved_item.get("name", resolved_item_id)
+    bar_value = f"`[{bar}]` {pulled} / {total} inclusions  ({len(missing_flat)} missing)"
+    if complete:
+        bar_value += "\n🎉 **complete collection!**"
+    copy_word    = "copy" if len(instances) == 1 else "copies"
+    copies_value = f"**{len(instances)}** {copy_word}"
+
+    view = AlbumProgressPaginatorView(
+        oc_name=oc["name"],
+        album_name=album_display_name,
+        embed_color=embed_color,
+        thumbnail_url=oc.get("profile_picture") or None,
+        bar_value=bar_value,
+        copies_value=copies_value,
+        missing_lines=missing_flat,
+        received_lines=received_display,
+        invoker_id=interaction.user.id,
+    )
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+
+@album_progress_cmd.autocomplete("album_name")
+async def album_progress_album_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest album names scoped to albums the OC actually owns."""
+    data  = load_data()
+    shop  = data.get("shop", {})
+    oc_name_typed: str = getattr(interaction.namespace, "oc_name", "") or ""
+    oc_key_str = oc_key_of(oc_name_typed) if oc_name_typed else None
+    inventory = data.get("inventories", {}).get(oc_key_str, {}) if oc_key_str else {}
+    album_items = [(iid, itm) for iid, itm in shop.items() if itm.get("type") == "album"]
+    if inventory:
+        album_items = [(iid, itm) for iid, itm in album_items if iid in inventory]
+    current_lower = current.strip().lower()
+    filtered = [(iid, itm) for iid, itm in album_items if current_lower in itm.get("name", iid).lower()]
+    filtered.sort(key=lambda x: x[1].get("name", x[0]).lower())
+    return [
+        app_commands.Choice(name=itm.get("name", iid), value=itm.get("name", iid))
+        for iid, itm in filtered[:25]
+    ]
+
+
+@bot.tree.command(name="eval_history", description="view an oc's past evaluation scores.")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(oc_name="oc name", limit="number of past entries to show (default 10, max 52)")
+async def eval_history_cmd(
+    interaction: discord.Interaction,
+    oc_name: str,
+    limit: Optional[int] = 10,
+):
+    data   = load_data()
+    oc_key = oc_key_of(oc_name)
+    if oc_key not in data["ocs"]:
+        return await interaction.response.send_message(f"❌ oc **{oc_name}** not found.", ephemeral=True)
+    oc = data["ocs"][oc_key]
+    if not is_dev(interaction) and oc.get("owner_id") != interaction.user.id:
+        return await interaction.response.send_message("❌ you do not own this oc.", ephemeral=True)
+    history = oc.get("eval_history", [])
+    if not history:
+        return await interaction.response.send_message(
+            f"❌ no evaluation history found for **{oc['name']}** yet.", ephemeral=True
+        )
+    limit   = max(1, min(limit or 10, 52))
+    entries = history[-limit:][::-1]  # most recent first
+    lines = []
+    for i, rec in enumerate(entries, start=1):
+        try:
+            dt = datetime.fromisoformat(rec["evaluated_at"]).strftime("%Y-%m-%d")
+        except Exception:
+            dt = "unknown date"
+        lines.append(
+            f"`{i:>2}.` **{dt}** — {rec['rating']}  "
+            f"(score: {rec['score']:,} | earned: ₩{rec['earned']:,} | bal: ₩{rec['new_balance']:,})"
+        )
+    embed = discord.Embed(
+        title=f"📊 eval history — {oc['name']}",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    if oc.get("profile_picture"):
+        embed.set_thumbnail(url=oc["profile_picture"])
+    embed.set_footer(text=f"showing last {len(entries)} of {len(history)} evaluations")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.event
